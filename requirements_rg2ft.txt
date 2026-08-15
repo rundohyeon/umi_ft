@@ -1,0 +1,3 @@
+# Additional dependency for OnRobot RG2-FT Modbus/TCP control.
+# rg2ft_protocol.py also supports older pymodbus unit/slave keyword APIs.
+pymodbus==3.14.0

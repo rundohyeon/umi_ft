@@ -1,0 +1,65 @@
+# Neuromeka Indy + Dynamixel gripper waypoint sequence
+#
+# Robot:
+#   movej  + absolute  -> joint angles in DEGREES (7 values for IndyRP2)
+#   movel  + absolute  -> TCP in base frame [x,y,z,u,v,w] mm/deg
+#
+# Gripper (Dynamixel):
+#   type: gripper
+#   target: open | close | <integer ticks>
+#   open_position / close_position depend on your hardware wiring.
+#   If 'open' moves the wrong way, swap the two values below.
+
+defaults:
+  vel_ratio: 20
+  acc_ratio: 50
+  dwell_s: 0.5
+
+gripper:
+  port: /dev/ttyUSB0
+  id: 1
+  baudrate: 57600
+  open_position: 1600
+  close_position: 250
+  profile_velocity: 30
+  profile_acceleration: 15
+  keep_torque: true
+
+waypoints:
+  # Run arm motion first so a slow/stuck gripper does not block the whole demo.
+  - name: joints_ready
+    type: movej
+    frame: absolute
+    target: [-5.22, -55.76, -90.51, -82.75, 50.17, -5.20, 5.82]
+
+  - name: gripper_open
+    type: gripper
+    target: open
+
+  - name: tcp_above_table
+    type: movel
+    frame: absolute
+    target: [280, -815, 500, 180, 90, 90]
+
+  - name: tcp_pick
+    type: movel
+    frame: absolute
+    target: [280, -815, 440, 180, 90, 90]
+
+  - name: gripper_close
+    type: gripper
+    target: close
+
+  - name: lift_with_part
+    type: movel
+    frame: relative
+    target: [0, 0, 30, 0, 0, 0]
+
+  - name: gripper_open_release
+    type: gripper
+    target: open
+
+  - name: return_home
+    type: movej
+    frame: absolute
+    target: home

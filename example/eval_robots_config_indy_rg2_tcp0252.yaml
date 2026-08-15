@@ -1,0 +1,53 @@
+{
+  "robots": [
+    {
+      "robot_type": "indyrp2",
+      "robot_ip": "192.168.1.10",
+      "robot_obs_latency": 0.0001,
+      "robot_action_latency": 0.1,
+      "tcp_offset": 0.252,
+      "indy_task_rot_is_euler": true,
+      "indy_task_rot_euler_seq": "xyz",
+      "indy_task_rot_euler_in_degrees": true,
+      "indy_task_rot_euler_extrinsic": true,
+      "indy_task_frame_xyz_signs": [1, 1, 1],
+      "indy_robot_from_dataset_transform": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "indy_tool_rot_offset_deg": [0, 0, 0],
+      "indy_teleop_rot_euler_seq": "xyz",
+      "indy_teleop_rot_euler_extrinsic": false,
+      "indy_policy_tcp7_rot_euler_roundtrip": false,
+      "indy_policy_tcp7_rot_euler_seq": null,
+      "indy_policy_tcp7_rot_euler_extrinsic": null,
+      "height_threshold": -0.024,
+      "sphere_radius": 0.1,
+      "sphere_center": [0, -0.06, -0.185]
+    }
+  ],
+  "grippers": [
+    {
+      "gripper_type": "rg2ft",
+      "gripper_ip": "192.168.2.1",
+      "gripper_port": 502,
+      "gripper_slave_id": 65,
+      "max_gripper_width": 0.1,
+      "rg2ft_frequency": 100,
+      "rg2ft_force": 20.0,
+      "rg2ft_home_to_open": false,
+      "rg2ft_move_max_speed": 0.2,
+      "rg2ft_open_tolerance": 0.005,
+      "gripper_obs_latency": 0.01,
+      "gripper_action_latency": 0.1
+    }
+  ],
+  "tx_left_right": [
+    [0.99996206, 0.00661996, 0.00566226, -0.01676012],
+    [-0.00663261, 0.99997554, 0.0022186, -0.60552492],
+    [-0.00564743, -0.00225607, 0.99998151, -0.007277],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  # robot configurations, 0->right 1->left
+  # comment out robot #1 if only using 1 arm
+  "robots": [
+    {
+      "robot_type": "indyrp2",
+      "robot_ip": "192.168.1.10",
+      "robot_obs_latency": 0.0001, "robot_action_latency": 0.1, "tcp_offset": 0.235,
+      # Neuromeka task pose UVW are Euler angles (deg), not axis-angle / rotvec.
+      # Confirmed against official neuromeka SDK (v3.4.2.1 motor.py rotation matrix,
+      # 1e-16 match): UVW is extrinsic xyz RPY, R = Rz(w)*Ry(v)*Rx(u).
+      # scipy: lowercase = extrinsic, uppercase = intrinsic.
+      "indy_task_rot_is_euler": true,
+      "indy_task_rot_euler_seq": "xyz",
+      "indy_task_rot_euler_in_degrees": true,
+      "indy_task_rot_euler_extrinsic": true,
+      # 0709 dataset TCP axes and the physical Indy TCP axes are identical:
+      #   +X = camera image down, +Y = camera left, +Z = camera forward.
+      # Do not add an axis exchange or a sign flip at deployment.
+      "indy_task_frame_xyz_signs": [1, 1, 1],
+      # Identity on purpose. The old SLAM/tag-to-robot overlay transform must
+      # not be carried into relative TCP policy execution.
+      "indy_robot_from_dataset_transform": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      # Camera-to-TCP rotation was already applied while building the 0709 Zarr.
+      # There is no additional tool-side rotation at deployment.
+      "indy_tool_rot_offset_deg": [0, 0, 0],
+      # Human teleop (keyboard / SpaceMouse): Rotation.from_euler(..., drot_xyz) * R
+      "indy_teleop_rot_euler_seq": "xyz",
+      "indy_teleop_rot_euler_extrinsic": false,
+      # Keep the model's rotation matrix/rotvec unchanged until the final Indy
+      # task-pose conversion. Do not perform a redundant Euler round-trip.
+      "indy_policy_tcp7_rot_euler_roundtrip": false,
+      "indy_policy_tcp7_rot_euler_seq": null,
+      "indy_policy_tcp7_rot_euler_extrinsic": null,
+      # table height for finger-table collision avoidance
+      # -inf to disable
+      "height_threshold": -0.024,
+      # sphere collision primitive size and location for inter-gripper collision avoidance
+      # 0 to disable
+      "sphere_radius": 0.1, "sphere_center": [0, -0.06, -0.185]
+    },
+    # {
+    #   "robot_type": "ur5",
+    #   "robot_ip": "192.168.0.9",
+    #   "robot_obs_latency": 0.0001, "robot_action_latency": 0.1, "tcp_offset": 0.235,
+    #   "height_threshold": 0.022,
+    #   "sphere_radius": 0.1, "sphere_center": [0, -0.06, -0.185]
+    # }
+  ],
+  # Integrated Dynamixel path: observations come from the present-position
+  # register and commands are scheduled with the robot action horizon.
+  "grippers": [
+    {
+      "gripper_type": "dynamixel",
+      "gripper_serial_port": "/dev/ttyUSB0",
+      "dynamixel_id": 1,
+      "dynamixel_baudrate": 57600,
+      "dynamixel_protocol_version": 2.0,
+      "dynamixel_open_position": 1700,
+      "dynamixel_close_position": 650,
+      "dynamixel_max_gripper_width": 0.05651384,
+      "dynamixel_profile_velocity": 30,
+      "dynamixel_profile_acceleration": 15,
+      "dynamixel_move_max_speed": 0.05,
+      "dynamixel_pwm_limit": 0.85,
+      "dynamixel_home_to_open": false,
+      "gripper_obs_latency": 0.01,
+      "gripper_action_latency": 0.1
+    }
+  ],
+  # transformation right arm's base frame in left arm's base coordinate frame
+  "tx_left_right": [
+    [ 0.99996206,  0.00661996,  0.00566226, -0.01676012],
+    [-0.00663261,  0.99997554,  0.0022186 , -0.60552492],
+    [-0.00564743, -0.00225607,  0.99998151, -0.007277  ],
+    [ 0.        ,  0.        ,  0.        ,  1.        ]
+  ]
+}

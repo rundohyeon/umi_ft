@@ -1,0 +1,26 @@
+# Training/evaluation datasets and recordings
+/data/
+/dataset_*.zip
+*.zarr/
+*.zarr.zip
+
+# Model checkpoints and exported weights
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Generated experiment outputs
+/artifacts/
+/outputs/
+/wandb/
+*.log
+
+# Python/test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local environments and editor metadata
+.venv/

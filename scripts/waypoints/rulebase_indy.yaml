@@ -1,0 +1,190 @@
+# Neuromeka Indy + Dynamixel gripper waypoint sequence
+#
+# Robot:
+#   movej  + absolute  -> joint angles in DEGREES
+#   movel  + absolute  -> TCP in base frame [x,y,z,u,v,w] mm/deg
+#   movel  + relative  -> delta in BASE/reference frame (not teach-pendant joy)
+#   movel  + tcp       -> delta in TOOL frame (matches joy / jog on pendant)
+#
+# Gripper (Dynamixel):
+#   type: gripper
+#   target: open | close | <integer ticks>
+#
+# Gripper tuning (top-level gripper: section and/or per-waypoint overrides):
+#   pwm_limit         - XL430 (model 1060): max PWM output 0-885 or fraction <=1
+#   current_limit     - XM/XC only: max current in A (<10) or raw units
+#   finish_mode       - goal | stopped | time
+#                       goal    = wait until position within tolerance (use for full open/close)
+#                       stopped = wait until motor stops (grasp only; may stop before close_position)
+#                       time    = wait finish_time_s after sending command
+#   finish_time_s     - seconds to hold for finish_mode=time, or minimum run time for stopped
+#   move_timeout_s    - max wait before timeout error (alias: timeout_s)
+#   move_tolerance    - position error allowed for finish_mode=goal (alias: tolerance)
+#   profile_velocity  - motion speed (lower = slower)
+#   profile_acceleration
+
+defaults:
+  vel_ratio: 10
+  acc_ratio: 15
+  dwell_s: 0.5
+
+gripper:
+  port: /dev/ttyUSB0
+  id: 1
+  baudrate: 57600
+  open_position: 1700
+  close_position: 650
+  profile_velocity: 30
+  profile_acceleration: 15
+  pwm_limit: 0.85
+  keep_torque: true
+  finish_mode: goal
+  finish_time_s: 2.0
+  move_timeout_s: 8.0
+  move_tolerance: 25
+
+waypoints:
+  # ##### temp ################################# 
+  - name: gripper_open
+    type: gripper
+    target: open
+
+  # - name: point7_retract
+  #   type: movel
+  #   frame: relative
+  #   target: [0, 150, 0, 0, 0, 0]
+
+  # - name: joints_return_home
+  #   type: movej
+  #   frame: absolute
+  #   # target: [-76.6, 5.3, -8.95, -111.73, 14.26, -8.22, -18.59]
+  #   target: [-73.35,-30.55, 6.73, -113.56, 26.88, 57.7, -18.59]
+
+  # ##### tool library ################################# 
+  # - name: gripper_open
+  #   type: gripper
+  #   target: open
+
+  # - name: joints_ready
+  #   type: movej
+  #   frame: absolute
+  #   target: [-76.6, 5.3, -8.95, -111.73, 14.26, -8.22,]
+
+  # - name: gripper_init
+  #   type: gripper
+  #   target: open
+
+  # - name: joints_grasp_ready
+  #   type: movej
+  #   frame: absolute
+  #   target: [-94.92, -32.53, 5.06, -114.6, -0.69, 56.35, -2.34]
+
+  # - name: base_grasp_ready
+  #   type: movel
+  #   frame: relative
+  #   target: [0, -130, 0, 0, 0, 0]
+
+  # - name: grasp_part
+  #   type: gripper
+  #   target: close
+  #   finish_mode: stopped
+  #   finish_time_s: 2.0
+  #   pwm_limit: 0.85
+
+  # - name: point1_move_right
+  #   type: movel
+  #   frame: tcp
+  #   target: [-30, 0, 0, 0, 0, 0]
+
+  # - name: point2_move_down
+  #   type: movel
+  #   frame: tcp
+  #   target: [0, 0, -100, 0, 0, 0]
+
+  # - name: point3_move_left
+  #   type: movel
+  #   frame: tcp
+  #   target: [165, 0, 0, 0, 0, 0]
+
+  # - name: point4_move_up
+  #   type: movel
+  #   frame: tcp
+  #   target: [0, 0, 100, 0, 0, 0]
+
+  # - name: point4_move_up_right
+  #   type: movel
+  #   frame: tcp
+  #   target: [-60, 0, 100, 0, 0, 0]
+
+  # - name: point4_move_up_left
+  #   type: movel
+  #   frame: tcp
+  #   target: [60, 0, 50, 0, 0, 0]
+
+  # - name: point5_move_left_a
+  #   type: movel
+  #   frame: tcp
+  #   vel_ratio: 8
+  #   target: [100, 0, 0, 0, 0, 0]
+
+  # - name: point5_move_left_b
+  #   type: movel
+  #   frame: tcp
+  #   vel_ratio: 8
+  #   target: [100, 0, 0, 0, 0, 0]
+
+  # - name: point5_move_left_c
+  #   type: movel
+  #   frame: tcp
+  #   vel_ratio: 8
+  #   target: [100, 0, 0, 0, 0, 0]
+
+  # - name: point6_move_left
+  #   type: movel
+  #   frame: tcp
+  #   target: [0, 0, -100, 0, 0, 0]
+
+  # - name: gripper_release
+  #   type: gripper
+  #   target: open
+
+  # - name: point7_retract
+  #   type: movel
+  #   frame: tcp
+  #   target: [0, 150, 0, 0, 0, 0]
+
+  # - name: joints_return_home
+  #   type: movej
+  #   frame: absolute
+  #   target: [-73.35,-30.55, 6.73, -113.56, 26.88, 57.7, -18.59]
+
+
+
+  # ##### tool library ################################# 
+  # - name: tcp_above_table
+  #   type: movel
+  #   frame: absolute
+  #   target: [420, 0, 280, 180, 0, 180]
+
+  # - name: tcp_pick
+  #   type: movel
+  #   frame: absolute
+  #   target: [420, 0, 220, 180, 0, 180]
+
+  # - name: gripper_close
+  #   type: gripper
+  #   target: close
+
+  # - name: lift_with_part
+  #   type: movel
+  #   frame: relative
+  #   target: [0, 0, 30, 0, 0, 0]
+
+  # - name: gripper_open_release
+  #   type: gripper
+  #   target: open
+
+  # - name: return_home
+  #   type: movej
+  #   frame: absolute
+  #   target: home

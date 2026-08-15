@@ -1,0 +1,26 @@
+맞아, 터미널(terminal)에 치면 돼. 지금 new-laptop에 SSH로 접속한 그 터미널 창에 그대로 입력하면 돼.
+
+순서대로:
+
+1) 터미널에 이거 한 줄 복붙 → 엔터:
+
+
+cd /home/idim/smh/indy_umi_rg && scripts_real/run_record_gopro_rg2ft.sh ~/umi_data/session_20260722
+2) 이런 화면이 뜨면 성공:
+
+
+Ready. Output: .../demos  (next episode: demo_0000)
+[space]/r record | o open | c close | z zero-FT | q quit
+[idle] ep0000 cap=20.1fps enc=0 | w=99.8mm fz=(82.8,-69.8)N det=0
+3) 이제부터는 명령어 치는 게 아니라, 그 창에서 그냥 키 하나만 누르면 돼 (엔터도 필요 없음):
+
+space(스페이스바) = 녹화 시작 → 다시 누르면 정지
+o = 그리퍼 열기, c = 닫기
+q = 종료
+즉 처음 실행 명령 한 줄만 치고, 그 다음부터는 키만 누르는 것이야.
+
+한 가지만 확인 — 지금 터미널이:
+
+VS Code 안의 터미널 창이든
+그냥 SSH 터미널이든
+둘 다 상관없이 거기다 치면 돼. 지금 그 창에 1번 명령어 쳐보고, 나온 결과 그대로 붙여줄래?

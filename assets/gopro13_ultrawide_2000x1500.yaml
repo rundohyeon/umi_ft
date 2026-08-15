@@ -1,0 +1,75 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters
+#--------------------------------------------------------------------------------------------
+# GoPro Hero 13 Black + MaxLens Mod 2.0 at 4000x3000 (native ultrawide)
+# Calibration from Gyroflow lens_profiles (calibrated by Damian, RMS=0.816)
+File.version: "1.0"
+Camera.type: "KannalaBrandt8"
+
+# Intrinsics at full 4000x3000 (2x the former 0.5-scale values)
+Camera1.fx: 1422.7505103939195
+Camera1.fy: 1423.2778854704363
+Camera1.cx: 1989.901463339594
+Camera1.cy: 1483.1933077080614
+
+# Distortion parameters (resolution independent)
+Camera1.k1: 0.15259797885624934
+Camera1.k2: -0.12637681547624
+Camera1.k3: 0.0774855085617644
+Camera1.k4: -0.01752772577624508
+
+# Camera resolution
+Camera.width: 4000
+Camera.height: 3000
+
+# Camera frames per second
+Camera.fps: 60
+
+# Color order of the images (0: BGR, 1: RGB)
+Camera.RGB: 1
+
+# Transformation from camera to imu (body frame)
+# calibrated with OpenICC (GoPro 10/11 MaxLens - same mount geometry)
+IMU.T_b_c1: !!opencv-matrix
+    rows: 4
+    cols: 4
+    dt: f
+    data: [ 0.00156717, -0.99997878,  0.00632289, -0.01321271, -0.99996531,
+       -0.00161881, -0.00817069, -0.00330095,  0.00818075, -0.00630987,
+       -0.99994663, -0.05175258,  0.        ,  0.        ,  0.        ,
+        1.        ]
+
+# IMU noise (relaxed for Hero 13 - Tbc from Hero 10/11 may not be exact)
+IMU.NoiseGyro: 0.004
+IMU.NoiseAcc: 0.04
+IMU.GyroWalk: 1.0e-4
+IMU.AccWalk: 0.01
+IMU.Frequency: 200.0
+
+System.thFarPoints: 20.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 5000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 12
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 0.5

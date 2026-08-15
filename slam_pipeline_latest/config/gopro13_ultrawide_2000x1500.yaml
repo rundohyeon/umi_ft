@@ -1,0 +1,79 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters
+#--------------------------------------------------------------------------------------------
+# GoPro Hero 13 Black + MaxLens Mod 2.0 at 4000x3000 (native ultrawide)
+# Calibration from Gyroflow lens_profiles (calibrated by Damian, RMS=0.816)
+File.version: "1.0"
+Camera.type: "KannalaBrandt8"
+
+# Intrinsics at full 4000x3000 (2x the former 0.5-scale values)
+Camera1.fx: 1422.7505103939195
+Camera1.fy: 1423.2778854704363
+Camera1.cx: 1989.901463339594
+Camera1.cy: 1483.1933077080614
+
+# Distortion parameters (resolution independent)
+Camera1.k1: 0.15259797885624934
+Camera1.k2: -0.12637681547624
+Camera1.k3: 0.0774855085617644
+Camera1.k4: -0.01752772577624508
+
+# Camera resolution
+Camera.width: 4000
+Camera.height: 3000
+
+# Camera frames per second
+Camera.fps: 60
+
+# Color order of the images (0: BGR, 1: RGB)
+Camera.RGB: 1
+
+# Transformation from camera to imu (body frame)
+# OpenICC cam-imu calibration (2025-06-15)
+# Videos: cam/GX010191, imu_bias/GX010193, cam_imu/GX010196
+# Source: 0615/openicc_dataset/cam_imu/cam_imu_calib_result_GX010196.json
+# perm_mat @ inv(T_i_c) per gopro10_maxlens_fisheye_setting_v1_720.yaml
+# final_reproj_error=1.67px, time_offset_imu_to_cam=-0.0126s
+IMU.T_b_c1: !!opencv-matrix
+    rows: 4
+    cols: 4
+    dt: f
+    data: [ 0.00866858, -0.99995048,  0.00488735, -0.07149465, -0.99996149,
+       -0.00866179,  0.00141031, -0.02352274, -0.00136791, -0.00489939,
+       -0.99998706, -0.00307761,  0.        ,  0.        ,  0.        ,
+        1.        ]
+
+# IMU noise (GoPro 10/11 OpenICC defaults; Hero 13 Allan variance not measured)
+IMU.NoiseGyro: 0.0015
+IMU.NoiseAcc: 0.017
+IMU.GyroWalk: 5.0e-5
+IMU.AccWalk: 0.0055
+IMU.Frequency: 200.0
+
+System.thFarPoints: 20.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 5000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 12
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 0.5

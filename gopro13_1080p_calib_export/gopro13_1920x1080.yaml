@@ -1,0 +1,81 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters
+#--------------------------------------------------------------------------------------------
+# GoPro Hero 13 Black, 1920x1080 @ 59.94fps (new camera settings, 2026-07)
+# Intrinsics: OpenICC cam calibration gopro13_umi_calibration/cam_calib_GX010460_fi_1.0.json
+#   final_reproj_error = 0.193 px, 284 calib images, FISHEYE (KannalaBrandt)
+File.version: "1.0"
+Camera.type: "KannalaBrandt8"
+
+Camera1.fx: 685.5804631360595
+Camera1.fy: 688.2948421098316
+Camera1.cx: 960.5530992092887
+Camera1.cy: 550.6608837254979
+
+Camera1.k1: 0.16849768428394726
+Camera1.k2: -0.184064881350328
+Camera1.k3: 0.1440691584794357
+Camera1.k4: -0.042610853342964404
+
+# Camera resolution
+Camera.width: 1920
+Camera.height: 1080
+
+# Camera frames per second
+Camera.fps: 60
+
+# Color order of the images (0: BGR, 1: RGB)
+Camera.RGB: 1
+
+# Transformation from camera to imu (body frame)
+# OpenICC cam-imu calibration gopro13_umi_calibration/cam_imu_calib_result_GX010463.json
+#   final_reproj_error = 1.213 px, time_offset_imu_to_cam = -0.0126 s (not modeled by gopro_slam)
+# Tbc = perm_mat @ T_i_c   (T_i_c is already camera->IMU; do NOT invert.
+#   Verified against OpenICC source: T_w_c = T_w_i * T_i_c.
+#   perm_mat = [[0,0,1],[1,0,0],[0,1,0]] converts OpenICC IMU axes back to raw
+#   gopro-telemetry order, matching gopro_slam.cc which feeds raw [0,1,2] axes.)
+IMU.T_b_c1: !!opencv-matrix
+    rows: 4
+    cols: 4
+    dt: f
+    data: [ 0.00306531, -0.99928248, -0.03775094,  0.00132381, -0.99912100,
+       -0.00148218, -0.04189302,  0.00183159,  0.04180700,  0.03784618,
+       -0.99840865,  0.04043633,  0.        ,  0.        ,  0.        ,
+        1.        ]
+
+# IMU noise (GoPro 10/11 OpenICC defaults)
+# GyroWalk raised 5e-5 -> 5e-4: measured gyro bias drifts within a session
+# (GX010453: ~0.002 rad/s over 70 s), online bias estimation must track it.
+IMU.NoiseGyro: 0.0015
+IMU.NoiseAcc: 0.017
+IMU.GyroWalk: 5.0e-4
+IMU.AccWalk: 0.0055
+IMU.Frequency: 200.0
+
+System.thFarPoints: 20.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 5000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 12
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 1.0

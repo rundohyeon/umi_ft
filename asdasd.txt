@@ -1,0 +1,265 @@
+--tcp_delta_scales 1,0,0
+--tcp_delta_scales 0,1,0
+--tcp_delta_scales 0,0,1
+
+
+#########################3
+AI inference
+
+root@idimd:/ros2_ws/src/indy_umi#
+python3 eval_real_indy.py   --robot_config example/eval_robots_config_indy.yaml  -i scripts/waypoints/0624_latest.ckpt   -o data/eval_run   --vis_pose   --print_motion_debug 
+
+press 'c' in the 2nd image 
+ctrl + c must done in the command line
+
+#########################
+home position
+
+root@idimd:/ros2_ws/src/indy_umi#
+python3 scripts/example_neuromeka_movej_movel.py run   --ip 192.168.1.10   --waypoints scripts/waypoints/rulebase_indy.yaml 
+
+
+
+#################
+
+python3 eval_real_indy.py \
+  --robot_config example/eval_robots_config_indy.yaml \
+  -i scripts/waypoints/0625_axist.ckpt \
+  -o data/eval_run \
+  --vis_pose \
+  --print_motion_debug \
+  --max_policy_iters 1 \
+  --action_scale 0.1 \
+  --freeze_rotation
+
+  #############
+
+python3 eval_real_indy.py \
+  -i scripts/waypoints/0625_axist.ckpt \
+  -o data/eval_run \
+  -rc example/eval_robots_config_indy.yaml \
+  --action_scale 0.5 \
+  --print_motion_debug \
+  --print_policy_output
+
+  #####
+  /home/idim/miniforge3/envs/umi/bin/python eval_real_indy.py \
+  -i scripts/waypoints/0625_axist.ckpt \
+  -o data/eval_run \
+  -rc example/eval_robots_config_indy.yaml
+
+  #####################
+  네. 참고로 옵션 확인하다 하나 알게 된 것: --freeze_rotation이 기본 on이라 그동안 회전 명령이 에피소드 내내 고정이었던 게 이것 때문이었네요. 2단계는 우선 이 기본값(위치만 실행) 그대로 가는 게 안전합니다.
+
+1단계 — 로봇 정지 상태로 보정 확인:
+
+
+cd /home/idim/dkim/umi/scripts/indy_umi
+
+/home/idim/miniforge3/envs/umi/bin/python eval_real_indy.py \
+  -i scripts/waypoints/epoch100_axis.ckpt \
+  -o data/eval_run \
+  -rc example/eval_robots_config_indy.yaml \
+  --plan_only \
+  --print_motion_debug \
+  --print_model_input \
+  --pose_eval_audit \
+  --dataset_zarr data/axix_data_zarrfile/dataset_axis_newP.zarr.zip
+체크리스트 (이 3개 다 통과해야 2단계 진행):
+
+/home/idim/miniforge3/envs/umi/bin/python eval_real_indy.py \
+  -i scripts/waypoints/epoch100_axis.ckpt \
+  -o data/eval_run \
+  -rc example/eval_robots_config_indy.yaml \
+  -m data/axix_data_zarrfile/dataset_axis_newP.zarr.zip \
+  --allow_rotation
+
+
+시작 로그에 [IndyPositionalController] tool_rot_offset_deg=[90.0, 0.0, 0.0] 출력 → 보정 활성화 확인
+[Indy] interpreted TCP (m, rotvec rad)=...의 회전 부분이 [-2.x, ±1.x, ~0] 대역 → 기존 [-0.8, 0.7, -0.8] 같은 값이 나오면 보정이 안 먹은 것
+c 눌러서 정책 추론 시작 후, --print_motion_debug의 waypoint 델타 방향이 상식적인지 (그리퍼가 필름 쪽을 볼 때 전진 방향이 필름 쪽인지)
+2단계 — 저속·위치만·10사이클 제한 실행:
+
+
+/home/idim/miniforge3/envs/umi/bin/python eval_real_indy.py \
+  -i scripts/waypoints/epoch100_axis.ckpt \
+  -o data/eval_run \
+  -rc example/eval_robots_config_indy.yaml \
+  --print_motion_debug \
+  --action_scale 0.5 \
+  -mpi 10
+--action_scale 0.5: 이동량 절반
+-mpi 10: 추론 10사이클 후 자동 정지 (~3초 분량)
+회전은 기본값으로 얼려져 있음 (위치 방향만 먼저 검증)
+데모와 같은 시작 자세 잡고 c로 시작, 한 손은 E-stop에
+여기서 로봇이 테스트베드/필름 쪽으로 접근하면 성공입니다. 이전처럼 반대로 멀어지면 즉시 정지하고 로그 폴더명 알려주세요.
+
+2단계 통과 후 — 풀 실행:
+
+
+/home/idim/miniforge3/envs/umi/bin/python eval_real_indy.py \
+  -i scripts/waypoints/epoch100_axis.ckpt \
+  -o data/eval_run \
+  -rc example/eval_robots_config_indy.yaml \
+  --allow_rotation
+--allow_rotation을 켜야 정책의 회전 액션까지 실행됩니다 (grasp 자세 만들려면 필요). 각 단계 로그는 계속 data/eval_run/eval_logs/에 쌓이니, 돌리고 나서 "진단해줘" 하시면 바로 분석하겠습니다.
+
+################################3
+
+python eval_real_indy.py \
+  -i scripts/waypoints/epoch100_axis.ckpt \
+  -o data/eval_run \
+  -rc example/eval_robots_config_indy.yaml \
+  -m data/axix_data_zarrfile/dataset_axis_newP.zarr.zip \
+  --allow_rotation
+
+  ###############################################
+
+  cd /home/idim/dkim/umi/scripts/indy_umi
+
+python eval_real_indy.py \
+  -i scripts/waypoints/epoch100_axis.ckpt \
+  -o data/eval_run \
+  -rc example/eval_robots_config_indy.yaml \
+  -m data/axix_data_zarrfile/dataset_axis_newP.zarr.zip \
+  --allow_rotation
+  
+  시작 로그에 tool_rot_offset_deg=[111.93, 29.0, 71.39] 뜨는지 확인 (구버전이면 [90.0, 0.0, 0.0]이 뜰 것)
+Loaded initial frame for 79 episodes 확인
+오버레이 뜬 화면에서 n/b로 데모 에피소드 고르고, 키보드 텔레옵으로 라이브 뷰를 고스트 이미지에 겹치게 접근
+겹쳐지면 c로 정책 시작, 손은 E-stop 옆에
+이동 방향이 이제 필름 쪽인지 바로 확인 — 처음 1~2초만 보고 또 뒤로 가면 즉시 정지
+
+
+
+################
+
+Docker container name: indy_umi
+Script inside Docker: /ros2_ws/src/indy_umi_114/deploy_0709_real_robot.sh
+
+Run from host:
+
+docker exec -it indy_umi bash -lc 'cd /ros2_ws/src/indy_umi_114 && ACTION_SCALE=0.5 ./deploy_0709_real_robot.sh --match_dataset artifacts/0709_robot_tcp/dataset_robot_tcp.zarr.zip'
+
+or, if already inside Docker:
+
+cd /ros2_ws/src/indy_umi_114
+ACTION_SCALE=0.5 ./deploy_0709_real_robot.sh --match_dataset artifacts/0709_robot_tcp/dataset_robot_tcp.zarr.zip
+
+Expected: starts in "Human in control!" jog mode with overlay. Use n/b for episode, jog keys to align, then press c.
+
+
+#########
+ACTION_SCALE=0.2 ./deploy_0709_real_robot.sh \
+  --match_dataset artifacts/0709_robot_tcp/dataset_robot_tcp.zarr.zip \
+  --show_policy_image \
+  --policy_input_audit \
+  --coord_transform_audit
+
+
+ACTION_SCALE=1.0 ./deploy_0709_real_robot.sh \
+  --match_dataset artifacts/0709_robot_tcp/dataset_robot_tcp.zarr.zip \
+  --match_episode 1 \
+  --RG2_ENABLE_MOTION=1 \
+  --show_policy_image \
+  --policy_input_audit \
+  --coord_transform_audit
+
+python3 scripts/example_neuromeka_movej_movel.py run \
+  --ip 192.168.1.10 \
+  --waypoints scripts/waypoints/rulebase_indy.yaml
+  
+ACTION_SCALE=1.0 ./deploy_real_indy_rg2.sh \
+  --max_policy_iters 1 \
+  --print_motion_debug \
+  --show_policy_image \
+  --policy_input_audit \
+  --coord_transform_audit  
+
+python3 scripts/example_neuromeka_movej_movel_rg2.py run \
+  --ip 192.168.1.10 \
+  --waypoints scripts/waypoints/rulebase_indy_rg2.yaml
+  
+
+
+
+  ---
+  perfect episode 1
+
+  [teleop] target_tcp xyz(m) rotvec(rad): [-0.14343 -0.8714   0.31803  1.24868  1.37743 -1.14397]
+[teleop] grip_cmd width(m): 0.051992732800000004 delta_this_frame: 0.0
+
+---
+
+
+시작 
+1. cd ~/smh/indy_umi_rg/
+2. docker exec -it indy_umi bash
+3. cd src/indy_umi_rg/
+4. ACTION_SCALE=1.0 ./deploy_real_indy_rg2.sh \
+        --max_policy_iters 1 \
+        --print_motion_debug \
+        --show_policy_image \
+        --policy_input_audit \
+        --coord_transform_audit  
+5. joy 로 시작 위치로 이동
+6. 'c' policy 시작 (이미지 화면)
+7. terminal 에서 'ctrl + c' (terminal 에서)
+
+끝낼때
+8. 4~6 반복
+
+
+강제종료
+1. E-stop
+2. terminal 에서 'ctrl + c' (terminal 에서)
+3. E-stop 버튼 회전
+4. 로봇 컨트로박스 전원 off/on
+
+
+#########################
+
+FT 코드만 Docker 컨테이너로 복사
+(학습 데이터·데모는 제외합니다.)
+tar -cf - \
+  --exclude='indy_umi_rg_ft/data' \
+  --exclude='indy_umi_rg_ft/demos' \
+  --exclude='indy_umi_rg_ft/demos_0811' \
+  --exclude='indy_umi_rg_ft/wandb' \
+  --exclude='indy_umi_rg_ft/.pytest_cache' \
+  --exclude='__pycache__' \
+  indy_umi_rg_ft | docker exec -i indy_umi tar -C /ros2_ws/src -xf -
+체크포인트용 폴더 생성
+docker exec indy_umi mkdir -p /ros2_ws/src/indy_umi_rg_ft/data/checkpoints
+사용할 체크포인트를 컨테이너로 복사
+docker cp \
+  ~/smh/indy_umi_rg_ft/data/outputs/2026.08.12/09.33.24_umift-indy-rg2ft_umift-indy-rg2ft/checkpoints/epoch=0042-val_loss=0.0184.ckpt \
+  indy_umi:/ros2_ws/src/indy_umi_rg_ft/data/checkpoints/rg2ft_epoch0042.ckpt
+Docker 컨테이너에 들어가기
+docker exec -it indy_umi bash
+FT 프로젝트로 이동
+cd /ros2_ws/src/indy_umi_rg_ft
+먼저 안전 확인 실행 — 로봇은 움직이지 않음
+ACTION_SCALE=1.0 \
+RG2_CHECKPOINT="$PWD/data/checkpoints/rg2ft_epoch0042.ckpt" \
+./deploy_real_indy_rg2.sh \
+  --max_policy_iters 1 \
+  --print_motion_debug \
+  --show_policy_image \
+  --policy_input_audit \
+  --coord_transform_audit
+출력·카메라·시작 자세를 확인한 뒤 Ctrl+C로 끝내고, 실제 구동은 아래 명령으로 다시 실행
+ACTION_SCALE=1.0 \
+RG2_ENABLE_MOTION=1 \
+RG2_CHECKPOINT="$PWD/data/checkpoints/rg2ft_epoch0042.ckpt" \
+./deploy_real_indy_rg2.sh \
+  --max_policy_iters 1 \
+  --print_motion_debug \
+  --show_policy_image \
+  --policy_input_audit \
+  --coord_transform_audit
+joy로 시작 위치 이동 → 이미지 창에서 c로 policy 시작 → 종료는 터미널에서 Ctrl+C.
+강제 종료는 말씀하신 대로: E-stop → 터미널 Ctrl+C → E-stop 해제(회전) → 컨트롤박스 전원 재기동입니다.
+
+
+4:06 PM

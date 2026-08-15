@@ -1,0 +1,68 @@
+# Neuromeka Indy + OnRobot RG2-FT waypoint sequence
+#
+# Robot targets and frames are identical to rulebase_indy.yaml.
+# RG2-FT gripper targets:
+#   target: open | close | <width in metres>
+#
+# For an empty full-close, finish_mode=goal is appropriate.  When grasping an
+# object the fingers can stop before 0m, so use finish_mode=stopped.
+
+defaults:
+  vel_ratio: 10
+  acc_ratio: 15
+  dwell_s: 0.5
+
+gripper:
+  host: 192.168.2.1
+  port: 502
+  slave_id: 65
+  gripper_type: rg2ft
+  frequency: 100
+  force_n: 20.0
+  open_width_m: 0.08
+  close_width_m: 0.0
+  finish_mode: goal
+  finish_time_s: 1.0
+  move_timeout_s: 8.0
+  move_tolerance_m: 0.005
+  stopped_stable_s: 0.35
+  stopped_tolerance_m: 0.0005
+
+waypoints:
+  # ##### temp ################################# 
+  - name: gripper_open
+    type: gripper
+    target: open
+
+  # - name: point7_retract
+  #   type: movel
+  #   frame: relative
+  #   target: [0, 150, 0, 0, 0, 0]
+
+  - name: joints_return_home
+    type: movej
+    frame: absolute
+    # target: [-76.6, 5.3, -8.95, -111.73, 14.26, -8.22, -18.59]
+    target: [-73.35,-30.55, 6.73, -113.56, 26.88, 57.7, -18.59]
+  ######################################
+
+  # Kept disabled to match indy_umi_rg/scripts/waypoints/rulebase_indy.yaml.
+  # - name: joints_return_home
+  #   type: movej
+  #   frame: absolute
+  #   target: [-73.35, -30.55, 6.73, -113.56, 26.88, 57.7, -18.59]
+
+  # RG2-FT examples:
+  # - name: grasp_part
+  #   type: gripper
+  #   target: close
+  #   finish_mode: stopped
+  #   finish_time_s: 1.0
+
+  # - name: half_open
+  #   type: gripper
+  #   target: 0.05
+
+  # - name: release_part
+  #   type: gripper
+  #   target: open
