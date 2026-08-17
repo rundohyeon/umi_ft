@@ -1,0 +1,51 @@
+defaults:
+  - train_diffusion_unet_timm_umi_workspace
+  - override task: umi_dual_ft
+  - _self_
+
+name: train_diffusion_unet_timm_umi_dual_ft
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+
+# Prediction remains the existing 16 policy samples. Execution is a separate
+# deployment setting and can be changed without retraining.
+prediction_horizon: ${task.action_horizon}
+execution:
+  action_frequency: ${task.action_frequency}
+  n_action_steps: 2
+  allowed_n_action_steps: [1, 2, 4, 8]
+  replanning_interval_ms: ${eval:'1000.0 * ${execution.n_action_steps} / ${execution.action_frequency}'}
+n_action_steps: ${execution.n_action_steps}
+
+policy:
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.dual_ft_obs_encoder.DualFTObsEncoder
+    shape_meta: ${shape_meta}
+    model_name: 'vit_base_patch16_clip_224.openai'
+    pretrained: true
+    frozen: false
+    global_pool: ''
+    feature_aggregation: 'attention_pool_2d'
+    position_encording: 'sinusoidal'
+    downsample_ratio: 32
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+    use_group_norm: true
+    share_rgb_model: false
+    imagenet_norm: true
+    left_ft_key: robot0_ft_left
+    right_ft_key: robot0_ft_right
+    vision_feature_dim: 768
+    fusion_dim: 768
+    fusion_heads: 8
+    fusion_layers: 1
+    fusion_feedforward_dim: 2048
+    fusion_dropout: 0.0
+    ft_channel_dims: [16, 32, 64, 128]
+    share_ft_encoder: false

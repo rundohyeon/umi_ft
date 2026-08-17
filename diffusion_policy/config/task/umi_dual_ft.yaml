@@ -1,0 +1,128 @@
+name: umi_dual_ft
+
+# The policy anchor is the timestamp of the latest RGB frame actually used by
+# the TARGET pipeline. RGB, pose, and gripper share this timestamp grid in the
+# supplied dataset. F/T is selected independently and causally at 100 Hz.
+raw_rgb_frequency: 59.94003572704538
+ft_frequency: 100.00009536752259
+obs_down_sample_steps: 3
+action_frequency: ${eval:'${task.raw_rgb_frequency} / ${task.obs_down_sample_steps}'}
+
+low_dim_obs_horizon: 2
+img_obs_horizon: 2
+ft_obs_horizon: 32
+ft_obs_stride: 1
+ft_history_seconds: 0.31
+action_horizon: 16
+ignore_proprioception: false
+
+shape_meta: &shape_meta
+  obs:
+    camera0_rgb:
+      shape: [3, 224, 224]
+      horizon: ${task.img_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: rgb
+      ignore_by_policy: false
+    robot0_eef_pos:
+      shape: [3]
+      horizon: ${task.low_dim_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_eef_rot_axis_angle:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: low_dim
+      rotation_rep: rotation_6d
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_gripper_width:
+      shape: [1]
+      horizon: ${task.low_dim_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_ft_left:
+      shape: [6]
+      horizon: ${task.ft_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.ft_obs_stride}
+      type: low_dim
+      ignore_by_policy: false
+    robot0_ft_right:
+      shape: [6]
+      horizon: ${task.ft_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.ft_obs_stride}
+      type: low_dim
+      ignore_by_policy: false
+    robot0_eef_rot_axis_angle_wrt_start:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+  action:
+    shape: [10]
+    horizon: ${task.action_horizon}
+    latency_steps: 0
+    down_sample_steps: ${task.obs_down_sample_steps}
+    rotation_rep: rotation_6d
+
+dataset_path: data/dataset_multirate_clean.zarr.zip
+pose_repr: &pose_repr
+  obs_pose_repr: relative
+  action_pose_repr: relative
+
+# Explicit allowlist. No dataset key is auto-registered into shape_meta.
+data_keys: &data_keys
+  rgb: rgb_0
+  rgb_timestamp: rgb_time_stamps_0
+  pose: ts_pose_fb_0
+  pose_timestamp: robot_time_stamps_0
+  gripper: gripper_0
+  gripper_timestamp: gripper_time_stamps_0
+  rgb_episode_ends: episode_rgb0_len
+  pose_episode_ends: episode_robot0_len
+  gripper_episode_ends: episode_gripper0_len
+
+ft: &ft
+  left_key: wrench_left_0
+  right_key: wrench_right_0
+  left_timestamp_key: wrench_time_stamps_0
+  right_timestamp_key: wrench_time_stamps_0
+  left_episode_ends_key: episode_wrench0_len
+  right_episode_ends_key: episode_wrench0_len
+  num_steps: ${task.ft_obs_horizon}
+  stride: ${task.ft_obs_stride}
+  history_seconds: ${task.ft_history_seconds}
+  padding: repeat_first
+  channel_order: [Fx, Fy, Fz, Tx, Ty, Tz]
+  force_unit: N
+  torque_unit: Nm
+  left_frame: left_native_sensor
+  right_frame: right_native_sensor
+  axis_permutation: [0, 1, 2, 3, 4, 5]
+  axis_sign: [1, 1, 1, 1, 1, 1]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.umi_dual_ft_dataset.UmiDualFTDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  data_keys: *data_keys
+  ft: *ft
+  pose_repr: *pose_repr
+  action_padding: false
+  seed: 42
+  val_ratio: 0.05

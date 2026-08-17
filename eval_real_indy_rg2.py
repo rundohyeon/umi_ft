@@ -1774,11 +1774,16 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
 @click.option('--camera_reorder', '-cr', default='0')
 @click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
 @click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robot joint configuration in the beginning.")
-@click.option('--steps_per_inference', '-si', default=6, type=int, help="Action horizon for inference.")
+@click.option(
+    '--steps_per_inference', '-si', default=None, type=int,
+    help=(
+        "Number of predicted actions to execute before replanning. Defaults "
+        "to checkpoint execution.n_action_steps (dual-F/T default: 2)."
+    ),
+)
 @click.option('--max_duration', '-md', default=2000000, help='Max duration for each epoch in seconds.')
-@click.option('--frequency', '-f', default=19.98, type=float,
-    help="Control frequency in Hz. Default matches training's effective step "
-         "interval: 59.94fps / obs_down_sample_steps(3) = 19.98Hz.")
+@click.option('--frequency', '-f', default=None, type=float,
+    help="Control frequency in Hz. Defaults to checkpoint action frequency.")
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
 @click.option('--no_spacemouse', is_flag=True, default=True, help="Disable SpaceMouse and use keyboard teleop only.")
 @click.option('--no_gripper', is_flag=True, default=False, help="Run without connecting to gripper hardware.")
@@ -2125,6 +2130,55 @@ def main(input, output, robot_config,
     if OmegaConf.select(cfg, "policy.obs_encoder.pretrained") is not None:
         cfg.policy.obs_encoder.pretrained = False
     print("model_name:", cfg.policy.obs_encoder.model_name)
+    left_ft_meta = OmegaConf.select(
+        cfg, "task.shape_meta.obs.robot0_ft_left", default=None
+    )
+    right_ft_meta = OmegaConf.select(
+        cfg, "task.shape_meta.obs.robot0_ft_right", default=None
+    )
+    if (left_ft_meta is None) != (right_ft_meta is None):
+        raise click.ClickException(
+            "checkpoint must request both robot0_ft_left and robot0_ft_right"
+        )
+    dual_ft_enabled = left_ft_meta is not None
+    if dual_ft_enabled:
+        left_ft_horizon = int(left_ft_meta.horizon)
+        right_ft_horizon = int(right_ft_meta.horizon)
+        if left_ft_horizon != right_ft_horizon:
+            raise click.ClickException("left/right F/T horizons must match")
+        ft_obs_horizon = left_ft_horizon
+        ft_obs_stride = int(left_ft_meta.get("down_sample_steps", 1))
+    else:
+        ft_obs_horizon = 0
+        ft_obs_stride = 1
+
+    if steps_per_inference is None:
+        steps_per_inference = int(
+            OmegaConf.select(cfg, "execution.n_action_steps", default=6)
+        )
+    if dual_ft_enabled:
+        allowed_steps = list(
+            OmegaConf.select(
+                cfg,
+                "execution.allowed_n_action_steps",
+                default=[1, 2, 4, 8],
+            )
+        )
+        if int(steps_per_inference) not in set(map(int, allowed_steps)):
+            raise click.ClickException(
+                f"dual-F/T steps_per_inference must be one of {allowed_steps}"
+            )
+    if frequency is None:
+        frequency = float(
+            OmegaConf.select(cfg, "execution.action_frequency", default=19.98)
+        )
+    if frequency <= 0:
+        raise click.ClickException("frequency must be positive")
+    if dual_ft_enabled and no_gripper:
+        raise click.ClickException(
+            "dual-F/T deployment requires the live RG2-FT sensor; "
+            "--no_gripper is not supported"
+        )
     embedded_dataset_path = str(cfg.task.dataset.dataset_path)
     print("checkpoint dataset_path metadata:", embedded_dataset_path)
     print(
@@ -2207,6 +2261,11 @@ def main(input, output, robot_config,
         )
 
     print("steps_per_inference:", steps_per_inference)
+    print("action_frequency_hz:", f"{frequency:.9f}")
+    print(
+        "replanning_interval_ms:",
+        f"{1000.0 * int(steps_per_inference) / frequency:.3f}",
+    )
     tcp_delta_scale_vec = _parse_tcp_delta_scales(tcp_delta_scales)
     if plan_only:
         max_policy_iters = 1
@@ -2279,6 +2338,15 @@ def main(input, output, robot_config,
                 camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
                 robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
                 gripper_obs_horizon=cfg.task.shape_meta.obs.robot0_gripper_width.horizon,
+                ft_obs_horizon=ft_obs_horizon,
+                ft_obs_stride=ft_obs_stride,
+                ft_obs_frequency=float(
+                    OmegaConf.select(
+                        cfg,
+                        "task.ft_frequency",
+                        default=gc.get('rg2ft_frequency', 100.0),
+                    )
+                ),
                 no_mirror=no_mirror,
                 fisheye_converter=fisheye_converter,
                 policy_image_crop_ratio=policy_image_crop_ratio,
@@ -3228,6 +3296,15 @@ def main(input, output, robot_config,
                             )
                         obs_timestamps = obs['timestamp']
                         print(f'Obs latency {time.time() - obs_timestamps[-1]}')
+                        if dual_ft_enabled:
+                            print(
+                                "Dual-F/T causal timing: "
+                                f"anchor={float(obs_timestamps[-1]):.9f} "
+                                f"left_last={float(obs['robot0_ft_left_timestamps'][-1]):.9f} "
+                                f"left_age_ms={float(obs['robot0_ft_left_age']) * 1000.0:.3f} "
+                                f"right_last={float(obs['robot0_ft_right_timestamps'][-1]):.9f} "
+                                f"right_age_ms={float(obs['robot0_ft_right_age']) * 1000.0:.3f}"
+                            )
 
                         # run inference
                         with torch.no_grad():

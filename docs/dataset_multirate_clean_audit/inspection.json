@@ -1,0 +1,2058 @@
+{
+  "actual_action_frequency_hz": 19.980011909015126,
+  "anchor_total": 111838,
+  "causal_alignment_age_s": {
+    "max": 0.01118159294128418,
+    "mean": 0.005004173055511574,
+    "median": 0.0050067901611328125,
+    "min": 0.0,
+    "p95": 0.009503841400146484
+  },
+  "causal_lookup": "searchsorted(timestamp, anchor, side='right') - 1",
+  "default_n_action_steps": 2,
+  "default_replanning_interval_ms": 100.10004043579102,
+  "detected_nested_prefix": "dataset_multirate_clean.zarr",
+  "dropped_anchor_by_episode": [
+    {
+      "anchors": 748,
+      "dropped": 1,
+      "episode": 0,
+      "first_anchor_timestamp": 1786684314.9138503,
+      "first_left_ft_timestamp": 1786684314.9205785,
+      "first_right_ft_timestamp": 1786684314.9205785,
+      "left_missing": 1,
+      "ratio": 0.001336898395721925,
+      "right_missing": 1
+    },
+    {
+      "anchors": 723,
+      "dropped": 1,
+      "episode": 1,
+      "first_anchor_timestamp": 1786684398.7642834,
+      "first_left_ft_timestamp": 1786684398.7663927,
+      "first_right_ft_timestamp": 1786684398.7663927,
+      "left_missing": 1,
+      "ratio": 0.0013831258644536654,
+      "right_missing": 1
+    },
+    {
+      "anchors": 816,
+      "dropped": 1,
+      "episode": 2,
+      "first_anchor_timestamp": 1786684421.2701004,
+      "first_left_ft_timestamp": 1786684421.274301,
+      "first_right_ft_timestamp": 1786684421.274301,
+      "left_missing": 1,
+      "ratio": 0.0012254901960784314,
+      "right_missing": 1
+    },
+    {
+      "anchors": 775,
+      "dropped": 1,
+      "episode": 3,
+      "first_anchor_timestamp": 1786684442.7415504,
+      "first_left_ft_timestamp": 1786684442.7453055,
+      "first_right_ft_timestamp": 1786684442.7453055,
+      "left_missing": 1,
+      "ratio": 0.0012903225806451613,
+      "right_missing": 1
+    },
+    {
+      "anchors": 807,
+      "dropped": 1,
+      "episode": 4,
+      "first_anchor_timestamp": 1786684462.0274832,
+      "first_left_ft_timestamp": 1786684462.0329,
+      "first_right_ft_timestamp": 1786684462.0329,
+      "left_missing": 1,
+      "ratio": 0.0012391573729863693,
+      "right_missing": 1
+    },
+    {
+      "anchors": 810,
+      "dropped": 1,
+      "episode": 5,
+      "first_anchor_timestamp": 1786684484.2163162,
+      "first_left_ft_timestamp": 1786684484.2201324,
+      "first_right_ft_timestamp": 1786684484.2201324,
+      "left_missing": 1,
+      "ratio": 0.0012345679012345679,
+      "right_missing": 1
+    },
+    {
+      "anchors": 740,
+      "dropped": 1,
+      "episode": 6,
+      "first_anchor_timestamp": 1786684577.3260005,
+      "first_left_ft_timestamp": 1786684577.3334842,
+      "first_right_ft_timestamp": 1786684577.3334842,
+      "left_missing": 1,
+      "ratio": 0.0013513513513513514,
+      "right_missing": 1
+    },
+    {
+      "anchors": 784,
+      "dropped": 1,
+      "episode": 7,
+      "first_anchor_timestamp": 1786684596.6786664,
+      "first_left_ft_timestamp": 1786684596.6826491,
+      "first_right_ft_timestamp": 1786684596.6826491,
+      "left_missing": 1,
+      "ratio": 0.0012755102040816326,
+      "right_missing": 1
+    },
+    {
+      "anchors": 793,
+      "dropped": 1,
+      "episode": 8,
+      "first_anchor_timestamp": 1786684618.3670003,
+      "first_left_ft_timestamp": 1786684618.375163,
+      "first_right_ft_timestamp": 1786684618.375163,
+      "left_missing": 1,
+      "ratio": 0.0012610340479192938,
+      "right_missing": 1
+    },
+    {
+      "anchors": 725,
+      "dropped": 1,
+      "episode": 9,
+      "first_anchor_timestamp": 1786684703.8524003,
+      "first_left_ft_timestamp": 1786684703.8569388,
+      "first_right_ft_timestamp": 1786684703.8569388,
+      "left_missing": 1,
+      "ratio": 0.001379310344827586,
+      "right_missing": 1
+    },
+    {
+      "anchors": 625,
+      "dropped": 1,
+      "episode": 10,
+      "first_anchor_timestamp": 1786684722.2541163,
+      "first_left_ft_timestamp": 1786684722.2550318,
+      "first_right_ft_timestamp": 1786684722.2550318,
+      "left_missing": 1,
+      "ratio": 0.0016,
+      "right_missing": 1
+    },
+    {
+      "anchors": 662,
+      "dropped": 1,
+      "episode": 11,
+      "first_anchor_timestamp": 1786684738.9708164,
+      "first_left_ft_timestamp": 1786684738.9724221,
+      "first_right_ft_timestamp": 1786684738.9724221,
+      "left_missing": 1,
+      "ratio": 0.0015105740181268882,
+      "right_missing": 1
+    },
+    {
+      "anchors": 873,
+      "dropped": 1,
+      "episode": 12,
+      "first_anchor_timestamp": 1786684754.5697334,
+      "first_left_ft_timestamp": 1786684754.57948,
+      "first_right_ft_timestamp": 1786684754.57948,
+      "left_missing": 1,
+      "ratio": 0.001145475372279496,
+      "right_missing": 1
+    },
+    {
+      "anchors": 763,
+      "dropped": 1,
+      "episode": 13,
+      "first_anchor_timestamp": 1786684774.5230002,
+      "first_left_ft_timestamp": 1786684774.5276601,
+      "first_right_ft_timestamp": 1786684774.5276601,
+      "left_missing": 1,
+      "ratio": 0.001310615989515072,
+      "right_missing": 1
+    },
+    {
+      "anchors": 710,
+      "dropped": 1,
+      "episode": 14,
+      "first_anchor_timestamp": 1786684793.3084333,
+      "first_left_ft_timestamp": 1786684793.3144138,
+      "first_right_ft_timestamp": 1786684793.3144138,
+      "left_missing": 1,
+      "ratio": 0.0014084507042253522,
+      "right_missing": 1
+    },
+    {
+      "anchors": 767,
+      "dropped": 1,
+      "episode": 15,
+      "first_anchor_timestamp": 1786684811.6267333,
+      "first_left_ft_timestamp": 1786684811.6353235,
+      "first_right_ft_timestamp": 1786684811.6353235,
+      "left_missing": 1,
+      "ratio": 0.001303780964797914,
+      "right_missing": 1
+    },
+    {
+      "anchors": 791,
+      "dropped": 1,
+      "episode": 16,
+      "first_anchor_timestamp": 1786684837.0187664,
+      "first_left_ft_timestamp": 1786684837.026043,
+      "first_right_ft_timestamp": 1786684837.026043,
+      "left_missing": 1,
+      "ratio": 0.0012642225031605564,
+      "right_missing": 1
+    },
+    {
+      "anchors": 748,
+      "dropped": 1,
+      "episode": 17,
+      "first_anchor_timestamp": 1786684859.7247834,
+      "first_left_ft_timestamp": 1786684859.7299633,
+      "first_right_ft_timestamp": 1786684859.7299633,
+      "left_missing": 1,
+      "ratio": 0.001336898395721925,
+      "right_missing": 1
+    },
+    {
+      "anchors": 849,
+      "dropped": 1,
+      "episode": 18,
+      "first_anchor_timestamp": 1786684878.9773502,
+      "first_left_ft_timestamp": 1786684878.986703,
+      "first_right_ft_timestamp": 1786684878.986703,
+      "left_missing": 1,
+      "ratio": 0.001177856301531213,
+      "right_missing": 1
+    },
+    {
+      "anchors": 766,
+      "dropped": 1,
+      "episode": 19,
+      "first_anchor_timestamp": 1786684900.3487003,
+      "first_left_ft_timestamp": 1786684900.3523982,
+      "first_right_ft_timestamp": 1786684900.3523982,
+      "left_missing": 1,
+      "ratio": 0.0013054830287206266,
+      "right_missing": 1
+    },
+    {
+      "anchors": 795,
+      "dropped": 1,
+      "episode": 20,
+      "first_anchor_timestamp": 1786684920.5188503,
+      "first_left_ft_timestamp": 1786684920.5250485,
+      "first_right_ft_timestamp": 1786684920.5250485,
+      "left_missing": 1,
+      "ratio": 0.0012578616352201257,
+      "right_missing": 1
+    },
+    {
+      "anchors": 892,
+      "dropped": 1,
+      "episode": 21,
+      "first_anchor_timestamp": 1786684940.9392502,
+      "first_left_ft_timestamp": 1786684940.9428852,
+      "first_right_ft_timestamp": 1786684940.9428852,
+      "left_missing": 1,
+      "ratio": 0.0011210762331838565,
+      "right_missing": 1
+    },
+    {
+      "anchors": 811,
+      "dropped": 1,
+      "episode": 22,
+      "first_anchor_timestamp": 1786684963.9956164,
+      "first_left_ft_timestamp": 1786684964.001257,
+      "first_right_ft_timestamp": 1786684964.001257,
+      "left_missing": 1,
+      "ratio": 0.0012330456226880395,
+      "right_missing": 1
+    },
+    {
+      "anchors": 723,
+      "dropped": 1,
+      "episode": 23,
+      "first_anchor_timestamp": 1786685024.4393334,
+      "first_left_ft_timestamp": 1786685024.4485273,
+      "first_right_ft_timestamp": 1786685024.4485273,
+      "left_missing": 1,
+      "ratio": 0.0013831258644536654,
+      "right_missing": 1
+    },
+    {
+      "anchors": 917,
+      "dropped": 1,
+      "episode": 24,
+      "first_anchor_timestamp": 1786685043.4249663,
+      "first_left_ft_timestamp": 1786685043.426317,
+      "first_right_ft_timestamp": 1786685043.426317,
+      "left_missing": 1,
+      "ratio": 0.0010905125408942203,
+      "right_missing": 1
+    },
+    {
+      "anchors": 768,
+      "dropped": 1,
+      "episode": 25,
+      "first_anchor_timestamp": 1786685070.8356833,
+      "first_left_ft_timestamp": 1786685070.8402956,
+      "first_right_ft_timestamp": 1786685070.8402956,
+      "left_missing": 1,
+      "ratio": 0.0013020833333333333,
+      "right_missing": 1
+    },
+    {
+      "anchors": 765,
+      "dropped": 1,
+      "episode": 26,
+      "first_anchor_timestamp": 1786685093.5917504,
+      "first_left_ft_timestamp": 1786685093.6001039,
+      "first_right_ft_timestamp": 1786685093.6001039,
+      "left_missing": 1,
+      "ratio": 0.00130718954248366,
+      "right_missing": 1
+    },
+    {
+      "anchors": 846,
+      "dropped": 1,
+      "episode": 27,
+      "first_anchor_timestamp": 1786685139.9714162,
+      "first_left_ft_timestamp": 1786685139.973281,
+      "first_right_ft_timestamp": 1786685139.973281,
+      "left_missing": 1,
+      "ratio": 0.001182033096926714,
+      "right_missing": 1
+    },
+    {
+      "anchors": 819,
+      "dropped": 1,
+      "episode": 28,
+      "first_anchor_timestamp": 1786685164.2456663,
+      "first_left_ft_timestamp": 1786685164.2509756,
+      "first_right_ft_timestamp": 1786685164.2509756,
+      "left_missing": 1,
+      "ratio": 0.001221001221001221,
+      "right_missing": 1
+    },
+    {
+      "anchors": 841,
+      "dropped": 1,
+      "episode": 29,
+      "first_anchor_timestamp": 1786685187.6690664,
+      "first_left_ft_timestamp": 1786685187.6776881,
+      "first_right_ft_timestamp": 1786685187.6776881,
+      "left_missing": 1,
+      "ratio": 0.0011890606420927466,
+      "right_missing": 1
+    },
+    {
+      "anchors": 832,
+      "dropped": 1,
+      "episode": 30,
+      "first_anchor_timestamp": 1786685208.4565003,
+      "first_left_ft_timestamp": 1786685208.4576495,
+      "first_right_ft_timestamp": 1786685208.4576495,
+      "left_missing": 1,
+      "ratio": 0.001201923076923077,
+      "right_missing": 1
+    },
+    {
+      "anchors": 851,
+      "dropped": 1,
+      "episode": 31,
+      "first_anchor_timestamp": 1786685229.7277505,
+      "first_left_ft_timestamp": 1786685229.7349107,
+      "first_right_ft_timestamp": 1786685229.7349107,
+      "left_missing": 1,
+      "ratio": 0.0011750881316098707,
+      "right_missing": 1
+    },
+    {
+      "anchors": 789,
+      "dropped": 1,
+      "episode": 32,
+      "first_anchor_timestamp": 1786685250.4985003,
+      "first_left_ft_timestamp": 1786685250.502945,
+      "first_right_ft_timestamp": 1786685250.502945,
+      "left_missing": 1,
+      "ratio": 0.0012674271229404308,
+      "right_missing": 1
+    },
+    {
+      "anchors": 805,
+      "dropped": 1,
+      "episode": 33,
+      "first_anchor_timestamp": 1786685276.0573664,
+      "first_left_ft_timestamp": 1786685276.0604541,
+      "first_right_ft_timestamp": 1786685276.0604541,
+      "left_missing": 1,
+      "ratio": 0.0012422360248447205,
+      "right_missing": 1
+    },
+    {
+      "anchors": 862,
+      "dropped": 1,
+      "episode": 34,
+      "first_anchor_timestamp": 1786685295.7103333,
+      "first_left_ft_timestamp": 1786685295.7157085,
+      "first_right_ft_timestamp": 1786685295.7157085,
+      "left_missing": 1,
+      "ratio": 0.001160092807424594,
+      "right_missing": 1
+    },
+    {
+      "anchors": 782,
+      "dropped": 1,
+      "episode": 35,
+      "first_anchor_timestamp": 1786685370.9354835,
+      "first_left_ft_timestamp": 1786685370.9427745,
+      "first_right_ft_timestamp": 1786685370.9427745,
+      "left_missing": 1,
+      "ratio": 0.0012787723785166241,
+      "right_missing": 1
+    },
+    {
+      "anchors": 834,
+      "dropped": 1,
+      "episode": 36,
+      "first_anchor_timestamp": 1786685392.9908504,
+      "first_left_ft_timestamp": 1786685392.9924502,
+      "first_right_ft_timestamp": 1786685392.9924502,
+      "left_missing": 1,
+      "ratio": 0.001199040767386091,
+      "right_missing": 1
+    },
+    {
+      "anchors": 930,
+      "dropped": 1,
+      "episode": 37,
+      "first_anchor_timestamp": 1786685414.7959664,
+      "first_left_ft_timestamp": 1786685414.7994425,
+      "first_right_ft_timestamp": 1786685414.7994425,
+      "left_missing": 1,
+      "ratio": 0.001075268817204301,
+      "right_missing": 1
+    },
+    {
+      "anchors": 852,
+      "dropped": 1,
+      "episode": 38,
+      "first_anchor_timestamp": 1786685456.6210833,
+      "first_left_ft_timestamp": 1786685456.6228344,
+      "first_right_ft_timestamp": 1786685456.6228344,
+      "left_missing": 1,
+      "ratio": 0.0011737089201877935,
+      "right_missing": 1
+    },
+    {
+      "anchors": 820,
+      "dropped": 1,
+      "episode": 39,
+      "first_anchor_timestamp": 1786685495.7601833,
+      "first_left_ft_timestamp": 1786685495.7630396,
+      "first_right_ft_timestamp": 1786685495.7630396,
+      "left_missing": 1,
+      "ratio": 0.0012195121951219512,
+      "right_missing": 1
+    },
+    {
+      "anchors": 917,
+      "dropped": 1,
+      "episode": 40,
+      "first_anchor_timestamp": 1786685517.7821834,
+      "first_left_ft_timestamp": 1786685517.7847428,
+      "first_right_ft_timestamp": 1786685517.7847428,
+      "left_missing": 1,
+      "ratio": 0.0010905125408942203,
+      "right_missing": 1
+    },
+    {
+      "anchors": 841,
+      "dropped": 1,
+      "episode": 41,
+      "first_anchor_timestamp": 1786685541.7060833,
+      "first_left_ft_timestamp": 1786685541.7128763,
+      "first_right_ft_timestamp": 1786685541.7128763,
+      "left_missing": 1,
+      "ratio": 0.0011890606420927466,
+      "right_missing": 1
+    },
+    {
+      "anchors": 885,
+      "dropped": 1,
+      "episode": 42,
+      "first_anchor_timestamp": 1786685564.5122004,
+      "first_left_ft_timestamp": 1786685564.521996,
+      "first_right_ft_timestamp": 1786685564.521996,
+      "left_missing": 1,
+      "ratio": 0.0011299435028248588,
+      "right_missing": 1
+    },
+    {
+      "anchors": 928,
+      "dropped": 1,
+      "episode": 43,
+      "first_anchor_timestamp": 1786685638.3359504,
+      "first_left_ft_timestamp": 1786685638.3443258,
+      "first_right_ft_timestamp": 1786685638.3443258,
+      "left_missing": 1,
+      "ratio": 0.0010775862068965517,
+      "right_missing": 1
+    },
+    {
+      "anchors": 859,
+      "dropped": 1,
+      "episode": 44,
+      "first_anchor_timestamp": 1786685661.2588503,
+      "first_left_ft_timestamp": 1786685661.2593615,
+      "first_right_ft_timestamp": 1786685661.2593615,
+      "left_missing": 1,
+      "ratio": 0.0011641443538998836,
+      "right_missing": 1
+    },
+    {
+      "anchors": 823,
+      "dropped": 1,
+      "episode": 45,
+      "first_anchor_timestamp": 1786685683.3809505,
+      "first_left_ft_timestamp": 1786685683.3904262,
+      "first_right_ft_timestamp": 1786685683.3904262,
+      "left_missing": 1,
+      "ratio": 0.001215066828675577,
+      "right_missing": 1
+    },
+    {
+      "anchors": 818,
+      "dropped": 1,
+      "episode": 46,
+      "first_anchor_timestamp": 1786685705.8700833,
+      "first_left_ft_timestamp": 1786685705.87405,
+      "first_right_ft_timestamp": 1786685705.87405,
+      "left_missing": 1,
+      "ratio": 0.0012224938875305623,
+      "right_missing": 1
+    },
+    {
+      "anchors": 828,
+      "dropped": 1,
+      "episode": 47,
+      "first_anchor_timestamp": 1786685729.0098662,
+      "first_left_ft_timestamp": 1786685729.0099678,
+      "first_right_ft_timestamp": 1786685729.0099678,
+      "left_missing": 1,
+      "ratio": 0.0012077294685990338,
+      "right_missing": 1
+    },
+    {
+      "anchors": 789,
+      "dropped": 1,
+      "episode": 48,
+      "first_anchor_timestamp": 1786685907.6550004,
+      "first_left_ft_timestamp": 1786685907.6633313,
+      "first_right_ft_timestamp": 1786685907.6633313,
+      "left_missing": 1,
+      "ratio": 0.0012674271229404308,
+      "right_missing": 1
+    },
+    {
+      "anchors": 740,
+      "dropped": 1,
+      "episode": 49,
+      "first_anchor_timestamp": 1786685926.5071664,
+      "first_left_ft_timestamp": 1786685926.5087173,
+      "first_right_ft_timestamp": 1786685926.5087173,
+      "left_missing": 1,
+      "ratio": 0.0013513513513513514,
+      "right_missing": 1
+    },
+    {
+      "anchors": 786,
+      "dropped": 1,
+      "episode": 50,
+      "first_anchor_timestamp": 1786685946.5939004,
+      "first_left_ft_timestamp": 1786685946.5945563,
+      "first_right_ft_timestamp": 1786685946.5945563,
+      "left_missing": 1,
+      "ratio": 0.001272264631043257,
+      "right_missing": 1
+    },
+    {
+      "anchors": 727,
+      "dropped": 1,
+      "episode": 51,
+      "first_anchor_timestamp": 1786685967.2645504,
+      "first_left_ft_timestamp": 1786685967.2688968,
+      "first_right_ft_timestamp": 1786685967.2688968,
+      "left_missing": 1,
+      "ratio": 0.001375515818431912,
+      "right_missing": 1
+    },
+    {
+      "anchors": 832,
+      "dropped": 1,
+      "episode": 52,
+      "first_anchor_timestamp": 1786685989.6369004,
+      "first_left_ft_timestamp": 1786685989.6392689,
+      "first_right_ft_timestamp": 1786685989.6392689,
+      "left_missing": 1,
+      "ratio": 0.001201923076923077,
+      "right_missing": 1
+    },
+    {
+      "anchors": 761,
+      "dropped": 1,
+      "episode": 53,
+      "first_anchor_timestamp": 1786686010.0573003,
+      "first_left_ft_timestamp": 1786686010.0608454,
+      "first_right_ft_timestamp": 1786686010.0608454,
+      "left_missing": 1,
+      "ratio": 0.001314060446780552,
+      "right_missing": 1
+    },
+    {
+      "anchors": 888,
+      "dropped": 1,
+      "episode": 54,
+      "first_anchor_timestamp": 1786686029.3599164,
+      "first_left_ft_timestamp": 1786686029.36723,
+      "first_right_ft_timestamp": 1786686029.36723,
+      "left_missing": 1,
+      "ratio": 0.0011261261261261261,
+      "right_missing": 1
+    },
+    {
+      "anchors": 957,
+      "dropped": 1,
+      "episode": 55,
+      "first_anchor_timestamp": 1786686053.1503503,
+      "first_left_ft_timestamp": 1786686053.152521,
+      "first_right_ft_timestamp": 1786686053.152521,
+      "left_missing": 1,
+      "ratio": 0.0010449320794148381,
+      "right_missing": 1
+    },
+    {
+      "anchors": 892,
+      "dropped": 1,
+      "episode": 56,
+      "first_anchor_timestamp": 1786686077.1409833,
+      "first_left_ft_timestamp": 1786686077.1454391,
+      "first_right_ft_timestamp": 1786686077.1454391,
+      "left_missing": 1,
+      "ratio": 0.0011210762331838565,
+      "right_missing": 1
+    },
+    {
+      "anchors": 819,
+      "dropped": 1,
+      "episode": 57,
+      "first_anchor_timestamp": 1786686098.6458004,
+      "first_left_ft_timestamp": 1786686098.6513522,
+      "first_right_ft_timestamp": 1786686098.6513522,
+      "left_missing": 1,
+      "ratio": 0.001221001221001221,
+      "right_missing": 1
+    },
+    {
+      "anchors": 828,
+      "dropped": 1,
+      "episode": 58,
+      "first_anchor_timestamp": 1786686117.7482164,
+      "first_left_ft_timestamp": 1786686117.7555282,
+      "first_right_ft_timestamp": 1786686117.7555282,
+      "left_missing": 1,
+      "ratio": 0.0012077294685990338,
+      "right_missing": 1
+    },
+    {
+      "anchors": 793,
+      "dropped": 1,
+      "episode": 59,
+      "first_anchor_timestamp": 1786686139.9871004,
+      "first_left_ft_timestamp": 1786686139.9952478,
+      "first_right_ft_timestamp": 1786686139.9952478,
+      "left_missing": 1,
+      "ratio": 0.0012610340479192938,
+      "right_missing": 1
+    },
+    {
+      "anchors": 882,
+      "dropped": 1,
+      "episode": 60,
+      "first_anchor_timestamp": 1786686161.3584504,
+      "first_left_ft_timestamp": 1786686161.3653083,
+      "first_right_ft_timestamp": 1786686161.3653083,
+      "left_missing": 1,
+      "ratio": 0.0011337868480725624,
+      "right_missing": 1
+    },
+    {
+      "anchors": 882,
+      "dropped": 1,
+      "episode": 61,
+      "first_anchor_timestamp": 1786686183.4972334,
+      "first_left_ft_timestamp": 1786686183.5015419,
+      "first_right_ft_timestamp": 1786686183.5015419,
+      "left_missing": 1,
+      "ratio": 0.0011337868480725624,
+      "right_missing": 1
+    },
+    {
+      "anchors": 772,
+      "dropped": 1,
+      "episode": 62,
+      "first_anchor_timestamp": 1786686209.6733835,
+      "first_left_ft_timestamp": 1786686209.6740885,
+      "first_right_ft_timestamp": 1786686209.6740885,
+      "left_missing": 1,
+      "ratio": 0.0012953367875647669,
+      "right_missing": 1
+    },
+    {
+      "anchors": 907,
+      "dropped": 1,
+      "episode": 63,
+      "first_anchor_timestamp": 1786686231.7788002,
+      "first_left_ft_timestamp": 1786686231.786932,
+      "first_right_ft_timestamp": 1786686231.786932,
+      "left_missing": 1,
+      "ratio": 0.0011025358324145535,
+      "right_missing": 1
+    },
+    {
+      "anchors": 755,
+      "dropped": 1,
+      "episode": 64,
+      "first_anchor_timestamp": 1786686257.3043003,
+      "first_left_ft_timestamp": 1786686257.3060923,
+      "first_right_ft_timestamp": 1786686257.3060923,
+      "left_missing": 1,
+      "ratio": 0.0013245033112582781,
+      "right_missing": 1
+    },
+    {
+      "anchors": 844,
+      "dropped": 1,
+      "episode": 65,
+      "first_anchor_timestamp": 1786686277.8581665,
+      "first_left_ft_timestamp": 1786686277.8658655,
+      "first_right_ft_timestamp": 1786686277.8658655,
+      "left_missing": 1,
+      "ratio": 0.001184834123222749,
+      "right_missing": 1
+    },
+    {
+      "anchors": 830,
+      "dropped": 1,
+      "episode": 66,
+      "first_anchor_timestamp": 1786686301.0646834,
+      "first_left_ft_timestamp": 1786686301.0737312,
+      "first_right_ft_timestamp": 1786686301.0737312,
+      "left_missing": 1,
+      "ratio": 0.0012048192771084338,
+      "right_missing": 1
+    },
+    {
+      "anchors": 830,
+      "dropped": 1,
+      "episode": 67,
+      "first_anchor_timestamp": 1786686324.4547164,
+      "first_left_ft_timestamp": 1786686324.4596982,
+      "first_right_ft_timestamp": 1786686324.4596982,
+      "left_missing": 1,
+      "ratio": 0.0012048192771084338,
+      "right_missing": 1
+    },
+    {
+      "anchors": 809,
+      "dropped": 1,
+      "episode": 68,
+      "first_anchor_timestamp": 1786686346.3098834,
+      "first_left_ft_timestamp": 1786686346.3163059,
+      "first_right_ft_timestamp": 1786686346.3163059,
+      "left_missing": 1,
+      "ratio": 0.0012360939431396785,
+      "right_missing": 1
+    },
+    {
+      "anchors": 710,
+      "dropped": 1,
+      "episode": 69,
+      "first_anchor_timestamp": 1786686366.9805334,
+      "first_left_ft_timestamp": 1786686366.9897797,
+      "first_right_ft_timestamp": 1786686366.9897797,
+      "left_missing": 1,
+      "ratio": 0.0014084507042253522,
+      "right_missing": 1
+    },
+    {
+      "anchors": 775,
+      "dropped": 1,
+      "episode": 70,
+      "first_anchor_timestamp": 1786686407.7212334,
+      "first_left_ft_timestamp": 1786686407.7303116,
+      "first_right_ft_timestamp": 1786686407.7303116,
+      "left_missing": 1,
+      "ratio": 0.0012903225806451613,
+      "right_missing": 1
+    },
+    {
+      "anchors": 751,
+      "dropped": 1,
+      "episode": 71,
+      "first_anchor_timestamp": 1786686428.9591165,
+      "first_left_ft_timestamp": 1786686428.9658084,
+      "first_right_ft_timestamp": 1786686428.9658084,
+      "left_missing": 1,
+      "ratio": 0.0013315579227696406,
+      "right_missing": 1
+    },
+    {
+      "anchors": 686,
+      "dropped": 1,
+      "episode": 72,
+      "first_anchor_timestamp": 1786686451.1813164,
+      "first_left_ft_timestamp": 1786686451.1831937,
+      "first_right_ft_timestamp": 1786686451.1831937,
+      "left_missing": 1,
+      "ratio": 0.0014577259475218659,
+      "right_missing": 1
+    },
+    {
+      "anchors": 763,
+      "dropped": 1,
+      "episode": 73,
+      "first_anchor_timestamp": 1786686471.0678504,
+      "first_left_ft_timestamp": 1786686471.0687063,
+      "first_right_ft_timestamp": 1786686471.0687063,
+      "left_missing": 1,
+      "ratio": 0.001310615989515072,
+      "right_missing": 1
+    },
+    {
+      "anchors": 783,
+      "dropped": 1,
+      "episode": 74,
+      "first_anchor_timestamp": 1786686492.2890503,
+      "first_left_ft_timestamp": 1786686492.291989,
+      "first_right_ft_timestamp": 1786686492.291989,
+      "left_missing": 1,
+      "ratio": 0.001277139208173691,
+      "right_missing": 1
+    },
+    {
+      "anchors": 780,
+      "dropped": 1,
+      "episode": 75,
+      "first_anchor_timestamp": 1786686513.3100502,
+      "first_left_ft_timestamp": 1786686513.3190086,
+      "first_right_ft_timestamp": 1786686513.3190086,
+      "left_missing": 1,
+      "ratio": 0.001282051282051282,
+      "right_missing": 1
+    },
+    {
+      "anchors": 776,
+      "dropped": 1,
+      "episode": 76,
+      "first_anchor_timestamp": 1786686534.9483333,
+      "first_left_ft_timestamp": 1786686534.94842,
+      "first_right_ft_timestamp": 1786686534.94842,
+      "left_missing": 1,
+      "ratio": 0.001288659793814433,
+      "right_missing": 1
+    },
+    {
+      "anchors": 734,
+      "dropped": 1,
+      "episode": 77,
+      "first_anchor_timestamp": 1786686554.6847162,
+      "first_left_ft_timestamp": 1786686554.6927419,
+      "first_right_ft_timestamp": 1786686554.6927419,
+      "left_missing": 1,
+      "ratio": 0.0013623978201634877,
+      "right_missing": 1
+    },
+    {
+      "anchors": 775,
+      "dropped": 1,
+      "episode": 78,
+      "first_anchor_timestamp": 1786686573.2866333,
+      "first_left_ft_timestamp": 1786686573.2935896,
+      "first_right_ft_timestamp": 1786686573.2935896,
+      "left_missing": 1,
+      "ratio": 0.0012903225806451613,
+      "right_missing": 1
+    },
+    {
+      "anchors": 731,
+      "dropped": 1,
+      "episode": 79,
+      "first_anchor_timestamp": 1786686594.0407004,
+      "first_left_ft_timestamp": 1786686594.0503912,
+      "first_right_ft_timestamp": 1786686594.0503912,
+      "left_missing": 1,
+      "ratio": 0.0013679890560875513,
+      "right_missing": 1
+    },
+    {
+      "anchors": 656,
+      "dropped": 1,
+      "episode": 80,
+      "first_anchor_timestamp": 1786686615.8124504,
+      "first_left_ft_timestamp": 1786686615.819705,
+      "first_right_ft_timestamp": 1786686615.819705,
+      "left_missing": 1,
+      "ratio": 0.001524390243902439,
+      "right_missing": 1
+    },
+    {
+      "anchors": 765,
+      "dropped": 1,
+      "episode": 81,
+      "first_anchor_timestamp": 1786686635.5321503,
+      "first_left_ft_timestamp": 1786686635.533606,
+      "first_right_ft_timestamp": 1786686635.533606,
+      "left_missing": 1,
+      "ratio": 0.00130718954248366,
+      "right_missing": 1
+    },
+    {
+      "anchors": 756,
+      "dropped": 1,
+      "episode": 82,
+      "first_anchor_timestamp": 1786686656.2028003,
+      "first_left_ft_timestamp": 1786686656.207992,
+      "first_right_ft_timestamp": 1786686656.207992,
+      "left_missing": 1,
+      "ratio": 0.0013227513227513227,
+      "right_missing": 1
+    },
+    {
+      "anchors": 788,
+      "dropped": 1,
+      "episode": 83,
+      "first_anchor_timestamp": 1786686677.7409832,
+      "first_left_ft_timestamp": 1786686677.7412724,
+      "first_right_ft_timestamp": 1786686677.7412724,
+      "left_missing": 1,
+      "ratio": 0.0012690355329949238,
+      "right_missing": 1
+    },
+    {
+      "anchors": 675,
+      "dropped": 1,
+      "episode": 84,
+      "first_anchor_timestamp": 1786686699.1957502,
+      "first_left_ft_timestamp": 1786686699.2010996,
+      "first_right_ft_timestamp": 1786686699.2010996,
+      "left_missing": 1,
+      "ratio": 0.0014814814814814814,
+      "right_missing": 1
+    },
+    {
+      "anchors": 769,
+      "dropped": 1,
+      "episode": 85,
+      "first_anchor_timestamp": 1786686719.7162504,
+      "first_left_ft_timestamp": 1786686719.7179408,
+      "first_right_ft_timestamp": 1786686719.7179408,
+      "left_missing": 1,
+      "ratio": 0.0013003901170351106,
+      "right_missing": 1
+    },
+    {
+      "anchors": 753,
+      "dropped": 1,
+      "episode": 86,
+      "first_anchor_timestamp": 1786686740.4536333,
+      "first_left_ft_timestamp": 1786686740.463642,
+      "first_right_ft_timestamp": 1786686740.463642,
+      "left_missing": 1,
+      "ratio": 0.0013280212483399733,
+      "right_missing": 1
+    },
+    {
+      "anchors": 824,
+      "dropped": 1,
+      "episode": 87,
+      "first_anchor_timestamp": 1786686759.9731333,
+      "first_left_ft_timestamp": 1786686759.9774837,
+      "first_right_ft_timestamp": 1786686759.9774837,
+      "left_missing": 1,
+      "ratio": 0.0012135922330097086,
+      "right_missing": 1
+    },
+    {
+      "anchors": 725,
+      "dropped": 1,
+      "episode": 88,
+      "first_anchor_timestamp": 1786686782.2287004,
+      "first_left_ft_timestamp": 1786686782.2336636,
+      "first_right_ft_timestamp": 1786686782.2336636,
+      "left_missing": 1,
+      "ratio": 0.001379310344827586,
+      "right_missing": 1
+    },
+    {
+      "anchors": 799,
+      "dropped": 1,
+      "episode": 89,
+      "first_anchor_timestamp": 1786688078.7906334,
+      "first_left_ft_timestamp": 1786688078.7923257,
+      "first_right_ft_timestamp": 1786688078.7923257,
+      "left_missing": 1,
+      "ratio": 0.0012515644555694619,
+      "right_missing": 1
+    },
+    {
+      "anchors": 650,
+      "dropped": 1,
+      "episode": 90,
+      "first_anchor_timestamp": 1786688159.6714334,
+      "first_left_ft_timestamp": 1786688159.6741836,
+      "first_right_ft_timestamp": 1786688159.6741836,
+      "left_missing": 1,
+      "ratio": 0.0015384615384615385,
+      "right_missing": 1
+    },
+    {
+      "anchors": 673,
+      "dropped": 1,
+      "episode": 91,
+      "first_anchor_timestamp": 1786688179.4745502,
+      "first_left_ft_timestamp": 1786688179.4810991,
+      "first_right_ft_timestamp": 1786688179.4810991,
+      "left_missing": 1,
+      "ratio": 0.0014858841010401188,
+      "right_missing": 1
+    },
+    {
+      "anchors": 669,
+      "dropped": 1,
+      "episode": 92,
+      "first_anchor_timestamp": 1786688197.8262165,
+      "first_left_ft_timestamp": 1786688197.833935,
+      "first_right_ft_timestamp": 1786688197.833935,
+      "left_missing": 1,
+      "ratio": 0.0014947683109118087,
+      "right_missing": 1
+    },
+    {
+      "anchors": 720,
+      "dropped": 1,
+      "episode": 93,
+      "first_anchor_timestamp": 1786688224.8198504,
+      "first_left_ft_timestamp": 1786688224.8215728,
+      "first_right_ft_timestamp": 1786688224.8215728,
+      "left_missing": 1,
+      "ratio": 0.001388888888888889,
+      "right_missing": 1
+    },
+    {
+      "anchors": 738,
+      "dropped": 1,
+      "episode": 94,
+      "first_anchor_timestamp": 1786688243.8221664,
+      "first_left_ft_timestamp": 1786688243.8289514,
+      "first_right_ft_timestamp": 1786688243.8289514,
+      "left_missing": 1,
+      "ratio": 0.0013550135501355014,
+      "right_missing": 1
+    },
+    {
+      "anchors": 758,
+      "dropped": 1,
+      "episode": 95,
+      "first_anchor_timestamp": 1786688264.1257834,
+      "first_left_ft_timestamp": 1786688264.1270409,
+      "first_right_ft_timestamp": 1786688264.1270409,
+      "left_missing": 1,
+      "ratio": 0.0013192612137203166,
+      "right_missing": 1
+    },
+    {
+      "anchors": 751,
+      "dropped": 1,
+      "episode": 96,
+      "first_anchor_timestamp": 1786688282.8278003,
+      "first_left_ft_timestamp": 1786688282.8373132,
+      "first_right_ft_timestamp": 1786688282.8373132,
+      "left_missing": 1,
+      "ratio": 0.0013315579227696406,
+      "right_missing": 1
+    },
+    {
+      "anchors": 702,
+      "dropped": 1,
+      "episode": 97,
+      "first_anchor_timestamp": 1786688304.5161333,
+      "first_left_ft_timestamp": 1786688304.5176616,
+      "first_right_ft_timestamp": 1786688304.5176616,
+      "left_missing": 1,
+      "ratio": 0.0014245014245014246,
+      "right_missing": 1
+    },
+    {
+      "anchors": 792,
+      "dropped": 1,
+      "episode": 98,
+      "first_anchor_timestamp": 1786688323.0513163,
+      "first_left_ft_timestamp": 1786688323.052717,
+      "first_right_ft_timestamp": 1786688323.052717,
+      "left_missing": 1,
+      "ratio": 0.0012626262626262627,
+      "right_missing": 1
+    },
+    {
+      "anchors": 763,
+      "dropped": 1,
+      "episode": 99,
+      "first_anchor_timestamp": 1786688344.4727163,
+      "first_left_ft_timestamp": 1786688344.47931,
+      "first_right_ft_timestamp": 1786688344.47931,
+      "left_missing": 1,
+      "ratio": 0.001310615989515072,
+      "right_missing": 1
+    },
+    {
+      "anchors": 763,
+      "dropped": 1,
+      "episode": 100,
+      "first_anchor_timestamp": 1786688364.4593503,
+      "first_left_ft_timestamp": 1786688364.4662647,
+      "first_right_ft_timestamp": 1786688364.4662647,
+      "left_missing": 1,
+      "ratio": 0.001310615989515072,
+      "right_missing": 1
+    },
+    {
+      "anchors": 792,
+      "dropped": 1,
+      "episode": 101,
+      "first_anchor_timestamp": 1786688403.7152333,
+      "first_left_ft_timestamp": 1786688403.7187178,
+      "first_right_ft_timestamp": 1786688403.7187178,
+      "left_missing": 1,
+      "ratio": 0.0012626262626262627,
+      "right_missing": 1
+    },
+    {
+      "anchors": 780,
+      "dropped": 1,
+      "episode": 102,
+      "first_anchor_timestamp": 1786688425.7372334,
+      "first_left_ft_timestamp": 1786688425.74693,
+      "first_right_ft_timestamp": 1786688425.74693,
+      "left_missing": 1,
+      "ratio": 0.001282051282051282,
+      "right_missing": 1
+    },
+    {
+      "anchors": 749,
+      "dropped": 1,
+      "episode": 103,
+      "first_anchor_timestamp": 1786688470.5319834,
+      "first_left_ft_timestamp": 1786688470.5336754,
+      "first_right_ft_timestamp": 1786688470.5336754,
+      "left_missing": 1,
+      "ratio": 0.0013351134846461949,
+      "right_missing": 1
+    },
+    {
+      "anchors": 703,
+      "dropped": 1,
+      "episode": 104,
+      "first_anchor_timestamp": 1786688495.8072333,
+      "first_left_ft_timestamp": 1786688495.8116546,
+      "first_right_ft_timestamp": 1786688495.8116546,
+      "left_missing": 1,
+      "ratio": 0.001422475106685633,
+      "right_missing": 1
+    },
+    {
+      "anchors": 662,
+      "dropped": 1,
+      "episode": 105,
+      "first_anchor_timestamp": 1786688513.6250334,
+      "first_left_ft_timestamp": 1786688513.6278667,
+      "first_right_ft_timestamp": 1786688513.6278667,
+      "left_missing": 1,
+      "ratio": 0.0015105740181268882,
+      "right_missing": 1
+    },
+    {
+      "anchors": 670,
+      "dropped": 1,
+      "episode": 106,
+      "first_anchor_timestamp": 1786688529.4575164,
+      "first_left_ft_timestamp": 1786688529.4636698,
+      "first_right_ft_timestamp": 1786688529.4636698,
+      "left_missing": 1,
+      "ratio": 0.0014925373134328358,
+      "right_missing": 1
+    },
+    {
+      "anchors": 617,
+      "dropped": 1,
+      "episode": 107,
+      "first_anchor_timestamp": 1786688547.0083833,
+      "first_left_ft_timestamp": 1786688547.0134978,
+      "first_right_ft_timestamp": 1786688547.0134978,
+      "left_missing": 1,
+      "ratio": 0.0016207455429497568,
+      "right_missing": 1
+    },
+    {
+      "anchors": 570,
+      "dropped": 1,
+      "episode": 108,
+      "first_anchor_timestamp": 1786688563.7584503,
+      "first_left_ft_timestamp": 1786688563.759509,
+      "first_right_ft_timestamp": 1786688563.759509,
+      "left_missing": 1,
+      "ratio": 0.0017543859649122807,
+      "right_missing": 1
+    },
+    {
+      "anchors": 784,
+      "dropped": 1,
+      "episode": 109,
+      "first_anchor_timestamp": 1786688580.3583663,
+      "first_left_ft_timestamp": 1786688580.3595328,
+      "first_right_ft_timestamp": 1786688580.3595328,
+      "left_missing": 1,
+      "ratio": 0.0012755102040816326,
+      "right_missing": 1
+    },
+    {
+      "anchors": 819,
+      "dropped": 1,
+      "episode": 110,
+      "first_anchor_timestamp": 1786688601.8298163,
+      "first_left_ft_timestamp": 1786688601.8310778,
+      "first_right_ft_timestamp": 1786688601.8310778,
+      "left_missing": 1,
+      "ratio": 0.001221001221001221,
+      "right_missing": 1
+    },
+    {
+      "anchors": 739,
+      "dropped": 1,
+      "episode": 111,
+      "first_anchor_timestamp": 1786688623.2345333,
+      "first_left_ft_timestamp": 1786688623.236345,
+      "first_right_ft_timestamp": 1786688623.236345,
+      "left_missing": 1,
+      "ratio": 0.0013531799729364006,
+      "right_missing": 1
+    },
+    {
+      "anchors": 795,
+      "dropped": 1,
+      "episode": 112,
+      "first_anchor_timestamp": 1786688661.4226832,
+      "first_left_ft_timestamp": 1786688661.4307413,
+      "first_right_ft_timestamp": 1786688661.4307413,
+      "left_missing": 1,
+      "ratio": 0.0012578616352201257,
+      "right_missing": 1
+    },
+    {
+      "anchors": 802,
+      "dropped": 1,
+      "episode": 113,
+      "first_anchor_timestamp": 1786688684.3789504,
+      "first_left_ft_timestamp": 1786688684.3867896,
+      "first_right_ft_timestamp": 1786688684.3867896,
+      "left_missing": 1,
+      "ratio": 0.0012468827930174563,
+      "right_missing": 1
+    },
+    {
+      "anchors": 840,
+      "dropped": 1,
+      "episode": 114,
+      "first_anchor_timestamp": 1786688705.2498004,
+      "first_left_ft_timestamp": 1786688705.255078,
+      "first_right_ft_timestamp": 1786688705.255078,
+      "left_missing": 1,
+      "ratio": 0.0011904761904761906,
+      "right_missing": 1
+    },
+    {
+      "anchors": 830,
+      "dropped": 1,
+      "episode": 115,
+      "first_anchor_timestamp": 1786688725.7369332,
+      "first_left_ft_timestamp": 1786688725.741451,
+      "first_right_ft_timestamp": 1786688725.741451,
+      "left_missing": 1,
+      "ratio": 0.0012048192771084338,
+      "right_missing": 1
+    },
+    {
+      "anchors": 832,
+      "dropped": 1,
+      "episode": 116,
+      "first_anchor_timestamp": 1786688747.4920003,
+      "first_left_ft_timestamp": 1786688747.497115,
+      "first_right_ft_timestamp": 1786688747.497115,
+      "left_missing": 1,
+      "ratio": 0.001201923076923077,
+      "right_missing": 1
+    },
+    {
+      "anchors": 843,
+      "dropped": 1,
+      "episode": 117,
+      "first_anchor_timestamp": 1786688768.5130002,
+      "first_left_ft_timestamp": 1786688768.5222378,
+      "first_right_ft_timestamp": 1786688768.5222378,
+      "left_missing": 1,
+      "ratio": 0.0011862396204033216,
+      "right_missing": 1
+    },
+    {
+      "anchors": 835,
+      "dropped": 1,
+      "episode": 118,
+      "first_anchor_timestamp": 1786688789.4005334,
+      "first_left_ft_timestamp": 1786688789.4092958,
+      "first_right_ft_timestamp": 1786688789.4092958,
+      "left_missing": 1,
+      "ratio": 0.0011976047904191617,
+      "right_missing": 1
+    },
+    {
+      "anchors": 745,
+      "dropped": 1,
+      "episode": 119,
+      "first_anchor_timestamp": 1786688831.0421333,
+      "first_left_ft_timestamp": 1786688831.0448813,
+      "first_right_ft_timestamp": 1786688831.0448813,
+      "left_missing": 1,
+      "ratio": 0.0013422818791946308,
+      "right_missing": 1
+    },
+    {
+      "anchors": 801,
+      "dropped": 1,
+      "episode": 120,
+      "first_anchor_timestamp": 1786688850.9620333,
+      "first_left_ft_timestamp": 1786688850.9640052,
+      "first_right_ft_timestamp": 1786688850.9640052,
+      "left_missing": 1,
+      "ratio": 0.0012484394506866417,
+      "right_missing": 1
+    },
+    {
+      "anchors": 718,
+      "dropped": 1,
+      "episode": 121,
+      "first_anchor_timestamp": 1786688870.8152003,
+      "first_left_ft_timestamp": 1786688870.817966,
+      "first_right_ft_timestamp": 1786688870.817966,
+      "left_missing": 1,
+      "ratio": 0.001392757660167131,
+      "right_missing": 1
+    },
+    {
+      "anchors": 678,
+      "dropped": 1,
+      "episode": 122,
+      "first_anchor_timestamp": 1786688888.5495834,
+      "first_left_ft_timestamp": 1786688888.5546327,
+      "first_right_ft_timestamp": 1786688888.5546327,
+      "left_missing": 1,
+      "ratio": 0.0014749262536873156,
+      "right_missing": 1
+    },
+    {
+      "anchors": 594,
+      "dropped": 1,
+      "episode": 123,
+      "first_anchor_timestamp": 1786688907.5018504,
+      "first_left_ft_timestamp": 1786688907.5054638,
+      "first_right_ft_timestamp": 1786688907.5054638,
+      "left_missing": 1,
+      "ratio": 0.0016835016835016834,
+      "right_missing": 1
+    },
+    {
+      "anchors": 679,
+      "dropped": 1,
+      "episode": 124,
+      "first_anchor_timestamp": 1786689004.2818663,
+      "first_left_ft_timestamp": 1786689004.284788,
+      "first_right_ft_timestamp": 1786689004.284788,
+      "left_missing": 1,
+      "ratio": 0.0014727540500736377,
+      "right_missing": 1
+    },
+    {
+      "anchors": 698,
+      "dropped": 1,
+      "episode": 125,
+      "first_anchor_timestamp": 1786689026.3372333,
+      "first_left_ft_timestamp": 1786689026.3423998,
+      "first_right_ft_timestamp": 1786689026.3423998,
+      "left_missing": 1,
+      "ratio": 0.0014326647564469914,
+      "right_missing": 1
+    },
+    {
+      "anchors": 651,
+      "dropped": 1,
+      "episode": 126,
+      "first_anchor_timestamp": 1786689049.0432503,
+      "first_left_ft_timestamp": 1786689049.0520182,
+      "first_right_ft_timestamp": 1786689049.0520182,
+      "left_missing": 1,
+      "ratio": 0.0015360983102918587,
+      "right_missing": 1
+    },
+    {
+      "anchors": 663,
+      "dropped": 1,
+      "episode": 127,
+      "first_anchor_timestamp": 1786689111.4055502,
+      "first_left_ft_timestamp": 1786689111.4123487,
+      "first_right_ft_timestamp": 1786689111.4123487,
+      "left_missing": 1,
+      "ratio": 0.0015082956259426848,
+      "right_missing": 1
+    },
+    {
+      "anchors": 679,
+      "dropped": 1,
+      "episode": 128,
+      "first_anchor_timestamp": 1786689129.5737004,
+      "first_left_ft_timestamp": 1786689129.5819087,
+      "first_right_ft_timestamp": 1786689129.5819087,
+      "left_missing": 1,
+      "ratio": 0.0014727540500736377,
+      "right_missing": 1
+    },
+    {
+      "anchors": 638,
+      "dropped": 1,
+      "episode": 129,
+      "first_anchor_timestamp": 1786689148.2089834,
+      "first_left_ft_timestamp": 1786689148.2129643,
+      "first_right_ft_timestamp": 1786689148.2129643,
+      "left_missing": 1,
+      "ratio": 0.001567398119122257,
+      "right_missing": 1
+    },
+    {
+      "anchors": 723,
+      "dropped": 1,
+      "episode": 130,
+      "first_anchor_timestamp": 1786689170.0307834,
+      "first_left_ft_timestamp": 1786689170.0380888,
+      "first_right_ft_timestamp": 1786689170.0380888,
+      "left_missing": 1,
+      "ratio": 0.0013831258644536654,
+      "right_missing": 1
+    },
+    {
+      "anchors": 660,
+      "dropped": 1,
+      "episode": 131,
+      "first_anchor_timestamp": 1786689188.1155164,
+      "first_left_ft_timestamp": 1786689188.1186557,
+      "first_right_ft_timestamp": 1786689188.1186557,
+      "left_missing": 1,
+      "ratio": 0.0015151515151515152,
+      "right_missing": 1
+    },
+    {
+      "anchors": 721,
+      "dropped": 1,
+      "episode": 132,
+      "first_anchor_timestamp": 1786689206.6507003,
+      "first_left_ft_timestamp": 1786689206.6513803,
+      "first_right_ft_timestamp": 1786689206.6513803,
+      "left_missing": 1,
+      "ratio": 0.0013869625520110957,
+      "right_missing": 1
+    },
+    {
+      "anchors": 665,
+      "dropped": 1,
+      "episode": 133,
+      "first_anchor_timestamp": 1786689225.8031664,
+      "first_left_ft_timestamp": 1786689225.8116565,
+      "first_right_ft_timestamp": 1786689225.8116565,
+      "left_missing": 1,
+      "ratio": 0.0015037593984962407,
+      "right_missing": 1
+    },
+    {
+      "anchors": 733,
+      "dropped": 1,
+      "episode": 134,
+      "first_anchor_timestamp": 1786689244.2382503,
+      "first_left_ft_timestamp": 1786689244.2432263,
+      "first_right_ft_timestamp": 1786689244.2432263,
+      "left_missing": 1,
+      "ratio": 0.001364256480218281,
+      "right_missing": 1
+    },
+    {
+      "anchors": 767,
+      "dropped": 1,
+      "episode": 135,
+      "first_anchor_timestamp": 1786689263.5408664,
+      "first_left_ft_timestamp": 1786689263.546477,
+      "first_right_ft_timestamp": 1786689263.546477,
+      "left_missing": 1,
+      "ratio": 0.001303780964797914,
+      "right_missing": 1
+    },
+    {
+      "anchors": 748,
+      "dropped": 1,
+      "episode": 136,
+      "first_anchor_timestamp": 1786689283.1437833,
+      "first_left_ft_timestamp": 1786689283.1529872,
+      "first_right_ft_timestamp": 1786689283.1529872,
+      "left_missing": 1,
+      "ratio": 0.001336898395721925,
+      "right_missing": 1
+    },
+    {
+      "anchors": 723,
+      "dropped": 1,
+      "episode": 137,
+      "first_anchor_timestamp": 1786689326.5871832,
+      "first_left_ft_timestamp": 1786689326.5955167,
+      "first_right_ft_timestamp": 1786689326.5955167,
+      "left_missing": 1,
+      "ratio": 0.0013831258644536654,
+      "right_missing": 1
+    },
+    {
+      "anchors": 644,
+      "dropped": 1,
+      "episode": 138,
+      "first_anchor_timestamp": 1786689345.2558334,
+      "first_left_ft_timestamp": 1786689345.2585745,
+      "first_right_ft_timestamp": 1786689345.2585745,
+      "left_missing": 1,
+      "ratio": 0.0015527950310559005,
+      "right_missing": 1
+    },
+    {
+      "anchors": 619,
+      "dropped": 1,
+      "episode": 139,
+      "first_anchor_timestamp": 1786689362.1393664,
+      "first_left_ft_timestamp": 1786689362.1410344,
+      "first_right_ft_timestamp": 1786689362.1410344,
+      "left_missing": 1,
+      "ratio": 0.0016155088852988692,
+      "right_missing": 1
+    },
+    {
+      "anchors": 628,
+      "dropped": 1,
+      "episode": 140,
+      "first_anchor_timestamp": 1786689378.6558664,
+      "first_left_ft_timestamp": 1786689378.6654053,
+      "first_right_ft_timestamp": 1786689378.6654053,
+      "left_missing": 1,
+      "ratio": 0.0015923566878980893,
+      "right_missing": 1
+    },
+    {
+      "anchors": 623,
+      "dropped": 1,
+      "episode": 141,
+      "first_anchor_timestamp": 1786689394.4716663,
+      "first_left_ft_timestamp": 1786689394.4779556,
+      "first_right_ft_timestamp": 1786689394.4779556,
+      "left_missing": 1,
+      "ratio": 0.0016051364365971107,
+      "right_missing": 1
+    },
+    {
+      "anchors": 627,
+      "dropped": 1,
+      "episode": 142,
+      "first_anchor_timestamp": 1786689410.2207334,
+      "first_left_ft_timestamp": 1786689410.2262046,
+      "first_right_ft_timestamp": 1786689410.2262046,
+      "left_missing": 1,
+      "ratio": 0.001594896331738437,
+      "right_missing": 1
+    },
+    {
+      "anchors": 681,
+      "dropped": 1,
+      "episode": 143,
+      "first_anchor_timestamp": 1786689425.6361334,
+      "first_left_ft_timestamp": 1786689425.6410012,
+      "first_right_ft_timestamp": 1786689425.6410012,
+      "left_missing": 1,
+      "ratio": 0.0014684287812041115,
+      "right_missing": 1
+    },
+    {
+      "anchors": 646,
+      "dropped": 1,
+      "episode": 144,
+      "first_anchor_timestamp": 1786689443.8543334,
+      "first_left_ft_timestamp": 1786689443.8574898,
+      "first_right_ft_timestamp": 1786689443.8574898,
+      "left_missing": 1,
+      "ratio": 0.0015479876160990713,
+      "right_missing": 1
+    },
+    {
+      "anchors": 640,
+      "dropped": 1,
+      "episode": 145,
+      "first_anchor_timestamp": 1786689461.3217833,
+      "first_left_ft_timestamp": 1786689461.323717,
+      "first_right_ft_timestamp": 1786689461.323717,
+      "left_missing": 1,
+      "ratio": 0.0015625,
+      "right_missing": 1
+    }
+  ],
+  "dropped_anchor_ratio": 0.0013054596827554142,
+  "dropped_anchor_total": 146,
+  "ft_timeline": {
+    "dt_max_s": 0.012414932250976562,
+    "dt_mean_s": 0.009999999999129261,
+    "dt_median_s": 0.009999990463256836,
+    "dt_min_s": 0.00746607780456543,
+    "dt_p95_s": 0.010336160659790039,
+    "duplicate_count": 0,
+    "frequency_hz_from_median_dt": 100.00009536752259,
+    "nonmonotonic_count": 0
+  },
+  "jpegxl_compatibility_fields": {
+    "bitspersample": null,
+    "policy": "accept and log only when None; reject non-None",
+    "squeeze": null
+  },
+  "open_mode": "read-only ZipStore + zarr.open_group(path=prefix)",
+  "policy_anchor": "latest selected rgb_0 timestamp; pose/gripper share exact grid",
+  "prediction_horizon": 16,
+  "rgb_decode": [
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 0,
+      "global_index": 0,
+      "max": 255,
+      "mean": 99.15229724702381,
+      "min": 0,
+      "position": "start",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    },
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 0,
+      "global_index": 373,
+      "max": 255,
+      "mean": 93.81412760416667,
+      "min": 0,
+      "position": "middle",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    },
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 0,
+      "global_index": 747,
+      "max": 255,
+      "mean": 103.18712133290816,
+      "min": 0,
+      "position": "end",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    },
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 73,
+      "global_index": 58953,
+      "max": 255,
+      "mean": 98.76111421130952,
+      "min": 0,
+      "position": "start",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    },
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 73,
+      "global_index": 59334,
+      "max": 255,
+      "mean": 97.64922140731292,
+      "min": 0,
+      "position": "middle",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    },
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 73,
+      "global_index": 59715,
+      "max": 255,
+      "mean": 95.77650669642857,
+      "min": 0,
+      "position": "end",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    },
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 145,
+      "global_index": 111198,
+      "max": 255,
+      "mean": 95.55224941539116,
+      "min": 0,
+      "position": "start",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    },
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 145,
+      "global_index": 111517,
+      "max": 255,
+      "mean": 93.32851695365646,
+      "min": 0,
+      "position": "middle",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    },
+    {
+      "channel_order": "HWC RGB",
+      "dtype": "uint8",
+      "episode": 145,
+      "global_index": 111837,
+      "max": 255,
+      "mean": 94.62860730229592,
+      "min": 0,
+      "position": "end",
+      "shape": [
+        224,
+        224,
+        3
+      ]
+    }
+  ],
+  "rgb_metadata": {
+    "chunks": [
+      1,
+      224,
+      224,
+      3
+    ],
+    "compressor": "JpegXl(bitspersample=None, decodingspeed=None, distance=None, effort=None, index=None, keeporientation=None, level=99, lossless=False, numthreads=1, photometric=None, planar=None, squeeze=None, usecontainer=None)",
+    "dtype": "uint8",
+    "shape": [
+      111838,
+      224,
+      224,
+      3
+    ]
+  },
+  "rgb_timeline": {
+    "dt_max_s": 0.016683340072631836,
+    "dt_mean_s": 0.016683333335810617,
+    "dt_median_s": 0.016683340072631836,
+    "dt_min_s": 0.016683101654052734,
+    "dt_p95_s": 0.016683340072631836,
+    "duplicate_count": 0,
+    "frequency_hz_from_median_dt": 59.94003572704538,
+    "nonmonotonic_count": 0
+  },
+  "sha256_after": "3f5e0aecc3184deb313d5c11cb2eabb4dd9e1d7a43287a449f24d500d36cfaa5",
+  "sha256_before": "3f5e0aecc3184deb313d5c11cb2eabb4dd9e1d7a43287a449f24d500d36cfaa5",
+  "sha256_unchanged": true,
+  "tensor_shapes": {
+    "action": [
+      16,
+      10
+    ],
+    "camera0_rgb": [
+      2,
+      3,
+      224,
+      224
+    ],
+    "model_condition": [
+      800
+    ],
+    "robot0_eef_pos": [
+      2,
+      3
+    ],
+    "robot0_eef_rot_axis_angle": [
+      2,
+      6
+    ],
+    "robot0_eef_rot_axis_angle_wrt_start": [
+      2,
+      6
+    ],
+    "robot0_ft_left": [
+      32,
+      6
+    ],
+    "robot0_ft_right": [
+      32,
+      6
+    ],
+    "robot0_gripper_width": [
+      2,
+      1
+    ]
+  },
+  "train_split": {
+    "seed": 42,
+    "train_episode_count": 139,
+    "val_episodes": [
+      12,
+      62,
+      92,
+      109,
+      124,
+      143,
+      145
+    ],
+    "val_ratio": 0.05,
+    "wrench_sample_count": 177845
+  },
+  "train_split_wrench_stats": {
+    "channel_order_per_side": [
+      "Fx",
+      "Fy",
+      "Fz",
+      "Tx",
+      "Ty",
+      "Tz"
+    ],
+    "left": {
+      "max": [
+        2.2760000228881836,
+        0.9240000247955322,
+        0.20000000298023224,
+        0.019999999552965164,
+        0.019999999552965164,
+        0.019999999552965164
+      ],
+      "mean": [
+        0.093459852039814,
+        -0.05988756939768791,
+        -2.284494638442993,
+        -0.006696408148854971,
+        -0.01739433780312538,
+        0.0011728316312655807
+      ],
+      "min": [
+        -1.531999945640564,
+        -1.7000000476837158,
+        -7.5960001945495605,
+        -0.03999999910593033,
+        -0.07999999821186066,
+        -0.01720000058412552
+      ],
+      "std": [
+        0.31938958168029785,
+        0.21573743224143982,
+        2.3533504009246826,
+        0.009128481149673462,
+        0.021074868738651276,
+        0.004316927399486303
+      ]
+    },
+    "right": {
+      "max": [
+        2.5,
+        3.299999952316284,
+        9.836000442504883,
+        0.10279999673366547,
+        0.10080000013113022,
+        0.029999999329447746
+      ],
+      "mean": [
+        -0.09690626710653305,
+        0.3513822555541992,
+        3.6588311195373535,
+        0.025471407920122147,
+        0.016935836523771286,
+        0.0004589293384924531
+      ],
+      "min": [
+        -2.319999933242798,
+        -2.2119998931884766,
+        -0.2840000092983246,
+        -0.009999999776482582,
+        -0.05959999933838844,
+        -0.029999999329447746
+      ],
+      "std": [
+        0.5115389823913574,
+        0.5291967988014221,
+        3.6367225646972656,
+        0.02857845276594162,
+        0.024551676586270332,
+        0.004570147953927517
+      ]
+    }
+  },
+  "zarr_attrs": {
+    "aruco_gripper_is_sync_reference_only": true,
+    "episode_len_is_cumulative_end": true,
+    "filtered_dropped_indices": [
+      101
+    ],
+    "filtered_dropped_source_episodes": [
+      "demo_C3531324983555_2026.08.14_15.19.43.728600"
+    ],
+    "filtered_from": "/home/oem/smh/indy_umi_rg_ft/demos_0814/dataset_multirate.zarr",
+    "filtered_reason": "rebuild: ep101 SLAM glitch at insertion moment; 10 eps front-jump head-trim; labels gravity-comp f1.5/3.0",
+    "label_dim": 3,
+    "label_f_high": 3.0,
+    "label_f_low": 1.5,
+    "label_grasp_axis": 2,
+    "label_gravity_comp": true,
+    "label_gravity_dir_world": [
+      0.08771410896844647,
+      -0.9618676135005783,
+      -0.2590693520788862
+    ],
+    "label_k_max": 3000.0,
+    "label_k_min": 200.0,
+    "label_max_offset_mm": 50.0,
+    "label_note": "Gravity-compensated contact force drives the labels; thresholds fitted to the 0814 peg-in-hole distribution. raw contact estimate stored as ft_force_contact_0.",
+    "label_schema": "umift_action21_v1",
+    "label_thresholds_tuned": true,
+    "n_episodes": 146,
+    "policy_force_bias_removed": true,
+    "policy_force_frame": "tcp",
+    "policy_force_hz": 100.0,
+    "policy_force_includes_torque": false,
+    "policy_force_keys": [
+      "wrench_force_left_0",
+      "wrench_force_right_0",
+      "wrench_force_net_0",
+      "grasp_force_native_0"
+    ],
+    "policy_gripper_key": "gripper_rg2ft_0",
+    "rgb_native_hz": 59.94005994005994,
+    "schema": "umift_multirate_rg2ft_v1",
+    "tcp_offset_m": 0.252,
+    "timestamps_on": "video_clock",
+    "trimmed_head_rows": {
+      "100": [
+        42,
+        70
+      ],
+      "120": [
+        48,
+        80
+      ],
+      "124": [
+        42,
+        70
+      ],
+      "129": [
+        42,
+        70
+      ],
+      "130": [
+        42,
+        70
+      ],
+      "133": [
+        42,
+        70
+      ],
+      "141": [
+        42,
+        71
+      ],
+      "31": [
+        48,
+        80
+      ],
+      "62": [
+        42,
+        70
+      ],
+      "72": [
+        42,
+        70
+      ]
+    },
+    "trimmed_heads_s": {
+      "100": 0.7,
+      "120": 0.8,
+      "124": 0.7,
+      "129": 0.7,
+      "130": 0.7,
+      "133": 0.7,
+      "141": 0.7,
+      "31": 0.8,
+      "62": 0.7,
+      "72": 0.7
+    },
+    "wrench_bias_subtracted": false,
+    "wrench_channel_order": [
+      "fx_l",
+      "fy_l",
+      "fz_l",
+      "tx_l",
+      "ty_l",
+      "tz_l",
+      "fx_r",
+      "fy_r",
+      "fz_r",
+      "tx_r",
+      "ty_r",
+      "tz_r"
+    ],
+    "wrench_is_raw": true,
+    "wrench_native_hz": 100.0
+  },
+  "zip_path": "/home/idim/dkim/umi/indy_umi_rg_ft_dkim/data/dataset_multirate_clean.zarr.zip",
+  "zip_size_bytes": 2583110956
+}

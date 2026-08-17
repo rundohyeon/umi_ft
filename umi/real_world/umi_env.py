@@ -31,6 +31,7 @@ from diffusion_policy.common.cv2_util import (
 from umi.common.usb_util import reset_all_elgato_devices, get_sorted_v4l_paths
 from umi.common.pose_util import pose_to_pos_rot
 from umi.common.interpolation_util import get_interp1d, PoseInterpolator
+from umi.real_world.rg2ft_obs import causal_ft_history
 
 
 def _camera_capture_profile(dev_path: str):
@@ -127,6 +128,9 @@ class UmiEnv:
             camera_obs_horizon=2,
             robot_obs_horizon=2,
             gripper_obs_horizon=2,
+            ft_obs_horizon=0,
+            ft_obs_stride=1,
+            ft_obs_frequency=100.0,
             # action
             max_pos_speed=0.25,
             max_rot_speed=0.6,
@@ -554,6 +558,11 @@ class UmiEnv:
         self.camera_obs_horizon = camera_obs_horizon
         self.robot_obs_horizon = robot_obs_horizon
         self.gripper_obs_horizon = gripper_obs_horizon
+        self.ft_obs_horizon = int(ft_obs_horizon)
+        self.ft_obs_stride = int(ft_obs_stride)
+        self.ft_obs_frequency = float(ft_obs_frequency)
+        if self.ft_obs_horizon < 0:
+            raise ValueError("ft_obs_horizon must be non-negative")
         # recording
         self.output_dir = output_dir
         self.video_dir = video_dir
@@ -742,6 +751,25 @@ class UmiEnv:
             'robot0_gripper_width': gripper_width,
             'robot0_ft': robot0_ft
         }
+        if self.ft_obs_horizon > 0:
+            if last_gripper_data is None:
+                raise RuntimeError(
+                    "dual-F/T policy requires live RG2-FT data; no gripper "
+                    "sensor stream is available"
+                )
+            if 'gripper_ft' not in last_gripper_data:
+                raise RuntimeError(
+                    "dual-F/T policy requires gripper_ft in the live sensor stream"
+                )
+            causal = causal_ft_history(
+                last_gripper_data['gripper_timestamp'],
+                last_gripper_data['gripper_ft'],
+                anchor_timestamp=last_timestamp,
+                num_steps=self.ft_obs_horizon,
+                stride=self.ft_obs_stride,
+                frequency=self.ft_obs_frequency,
+            )
+            gripper_obs.update(causal)
 
         # accumulate obs
         if self.obs_accumulator is not None:

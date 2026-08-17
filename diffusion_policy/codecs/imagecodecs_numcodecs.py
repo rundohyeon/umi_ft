@@ -41,6 +41,11 @@ from numcodecs.abc import Codec
 from numcodecs.registry import register_codec, get_codec
 
 import imagecodecs
+import logging
+
+
+logger = logging.getLogger(__name__)
+_jpegxl_compat_fields_logged = set()
 
 
 def protective_squeeze(x: numpy.ndarray):
@@ -716,6 +721,11 @@ class JpegXl(Codec):
         # decode
         index=None,
         keeporientation=None,
+        # Newer imagecodecs metadata fields. The local codec API used by this
+        # repository predates them, but datasets written by newer releases
+        # serialize them even when they are None.
+        bitspersample=None,
+        squeeze=None,
         # both
         numthreads=None,
     ):
@@ -817,6 +827,29 @@ class JpegXl(Codec):
         self.index = index
         self.keeporientation = keeporientation
         self.numthreads = numthreads
+        self.bitspersample = bitspersample
+        self.squeeze = squeeze
+
+        # Current TARGET imagecodecs does not expose either option to
+        # jpegxl_decode. Accepting None is lossless compatibility; silently
+        # ignoring a meaningful value would not be safe.
+        compat_values = {
+            'bitspersample': bitspersample,
+            'squeeze': squeeze,
+        }
+        for field, value in compat_values.items():
+            if value is not None:
+                raise ValueError(
+                    f"JPEG-XL metadata field {field!r}={value!r} is not "
+                    "supported by the TARGET codec; refusing to ignore it"
+                )
+            if field not in _jpegxl_compat_fields_logged:
+                logger.warning(
+                    "JPEG-XL compatibility: accepted metadata field %s=None; "
+                    "the local decoder has no corresponding runtime option",
+                    field,
+                )
+                _jpegxl_compat_fields_logged.add(field)
 
     def encode(self, buf):
         # TODO: only squeeze all but last dim
