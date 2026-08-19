@@ -31,7 +31,7 @@ from diffusion_policy.common.cv2_util import (
 from umi.common.usb_util import reset_all_elgato_devices, get_sorted_v4l_paths
 from umi.common.pose_util import pose_to_pos_rot
 from umi.common.interpolation_util import get_interp1d, PoseInterpolator
-from umi.real_world.rg2ft_obs import causal_ft_history
+from umi.real_world.rg2ft_obs import causal_ft_history_from_streams
 
 
 def _camera_capture_profile(dev_path: str):
@@ -131,6 +131,7 @@ class UmiEnv:
             ft_obs_horizon=0,
             ft_obs_stride=1,
             ft_obs_frequency=100.0,
+            ft_max_age=None,
             # action
             max_pos_speed=0.25,
             max_rot_speed=0.6,
@@ -561,8 +562,11 @@ class UmiEnv:
         self.ft_obs_horizon = int(ft_obs_horizon)
         self.ft_obs_stride = int(ft_obs_stride)
         self.ft_obs_frequency = float(ft_obs_frequency)
+        self.ft_max_age = None if ft_max_age is None else float(ft_max_age)
         if self.ft_obs_horizon < 0:
             raise ValueError("ft_obs_horizon must be non-negative")
+        if self.ft_max_age is not None and self.ft_max_age < 0:
+            raise ValueError("ft_max_age must be non-negative or None")
         # recording
         self.output_dir = output_dir
         self.video_dir = video_dir
@@ -757,17 +761,28 @@ class UmiEnv:
                     "dual-F/T policy requires live RG2-FT data; no gripper "
                     "sensor stream is available"
                 )
-            if 'gripper_ft' not in last_gripper_data:
+            if (
+                'gripper_ft_left' not in last_gripper_data
+                or 'gripper_ft_right' not in last_gripper_data
+            ):
                 raise RuntimeError(
-                    "dual-F/T policy requires gripper_ft in the live sensor stream"
+                    "dual-F/T policy requires distinct left/right F/T streams "
+                    "from the live RG2-FT controller"
                 )
-            causal = causal_ft_history(
+            # RG2-FT returns both finger wrenches atomically, therefore both
+            # side-specific streams currently share this wall-clock timestamp.
+            # The assembler nevertheless samples them independently, matching
+            # the training dataset's two causal lookups.
+            causal = causal_ft_history_from_streams(
                 last_gripper_data['gripper_timestamp'],
-                last_gripper_data['gripper_ft'],
+                last_gripper_data['gripper_ft_left'],
+                last_gripper_data['gripper_timestamp'],
+                last_gripper_data['gripper_ft_right'],
                 anchor_timestamp=last_timestamp,
                 num_steps=self.ft_obs_horizon,
                 stride=self.ft_obs_stride,
                 frequency=self.ft_obs_frequency,
+                max_age=self.ft_max_age,
             )
             gripper_obs.update(causal)
 

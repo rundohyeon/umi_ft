@@ -148,6 +148,96 @@ def _get_eval_workspace_class(target: str):
     return hydra.utils.get_class(target)
 
 
+def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
+    """Fail closed unless a payload is the trained 32-step dual-F/T policy.
+
+    This only inspects checkpoint metadata/state dictionaries; it never
+    instantiates a robot, camera, or policy.  The normalizer is deliberately
+    required here because ``DiffusionUnetTimmPolicy.predict_action`` owns the
+    single observation/action normalization pass.
+    """
+    if not isinstance(payload, dict) or "cfg" not in payload:
+        raise ValueError("checkpoint payload is missing resolved cfg")
+    cfg = payload["cfg"]
+    obs_meta = OmegaConf.select(cfg, "task.shape_meta.obs", default=None)
+    action_meta = OmegaConf.select(cfg, "task.shape_meta.action", default=None)
+    if obs_meta is None or action_meta is None:
+        raise ValueError("checkpoint cfg is missing task.shape_meta")
+    required = ("camera0_rgb", "robot0_ft_left", "robot0_ft_right")
+    missing = [key for key in required if key not in obs_meta]
+    if missing:
+        raise ValueError(
+            "RGB-only/non-dual checkpoint rejected; missing required obs keys: "
+            + ", ".join(missing)
+        )
+    for key in ("robot0_ft_left", "robot0_ft_right"):
+        meta = obs_meta[key]
+        if tuple(meta.get("shape", ())) != (6,) or int(meta.get("horizon", -1)) != 32:
+            raise ValueError(
+                f"{key} must be [32,6], got horizon={meta.get('horizon')} "
+                f"shape={meta.get('shape')}"
+            )
+    if tuple(action_meta.get("shape", ())) != (10,) or int(action_meta.get("horizon", -1)) != 16:
+        raise ValueError(
+            "checkpoint action contract must be [16,10], got "
+            f"horizon={action_meta.get('horizon')} shape={action_meta.get('shape')}"
+        )
+    state_dicts = payload.get("state_dicts", {})
+    if not isinstance(state_dicts, dict) or not state_dicts:
+        raise ValueError("checkpoint is missing model state dictionaries")
+    state = state_dicts.get("ema_model") or state_dicts.get("model")
+    if not isinstance(state, dict):
+        raise ValueError("checkpoint is missing model/ema_model weights")
+    required_state_fragments = (
+        "obs_encoder.left_ft_encoder.",
+        "obs_encoder.right_ft_encoder.",
+        "normalizer.params_dict.robot0_ft_left.",
+        "normalizer.params_dict.robot0_ft_right.",
+        "normalizer.params_dict.action.",
+    )
+    absent = [
+        fragment for fragment in required_state_fragments
+        if not any(str(key).startswith(fragment) for key in state)
+    ]
+    if absent:
+        raise ValueError(
+            "checkpoint has no restorable dual-F/T normalizer/encoder state: "
+            + ", ".join(absent)
+        )
+    # DualFTObsEncoder builds the low-dimensional suffix from every
+    # non-RGB/non-FT observation that is not ignored.  ``low_dim_output`` is
+    # a derived constructor value, not necessarily a serialized config key.
+    left_key = str(OmegaConf.select(cfg, "policy.obs_encoder.left_ft_key", default="robot0_ft_left"))
+    right_key = str(OmegaConf.select(cfg, "policy.obs_encoder.right_ft_key", default="robot0_ft_right"))
+    low_dim_output = 0
+    for key, meta in obs_meta.items():
+        if (
+            key in (left_key, right_key)
+            or str(meta.get("type", "")) == "rgb"
+            or key.endswith("_rgb")
+        ):
+            continue
+        if bool(meta.get("ignore_by_policy", False)):
+            continue
+        low_dim_output += int(np.prod(meta.get("shape", ()))) * int(meta.get("horizon", 1))
+    serialized_low_dim_output = OmegaConf.select(
+        cfg, "policy.obs_encoder.low_dim_output", default=None
+    )
+    if serialized_low_dim_output is not None:
+        low_dim_output = int(serialized_low_dim_output)
+    return {
+        "cfg": cfg,
+        "condition_dim": int(
+            OmegaConf.select(cfg, "policy.obs_encoder.fusion_dim", default=0)
+        ) + low_dim_output,
+        "action_horizon": int(action_meta.horizon),
+        "action_dim": int(action_meta.shape[0]),
+        "ft_horizon": int(obs_meta.robot0_ft_left.horizon),
+        "ft_dim": int(obs_meta.robot0_ft_left.shape[0]),
+        "normalizer_owner": "policy.predict_action",
+    }
+
+
 class _TerminalKeyPoller:
     """Non-blocking single-key input for Docker terminals."""
 
@@ -1050,6 +1140,26 @@ def _check_policy_inputs_finite(obs_dict_np, tag: str) -> None:
         _check_finite_array(f"{tag} policy input {key!r}", value)
 
 
+def _policy_obs_float32(obs_dict_np: dict) -> dict:
+    """Match the dataset's float32 model-input dtype without normalizing."""
+    return {
+        key: np.asarray(value, dtype=np.float32)
+        for key, value in obs_dict_np.items()
+    }
+
+
+def _format_timing_stats_ms(samples) -> str:
+    """Compact p50/p95/max timing report without retaining raw log samples."""
+    values = np.asarray(samples, dtype=np.float64)
+    if values.size == 0:
+        return "n/a"
+    return (
+        f"p50={np.percentile(values, 50) * 1000.0:.3f}ms "
+        f"p95={np.percentile(values, 95) * 1000.0:.3f}ms "
+        f"max={np.max(values) * 1000.0:.3f}ms"
+    )
+
+
 def _array_minmax_str(arr) -> str:
     a = np.asarray(arr)
     if a.size == 0:
@@ -1784,6 +1894,12 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
 @click.option('--max_duration', '-md', default=2000000, help='Max duration for each epoch in seconds.')
 @click.option('--frequency', '-f', default=None, type=float,
     help="Control frequency in Hz. Defaults to checkpoint action frequency.")
+@click.option(
+    '--device',
+    default='auto',
+    show_default=True,
+    help="Inference device: auto, cpu, cuda, or cuda:N.",
+)
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
 @click.option('--no_spacemouse', is_flag=True, default=True, help="Disable SpaceMouse and use keyboard teleop only.")
 @click.option('--no_gripper', is_flag=True, default=False, help="Run without connecting to gripper hardware.")
@@ -1983,7 +2099,7 @@ def main(input, output, robot_config,
     camera_reorder,
     vis_camera_idx, init_joints,
     steps_per_inference, max_duration,
-    frequency, command_latency, no_spacemouse, no_gripper,
+    frequency, device, command_latency, no_spacemouse, no_gripper,
     direct_dynamixel_gripper, dynamixel_gripper_config, gripper_calib_zarr,
     no_mirror, sim_fov, camera_intrinsics, eval_image_mask, policy_image_crop_ratio,
     inpaint_aruco_tags, aruco_config, disable_eval_image_aug,
@@ -2123,7 +2239,17 @@ def main(input, output, robot_config,
     if not ckpt_path.endswith('.ckpt'):
         ckpt_path = os.path.join(ckpt_path, 'checkpoints', 'latest.ckpt')
     payload = torch.load(open(ckpt_path, 'rb'), map_location='cpu', pickle_module=dill)
-    cfg = payload['cfg']
+    checkpoint_contract = inspect_dual_ft_checkpoint_payload(payload)
+    cfg = checkpoint_contract["cfg"]
+    print(
+        "dual-F/T checkpoint contract: "
+        f"condition=[1,{checkpoint_contract['condition_dim']}], "
+        f"action=[1,{checkpoint_contract['action_horizon']},"
+        f"{checkpoint_contract['action_dim']}], "
+        f"FT=[1,{checkpoint_contract['ft_horizon']},"
+        f"{checkpoint_contract['ft_dim']}], normalizer="
+        f"{checkpoint_contract['normalizer_owner']}"
+    )
     # The checkpoint payload restores all trained weights immediately after
     # workspace construction. Avoid an unnecessary online pretrained-weight
     # download when this self-contained folder is moved to the robot PC.
@@ -2148,6 +2274,11 @@ def main(input, output, robot_config,
             raise click.ClickException("left/right F/T horizons must match")
         ft_obs_horizon = left_ft_horizon
         ft_obs_stride = int(left_ft_meta.get("down_sample_steps", 1))
+        if checkpoint_contract["condition_dim"] != 800:
+            raise click.ClickException(
+                "dual-F/T checkpoint condition must be [1,800], got "
+                f"[1,{checkpoint_contract['condition_dim']}]"
+            )
     else:
         ft_obs_horizon = 0
         ft_obs_stride = 1
@@ -2174,6 +2305,31 @@ def main(input, output, robot_config,
         )
     if frequency <= 0:
         raise click.ClickException("frequency must be positive")
+    ft_sample_frequency = float(
+        OmegaConf.select(
+            cfg,
+            "task.ft_frequency",
+            default=gc.get('rg2ft_frequency', 100.0),
+        )
+    )
+    configured_ft_max_age = OmegaConf.select(
+        cfg, "task.ft_max_age_sec", default=None
+    )
+    # The August checkpoint predates the explicit config field. Its 0814
+    # alignment audit measured 11.182 ms max age at 100 Hz, which is 1.118
+    # samples; 1.2 sample periods preserves that evidence-based limit.
+    ft_max_age = (
+        float(configured_ft_max_age)
+        if configured_ft_max_age is not None
+        else 1.2 / ft_sample_frequency
+    )
+    if dual_ft_enabled:
+        print(
+            "dual-F/T freshness limit: "
+            f"{ft_max_age * 1000.0:.3f} ms "
+            + ("(checkpoint config)" if configured_ft_max_age is not None
+               else "(legacy checkpoint fallback: 1.2 F/T sample periods)")
+        )
     if dual_ft_enabled and no_gripper:
         raise click.ClickException(
             "dual-F/T deployment requires the live RG2-FT sensor; "
@@ -2268,8 +2424,12 @@ def main(input, output, robot_config,
     )
     tcp_delta_scale_vec = _parse_tcp_delta_scales(tcp_delta_scales)
     if plan_only:
-        max_policy_iters = 1
-        print("plan_only: robot will not move; printing one inference cycle only.")
+        if max_policy_iters is None:
+            max_policy_iters = 1
+        print(
+            "plan_only: robot will not move; running "
+            f"{max_policy_iters} inference cycle(s)."
+        )
     if max_policy_iters is not None:
         print("max_policy_iters:", max_policy_iters)
     if tcp_delta_scale_vec is not None:
@@ -2340,13 +2500,8 @@ def main(input, output, robot_config,
                 gripper_obs_horizon=cfg.task.shape_meta.obs.robot0_gripper_width.horizon,
                 ft_obs_horizon=ft_obs_horizon,
                 ft_obs_stride=ft_obs_stride,
-                ft_obs_frequency=float(
-                    OmegaConf.select(
-                        cfg,
-                        "task.ft_frequency",
-                        default=gc.get('rg2ft_frequency', 100.0),
-                    )
-                ),
+                ft_obs_frequency=ft_sample_frequency,
+                ft_max_age=ft_max_age if dual_ft_enabled else None,
                 no_mirror=no_mirror,
                 fisheye_converter=fisheye_converter,
                 policy_image_crop_ratio=policy_image_crop_ratio,
@@ -2439,6 +2594,14 @@ def main(input, output, robot_config,
             policy = workspace.model
             if cfg.training.use_ema:
                 policy = workspace.ema_model
+            if dual_ft_enabled:
+                encoder_shape = tuple(policy.obs_encoder.output_shape())
+                if encoder_shape != (1, 800):
+                    raise RuntimeError(
+                        "restored dual-F/T observation encoder must emit "
+                        f"condition [1,800], got {encoder_shape}"
+                    )
+                print("restored observation-encoder condition shape: [1,800]")
             if disable_eval_image_aug:
                 disabled_keys = _disable_policy_image_transforms(policy)
                 if disabled_keys:
@@ -2457,18 +2620,40 @@ def main(input, output, robot_config,
             policy_image_audit_printed = False
             coord_transform_audit_printed = False
 
+            requested_device = str(device).strip().lower()
             device = torch.device('cpu')
-            if torch.cuda.is_available():
+            if requested_device == 'auto':
+                if torch.cuda.is_available():
+                    try:
+                        device = torch.device('cuda')
+                        policy.eval().to(device)
+                    except Exception as exc:
+                        print(f"CUDA init failed ({exc}). Falling back to CPU inference.")
+                        device = torch.device('cpu')
+                        policy.eval().to(device)
+                else:
+                    print("CUDA not available. Falling back to CPU inference.")
+                    policy.eval().to(device)
+            elif requested_device in ('cpu', ''):
+                print("Using CPU inference by request.")
+                policy.eval().to(device)
+            elif requested_device.startswith('cuda'):
+                if not torch.cuda.is_available():
+                    raise click.ClickException(
+                        f"--device {requested_device!s} requested but CUDA is unavailable"
+                    )
                 try:
-                    device = torch.device('cuda')
+                    device = torch.device(requested_device)
                     policy.eval().to(device)
                 except Exception as exc:
-                    print(f"CUDA init failed ({exc}). Falling back to CPU inference.")
-                    device = torch.device('cpu')
-                    policy.eval().to(device)
+                    raise click.ClickException(
+                        f"failed to initialize --device {requested_device}: {exc}"
+                    ) from exc
             else:
-                print("CUDA not available. Falling back to CPU inference.")
-                policy.eval().to(device)
+                raise click.ClickException(
+                    "--device must be auto, cpu, cuda, or cuda:N; got "
+                    f"{requested_device!r}"
+                )
 
             print("Warming up policy inference")
             obs = env.get_obs()
@@ -2484,7 +2669,7 @@ def main(input, output, robot_config,
                     obs['robot0_eef_rot_axis_angle'],
                 ], axis=-1)[-1]
             ]
-            with torch.no_grad():
+            with torch.inference_mode():
                 policy.reset()
                 obs_for_model = prepare_rg2ft_policy_obs(
                     obs, cfg.task.shape_meta
@@ -2498,6 +2683,7 @@ def main(input, output, robot_config,
                     obs_pose_repr=obs_pose_rep,
                     tx_robot1_robot0=None,
                     episode_start_pose=episode_start_pose_for_model)
+                obs_dict_np = _policy_obs_float32(obs_dict_np)
                 _check_policy_inputs_finite(obs_dict_np, "[warmup]")
                 audit_match_episode = match_episode
                 if audit_match_episode is None and len(episode_first_policy_frame_map) > 0:
@@ -2529,7 +2715,15 @@ def main(input, output, robot_config,
                     lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                 result = policy.predict_action(obs_dict)
                 raw_pred = result["action_pred"][0].detach().to("cpu").numpy()
-                assert raw_pred.shape[-1] == 10 * n_robots
+                expected_action_shape = (
+                    int(checkpoint_contract["action_horizon"]),
+                    int(checkpoint_contract["action_dim"]) * n_robots,
+                )
+                if raw_pred.shape != expected_action_shape:
+                    raise RuntimeError(
+                        "policy must return its full trained trajectory; got "
+                        f"{raw_pred.shape}, expected {expected_action_shape}"
+                    )
                 _check_finite_array("[warmup] raw action_pred before frame fix", raw_pred)
                 raw_pred = _apply_slam_frame_fix(raw_pred, n_robots)
                 _check_finite_array("[warmup] raw action_pred after frame fix", raw_pred)
@@ -3282,11 +3476,23 @@ def main(input, output, robot_config,
                     iter_idx = 0
                     policy_iter_count = 0
                     perv_target_pose = None
+                    runtime_metrics = {
+                        "cycles": 0,
+                        "valid_observations": 0,
+                        "ft_left_age": [],
+                        "ft_right_age": [],
+                        "obs_assembly": [],
+                        "inference": [],
+                        "loop": [],
+                        "deadline_misses": 0,
+                        "robot_command_calls": 0,
+                    }
                     while True:
                         # calculate timing
                         t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
 
                         # get obs
+                        t_loop_start = time.perf_counter()
                         obs = env.get_obs()
                         if no_gripper:
                             obs = _with_synthetic_gripper_width(
@@ -3295,8 +3501,18 @@ def main(input, output, robot_config,
                                 fallback=max_gripper_width,
                             )
                         obs_timestamps = obs['timestamp']
+                        runtime_metrics["obs_assembly"].append(
+                            time.perf_counter() - t_loop_start
+                        )
+                        runtime_metrics["valid_observations"] += 1
                         print(f'Obs latency {time.time() - obs_timestamps[-1]}')
                         if dual_ft_enabled:
+                            runtime_metrics["ft_left_age"].append(
+                                float(obs["robot0_ft_left_age"])
+                            )
+                            runtime_metrics["ft_right_age"].append(
+                                float(obs["robot0_ft_right_age"])
+                            )
                             print(
                                 "Dual-F/T causal timing: "
                                 f"anchor={float(obs_timestamps[-1]):.9f} "
@@ -3307,7 +3523,7 @@ def main(input, output, robot_config,
                             )
 
                         # run inference
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             s = time.time()
                             obs_for_model = prepare_rg2ft_policy_obs(
                                 obs, cfg.task.shape_meta
@@ -3320,6 +3536,7 @@ def main(input, output, robot_config,
                                 obs_pose_repr=obs_pose_rep,
                                 tx_robot1_robot0=None,
                                 episode_start_pose=episode_start_pose_for_model)
+                            obs_dict_np = _policy_obs_float32(obs_dict_np)
                             _check_policy_inputs_finite(
                                 obs_dict_np, f"[policy iter={iter_idx}]"
                             )
@@ -3350,6 +3567,15 @@ def main(input, output, robot_config,
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
                             raw_action = result["action_pred"][0].detach().to("cpu").numpy()
+                            expected_action_shape = (
+                                int(checkpoint_contract["action_horizon"]),
+                                int(checkpoint_contract["action_dim"]) * n_robots,
+                            )
+                            if raw_action.shape != expected_action_shape:
+                                raise RuntimeError(
+                                    "policy must return its full trained trajectory; got "
+                                    f"{raw_action.shape}, expected {expected_action_shape}"
+                                )
                             _check_finite_array(
                                 f"[policy iter={iter_idx}] raw action_pred before frame fix",
                                 raw_action,
@@ -3396,7 +3622,9 @@ def main(input, output, robot_config,
                                     match_source_idx=0,
                                 )
                                 coord_transform_audit_printed = True
-                            print("Inference latency:", time.time() - s)
+                            inference_latency = time.time() - s
+                            runtime_metrics["inference"].append(inference_latency)
+                            print("Inference latency:", inference_latency)
                             if pose_eval_audit:
                                 _print_pose_z_audit(
                                     obs,
@@ -3438,6 +3666,7 @@ def main(input, output, robot_config,
                             + first_action_timestamp
                         )
                         is_new = action_timestamps > (curr_time + action_exec_latency)
+                        runtime_metrics["deadline_misses"] += int(np.sum(~is_new))
                         if np.sum(is_new) == 0:
                             # exceeded time budget, still do something
                             this_target_poses = this_target_poses[[-1]]
@@ -3508,6 +3737,7 @@ def main(input, output, robot_config,
                                 timestamps=action_timestamps,
                                 compensate_latency=False
                             )
+                            runtime_metrics["robot_command_calls"] += 1
                             print(f"Submitted {len(this_target_poses)} steps of actions.")
 
                         # --- per-step eval logging (CSV + comparison video) ---
@@ -3626,6 +3856,10 @@ def main(input, output, robot_config,
                             print("Max Duration reached.")
                             stop_episode = True
                         policy_iter_count += 1
+                        runtime_metrics["cycles"] += 1
+                        runtime_metrics["loop"].append(
+                            time.perf_counter() - t_loop_start
+                        )
                         if max_policy_iters is not None and policy_iter_count >= max_policy_iters:
                             print(f"max_policy_iters={max_policy_iters} reached.")
                             stop_episode = True
@@ -3658,6 +3892,37 @@ def main(input, output, robot_config,
                         except Exception:
                             pass
                         print(f"[eval_log] saved log.csv + comparison.mp4 to {eval_log_dir}")
+                    if 'runtime_metrics' in locals():
+                        print("[dual-F/T runtime summary]")
+                        print(
+                            "  cycles=", runtime_metrics["cycles"],
+                            "valid_observation_cycles=", runtime_metrics["valid_observations"],
+                            "dropped_cycles=", runtime_metrics["cycles"] - runtime_metrics["valid_observations"],
+                        )
+                        print(
+                            "  left_ft_age:",
+                            _format_timing_stats_ms(runtime_metrics["ft_left_age"]),
+                        )
+                        print(
+                            "  right_ft_age:",
+                            _format_timing_stats_ms(runtime_metrics["ft_right_age"]),
+                        )
+                        print(
+                            "  observation_assembly:",
+                            _format_timing_stats_ms(runtime_metrics["obs_assembly"]),
+                        )
+                        print(
+                            "  policy_total_inference:",
+                            _format_timing_stats_ms(runtime_metrics["inference"]),
+                        )
+                        print(
+                            "  total_loop:",
+                            _format_timing_stats_ms(runtime_metrics["loop"]),
+                        )
+                        print(
+                            "  deadline_misses=", runtime_metrics["deadline_misses"],
+                            "robot_command_calls=", runtime_metrics["robot_command_calls"],
+                        )
 
                 print("Stopped.")
 

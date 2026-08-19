@@ -132,6 +132,8 @@ class RG2FTController(mp.Process):
             "gripper_velocity": 0.0,
             "gripper_force": self.force_n,
             "gripper_ft": np.zeros(12, dtype=np.float64),
+            "gripper_ft_left": np.zeros(6, dtype=np.float64),
+            "gripper_ft_right": np.zeros(6, dtype=np.float64),
             "gripper_busy": 0,
             "gripper_grip_det": 0,
             "gripper_measure_timestamp": time.time(),
@@ -300,7 +302,15 @@ class RG2FTController(mp.Process):
                         "gripper_position": pos,
                         "gripper_velocity": vel,
                         "gripper_force": self.force_n,
+                        # The RG2-FT status block contains both native finger
+                        # wrenches in one atomic Modbus response.  Publish the
+                        # legacy combined field for recording compatibility and
+                        # side-specific streams for dual-F/T policy assembly.
+                        # The arrays are copies so a consumer cannot alias one
+                        # finger into the other.
                         "gripper_ft": ft,
+                        "gripper_ft_left": ft[:6].copy(),
+                        "gripper_ft_right": ft[6:].copy(),
                         "gripper_busy": busy,
                         "gripper_grip_det": grip_det,
                         "gripper_measure_timestamp": now_wall,
