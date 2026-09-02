@@ -286,6 +286,100 @@ See [the evaluation guide](docs/run_dual_ft_inference.md) and
 [the implementation/safety audit](docs/dual_ft_inference_audit.md) for the
 complete contracts and remaining commissioning limits.
 
+## Valve-state context classifier
+
+<details>
+<summary><strong>v4 (current) — causal 5-phase / 4-error classifier</strong></summary>
+
+The v4 bundle estimates the current valve-manipulation phase and error reason
+from RGB, TCP state, gripper width, and native dual F/T histories. The
+classifier is a frozen context estimator; the policy-side context encoder and
+stage-conditioned adapters/MoE are the trainable components.
+
+Local paths on `metafarmers-server2`:
+
+```text
+Bundle:     /home/metafarmers/dkim/umi_ft/valve_state_classifier_v4
+Checkpoint: /home/metafarmers/dkim/umi_ft/valve_state_classifier_v4/model/final.pt
+```
+
+The repository-relative checkpoint path is:
+
+```text
+valve_state_classifier_v4/model/final.pt
+```
+
+Verify the exported checkpoint before integration:
+
+```bash
+cd /home/metafarmers/dkim/umi_ft/valve_state_classifier_v4
+python verify_install.py --device cuda
+```
+
+Minimal streaming use from the repository root:
+
+```python
+from pathlib import Path
+import sys
+
+import numpy as np
+
+bundle_dir = Path("valve_state_classifier_v4").resolve()
+sys.path.insert(0, str(bundle_dir))
+
+from valve_state_classifier import (  # noqa: E402
+    ERROR_REASON_NAMES,
+    PHASE_NAMES,
+    ValveStateRuntime,
+)
+
+runtime = ValveStateRuntime(bundle_dir / "model/final.pt", device="cuda")
+
+# Enqueue every raw 100 Hz dual-wrench sample no newer than the RGB timestamp.
+runtime.append_wrench(
+    ft_timestamp_s,
+    wrench_12d,  # [left Fx,Fy,Fz,Tx,Ty,Tz, right Fx,Fy,Fz,Tx,Ty,Tz]
+)
+
+# Call this for every approximately 60 Hz RGB/robot observation, even when the
+# downstream diffusion policy replans at approximately 20 Hz.
+result = runtime.predict(
+    timestamp_s=rgb_timestamp_s,
+    rgb=rgb_224x224_uint8,               # RGB order, not OpenCV BGR
+    position_m=robot_position_xyz,       # metres
+    rotation_axis_angle_rad=robot_rotvec, # radians
+    gripper_width_m=gripper_width,
+)
+
+# Fixed 10-D policy context: phase 5 + error reason 4 + warm-up validity 1.
+valve_context_10d = np.asarray(
+    [result.phase_probabilities[name] for name in PHASE_NAMES]
+    + [result.error_reason_probabilities[name] for name in ERROR_REASON_NAMES]
+    + [float(result.warmed_up)],
+    dtype=np.float32,
+)
+```
+
+Call `runtime.reset()` at every episode/task boundary. Pass raw F/T values in
+N/Nm; the runtime applies its own training-time scaling. Never enqueue an F/T
+sample newer than the RGB timestamp being predicted. The classifier needs 61
+RGB frames for a fully warmed-up context and reports `warmed_up=False` before
+then.
+
+For policy training, run this frozen classifier causally over every training
+episode and store the timestamp-aligned 10-D outputs in a sidecar. At deploy,
+run the same frozen runtime online and give the most recent causal output to
+the trainable policy context module. Do not use only the hard `phase_id`; the
+five soft phase probabilities preserve classifier uncertainty.
+
+See
+[`README_FOR_CODEX.md`](valve_state_classifier_v4/README_FOR_CODEX.md),
+[`MODEL_CARD.md`](valve_state_classifier_v4/MODEL_CARD.md), and
+[`example_streaming.py`](valve_state_classifier_v4/example_streaming.py) for
+the complete input contract and limitations.
+
+</details>
+
 ## 🦾 Real-world Deployment
 In this section, we will demonstrate our real-world deployment/evaluation system with the cup arrangement policy. While this policy setup only requires a single arm and camera, the our system supports up to 2 arms and unlimited number of cameras.
 
