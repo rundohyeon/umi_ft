@@ -28,7 +28,10 @@ def dataset():
     if not OmegaConf.has_resolver("eval"):
         OmegaConf.register_new_resolver("eval", eval)
     with initialize_config_dir(version_base=None, config_dir=str(CONFIG)):
-        cfg = compose(config_name="train_diffusion_unet_timm_umi_dual_ft_workspace")
+        cfg = compose(
+            config_name="train_diffusion_unet_timm_umi_dual_ft_workspace",
+            overrides=["task=umi_dual_ft"],
+        )
     value = instantiate(cfg.task.dataset)
     yield value
     value.close()
@@ -87,4 +90,4 @@ def test_multiworker_loader_uses_process_local_lazy_zip_open(dataset):
     assert tuple(batch["obs"]["camera0_rgb"].shape) == (2, 2, 3, 224, 224)
     assert tuple(batch["obs"]["robot0_ft_left"].shape) == (2, 32, 6)
     assert tuple(batch["obs"]["robot0_ft_right"].shape) == (2, 32, 6)
-    assert tuple(batch["action"].shape) == (2, 16, 10)
+    assert tuple(batch["action"].shape) == (2, 16, 11)

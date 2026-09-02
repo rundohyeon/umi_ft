@@ -1,6 +1,6 @@
 defaults:
   - train_diffusion_unet_timm_umi_workspace
-  - override task: umi_dual_ft
+  - override task: umi_dual_ft_260827_bias_only
   - _self_
 
 name: train_diffusion_unet_timm_umi_dual_ft
@@ -18,6 +18,8 @@ execution:
 n_action_steps: ${execution.n_action_steps}
 
 policy:
+  # Match the released UMI-FT denoising-time embedding contract.
+  diffusion_step_embed_dim: 32
   obs_encoder:
     _target_: diffusion_policy.model.vision.dual_ft_obs_encoder.DualFTObsEncoder
     shape_meta: ${shape_meta}
@@ -47,5 +49,15 @@ policy:
     fusion_layers: 1
     fusion_feedforward_dim: 2048
     fusion_dropout: 0.0
+    fusion_position_encoding: learnable
     ft_channel_dims: [16, 32, 64, 128]
     share_ft_encoder: false
+
+# Only the timm ViT owns pretrained weights. The fusion Transformer is trained
+# more conservatively, while the F/T CNNs, fusion projection, position
+# embedding, and diffusion model use the base optimizer LR.
+optimizer_parameter_groups:
+  mode: dual_ft
+  pretrained_vision_lr: 3.0e-5
+  fusion_transformer_lr: 1.0e-4
+  new_obs_lr: ${optimizer.lr}

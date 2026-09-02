@@ -30,8 +30,148 @@ from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from accelerate import Accelerator
+from accelerate.utils import broadcast_object_list
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def _trainable_parameters(module):
+    return [param for param in module.parameters() if param.requires_grad]
+
+
+def _scheduler_resume_last_epoch(global_step: int, num_processes: int) -> int:
+    global_step = int(global_step)
+    num_processes = int(num_processes)
+    if global_step < 0 or num_processes <= 0:
+        raise ValueError("global_step must be nonnegative and num_processes positive")
+    return global_step * num_processes - 1
+
+
+def _build_optimizer_param_groups(model, cfg):
+    """Build disjoint optimizer groups, with an explicit dual-F/T split.
+
+    The legacy image-only path keeps its original two-group behavior. The
+    dual-F/T path separates the actually pretrained timm backbones from the
+    randomly initialized F/T and fusion modules.
+    """
+
+    base_lr = float(cfg.optimizer.lr)
+    split_cfg = OmegaConf.select(
+        cfg, "optimizer_parameter_groups", default=None
+    )
+    if split_cfg is None:
+        obs_encoder_lr = base_lr
+        if bool(cfg.policy.obs_encoder.pretrained):
+            obs_encoder_lr *= 0.1
+        return [
+            {
+                "name": "diffusion_model",
+                "params": _trainable_parameters(model.model),
+                "lr": base_lr,
+            },
+            {
+                "name": "obs_encoder",
+                "params": _trainable_parameters(model.obs_encoder),
+                "lr": obs_encoder_lr,
+            },
+        ]
+
+    mode = str(split_cfg.get("mode", ""))
+    if mode != "dual_ft":
+        raise ValueError(
+            "optimizer_parameter_groups.mode must be 'dual_ft', "
+            f"got {mode!r}"
+        )
+    obs_encoder = model.obs_encoder
+    required_attributes = (
+        "vision_pose_encoder",
+        "left_ft_encoder",
+        "right_ft_encoder",
+        "fusion",
+        "fusion_projection",
+    )
+    missing = [
+        name for name in required_attributes if not hasattr(obs_encoder, name)
+    ]
+    if missing:
+        raise ValueError(
+            "dual-F/T optimizer split requires encoder modules: "
+            + ", ".join(missing)
+        )
+    if not hasattr(obs_encoder.vision_pose_encoder, "key_model_map"):
+        raise ValueError(
+            "dual-F/T optimizer split cannot locate the pretrained timm "
+            "backbone map"
+        )
+
+    vision_ids = {
+        id(param)
+        for param in obs_encoder.vision_pose_encoder.key_model_map.parameters()
+        if param.requires_grad
+    }
+    fusion_ids = {
+        id(param) for param in obs_encoder.fusion.parameters()
+        if param.requires_grad
+    }
+    vision_params = []
+    fusion_params = []
+    new_obs_params = []
+    for param in obs_encoder.parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in vision_ids:
+            vision_params.append(param)
+        elif id(param) in fusion_ids:
+            fusion_params.append(param)
+        else:
+            # Includes both F/T CNNs, fusion_projection, position_embedding,
+            # and any future randomly initialized non-Transformer adapter.
+            new_obs_params.append(param)
+
+    param_groups = [
+        {
+            "name": "diffusion_model",
+            "params": _trainable_parameters(model.model),
+            "lr": base_lr,
+        },
+        {
+            "name": "pretrained_vision",
+            "params": vision_params,
+            "lr": float(split_cfg.pretrained_vision_lr),
+        },
+        {
+            "name": "fusion_transformer",
+            "params": fusion_params,
+            "lr": float(split_cfg.fusion_transformer_lr),
+        },
+        {
+            "name": "new_obs_modules",
+            "params": new_obs_params,
+            "lr": float(split_cfg.new_obs_lr),
+        },
+    ]
+    empty = [group["name"] for group in param_groups if not group["params"]]
+    if empty:
+        raise ValueError(
+            "optimizer parameter groups unexpectedly have no trainable "
+            "parameters: " + ", ".join(empty)
+        )
+
+    grouped_ids = [
+        id(param) for group in param_groups for param in group["params"]
+    ]
+    if len(grouped_ids) != len(set(grouped_ids)):
+        raise ValueError("optimizer parameter groups contain duplicate parameters")
+    expected_ids = {
+        id(param) for param in model.parameters() if param.requires_grad
+    }
+    if set(grouped_ids) != expected_ids:
+        raise ValueError(
+            "optimizer parameter groups do not cover every trainable policy "
+            "parameter exactly once"
+        )
+    return param_groups
+
 
 class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
@@ -57,19 +197,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # self.optimizer = hydra.utils.instantiate(
         #     cfg.optimizer, params=self.model.parameters())
 
-        obs_encorder_lr = cfg.optimizer.lr
-        if cfg.policy.obs_encoder.pretrained:
-            obs_encorder_lr *= 0.1
-            print('==> reduce pretrained obs_encorder\'s lr')
-        obs_encorder_params = list()
-        for param in self.model.obs_encoder.parameters():
-            if param.requires_grad:
-                obs_encorder_params.append(param)
-        print(f'obs_encorder params: {len(obs_encorder_params)}')
-        param_groups = [
-            {'params': self.model.model.parameters()},
-            {'params': obs_encorder_params, 'lr': obs_encorder_lr}
-        ]
+        param_groups = _build_optimizer_param_groups(self.model, cfg)
+        for group in param_groups:
+            parameter_count = sum(param.numel() for param in group["params"])
+            print(
+                f"optimizer group {group['name']}: "
+                f"parameters={parameter_count:,} lr={float(group['lr']):.6g}"
+            )
         # self.optimizer = hydra.utils.instantiate(
         #     cfg.optimizer, params=param_groups)
         optimizer_cfg = OmegaConf.to_container(cfg.optimizer, resolve=True)
@@ -91,6 +225,16 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
 
         accelerator = Accelerator(log_with='wandb')
+        # Hydra resolves ${now:...} independently in every launched process.
+        # Broadcast rank 0's directory so all ranks share one normalizer,
+        # checkpoint directory, and run identity even at a second boundary.
+        shared_output_dir = [
+            str(self.output_dir) if accelerator.is_main_process else None
+        ]
+        broadcast_object_list(shared_output_dir, from_process=0)
+        self._output_dir = shared_output_dir[0]
+        accelerator.wait_for_everyone()
+
         wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
         wandb_cfg.pop('project')
         accelerator.init_trackers(
@@ -101,16 +245,51 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
         # resume training
         if cfg.training.resume:
-            lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file():
-                accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
+            configured_resume_path = OmegaConf.select(
+                cfg, "training.resume_path", default=None
+            )
+            if configured_resume_path is None:
+                resume_ckpt_path = self.get_checkpoint_path()
+            else:
+                resume_ckpt_path = pathlib.Path(
+                    str(configured_resume_path)
+                ).expanduser().resolve()
+            if resume_ckpt_path.is_file():
+                accelerator.print(f"Resuming from checkpoint {resume_ckpt_path}")
+                self.load_checkpoint(path=resume_ckpt_path)
+                # Checkpoints are written after the labeled epoch's training
+                # batches and before the final per-epoch counter increment.
+                # Continue with the next epoch/global step exactly once.
+                completed_epoch = int(self.epoch)
+                self.epoch = completed_epoch + 1
+                self.global_step = int(self.global_step) + 1
+                accelerator.print(
+                    f"Resume state: completed_epoch={completed_epoch} "
+                    f"next_epoch={self.epoch} global_step={self.global_step}"
+                )
+            elif configured_resume_path is not None:
+                raise FileNotFoundError(
+                    f"configured training.resume_path does not exist: "
+                    f"{resume_ckpt_path}"
+                )
+            else:
+                accelerator.print(
+                    f"No latest checkpoint at {resume_ckpt_path}; starting fresh"
+                )
 
         # configure dataset
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset) or isinstance(dataset, BaseDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        accelerator.print(
+            "training distribution: "
+            f"processes={accelerator.num_processes} "
+            f"per_device_batch={int(cfg.dataloader.batch_size)} "
+            f"gradient_accumulation={int(cfg.training.gradient_accumulate_every)} "
+            f"global_batch={int(cfg.dataloader.batch_size) * accelerator.num_processes * int(cfg.training.gradient_accumulate_every)} "
+            f"mixed_precision={accelerator.mixed_precision}"
+        )
 
         # compute normalizer on the main process and save to disk
         normalizer_path = os.path.join(self.output_dir, 'normalizer.pkl')
@@ -125,14 +304,27 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
-        print('train dataset:', len(dataset), 'train dataloader:', len(train_dataloader))
-        print('val dataset:', len(val_dataset), 'val dataloader:', len(val_dataloader))
+        accelerator.print(
+            'train dataset:', len(dataset), 'train dataloader:', len(train_dataloader)
+        )
+        accelerator.print(
+            'val dataset:', len(val_dataset), 'val dataloader:', len(val_dataloader)
+        )
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        # With Accelerate's default split_batches=False, each distributed
+        # optimizer update advances the wrapped scheduler once per process so
+        # the schedule remains sample-based. Reconstruct that underlying step
+        # count on resume; using global_step alone would jump the LR backward
+        # by world_size on a multi-GPU run.
+        scheduler_last_epoch = _scheduler_resume_last_epoch(
+            self.global_step,
+            accelerator.num_processes,
+        )
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
@@ -142,7 +334,12 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     // cfg.training.gradient_accumulate_every,
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            last_epoch=scheduler_last_epoch
+        )
+        accelerator.print(
+            f"scheduler resume: global_step={self.global_step} "
+            f"underlying_last_epoch={lr_scheduler.last_epoch} "
+            f"lr={lr_scheduler.get_last_lr()}"
         )
 
         # configure ema
@@ -206,8 +403,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
+        # Only rank 0 owns the plain JSON log. Accelerator's tracker handles
+        # distributed logging separately.
+        json_logger = JsonLogger(log_path) if accelerator.is_main_process else None
+        if json_logger is not None:
+            json_logger.__enter__()
+        try:
+            for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
                 self.model.train()
 
                 step_log = dict()
@@ -218,7 +420,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
                 train_losses = list()
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
-                        leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
+                        leave=False, mininterval=cfg.training.tqdm_interval_sec,
+                        disable=not accelerator.is_local_main_process) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
                         # device transfer
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
@@ -229,7 +432,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         # compute loss
                         raw_loss = self.model(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
+                        accelerator.backward(loss)
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
@@ -242,21 +445,34 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             ema.step(accelerator.unwrap_model(self.model))
 
                         # logging
-                        raw_loss_cpu = raw_loss.item()
+                        raw_loss_cpu = accelerator.reduce(
+                            raw_loss.detach(), reduction="mean"
+                        ).item()
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
+                        group_lrs = {
+                            f"lr/{group.get('name', index)}": float(lr)
+                            for index, (group, lr) in enumerate(zip(
+                                self.optimizer.param_groups,
+                                lr_scheduler.get_last_lr(),
+                            ))
+                        }
                         step_log = {
                             'train_loss': raw_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0]
+                            # Keep the old scalar for existing dashboards while
+                            # also exposing every parameter group's actual LR.
+                            'lr': lr_scheduler.get_last_lr()[0],
+                            **group_lrs,
                         }
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
                             accelerator.log(step_log, step=self.global_step)
-                            json_logger.log(step_log)
+                            if json_logger is not None:
+                                json_logger.log(step_log)
                             self.global_step += 1
 
                         if (cfg.training.max_train_steps is not None) \
@@ -275,7 +491,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                if (
+                    (self.epoch % cfg.training.rollout_every) == 0
+                    and accelerator.is_main_process
+                ):
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)
@@ -300,12 +519,15 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 
                 def log_action_mse(step_log, category, pred_action, gt_action):
                     B, T, _ = pred_action.shape
-                    pred_action = pred_action.view(B, T, -1, 10)
-                    gt_action = gt_action.view(B, T, -1, 10)
+                    action_dim = int(cfg.task.shape_meta.action.shape[0])
+                    pred_action = pred_action.view(B, T, -1, action_dim)
+                    gt_action = gt_action.view(B, T, -1, action_dim)
                     step_log[f'{category}_action_mse_error'] = torch.nn.functional.mse_loss(pred_action, gt_action)
                     step_log[f'{category}_action_mse_error_pos'] = torch.nn.functional.mse_loss(pred_action[..., :3], gt_action[..., :3])
                     step_log[f'{category}_action_mse_error_rot'] = torch.nn.functional.mse_loss(pred_action[..., 3:9], gt_action[..., 3:9])
                     step_log[f'{category}_action_mse_error_width'] = torch.nn.functional.mse_loss(pred_action[..., 9], gt_action[..., 9])
+                    if action_dim == 11:
+                        step_log[f'{category}_action_mse_error_grasp_force'] = torch.nn.functional.mse_loss(pred_action[..., 10], gt_action[..., 10])
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0 and accelerator.is_main_process:
                     with torch.no_grad():
@@ -327,7 +549,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         del pred_action
                 
                 # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0 and accelerator.is_main_process:
+                is_final_epoch = self.epoch == (cfg.training.num_epochs - 1)
+                if (
+                    (
+                        (self.epoch % cfg.training.checkpoint_every) == 0
+                        or is_final_epoch
+                    )
+                    and accelerator.is_main_process
+                ):
                     # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
@@ -358,9 +587,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 # end of epoch
                 # log of last step is combined with validation and rollout
                 accelerator.log(step_log, step=self.global_step)
-                json_logger.log(step_log)
+                if json_logger is not None:
+                    json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
+                accelerator.wait_for_everyone()
+        finally:
+            if json_logger is not None:
+                json_logger.__exit__(None, None, None)
 
         accelerator.end_training()
 

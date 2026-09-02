@@ -1,4 +1,4 @@
-"""Read-only helpers for ZIP-backed Zarr datasets with an optional prefix."""
+"""Read-only helpers for ZIP- or directory-backed Zarr datasets."""
 
 from __future__ import annotations
 
@@ -38,11 +38,29 @@ def sha256_file(path: str | pathlib.Path, chunk_size: int = 1024 * 1024) -> str:
 def detect_zarr_prefix(path: str | pathlib.Path) -> NestedZarrInfo:
     """Find a root ``.zgroup`` or one unambiguous top-level Zarr group.
 
-    This examines ZIP directory metadata only and never extracts or mutates the
-    archive. A multi-root archive is rejected rather than guessed.
+    ZIP inputs are inspected through directory metadata only. Directory inputs
+    are inspected without modifying them. A multi-root store is rejected
+    rather than guessed.
     """
 
     resolved = pathlib.Path(path).expanduser().resolve()
+    if resolved.is_dir():
+        if resolved.joinpath(".zgroup").is_file():
+            return NestedZarrInfo(path=resolved, prefix="")
+        candidates = sorted(
+            child.name
+            for child in resolved.iterdir()
+            if child.is_dir() and child.joinpath(".zgroup").is_file()
+        )
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Expected one top-level Zarr prefix in {resolved}, found "
+                f"{candidates or 'none'}"
+            )
+        prefix = candidates[0]
+        logger.info("Detected read-only Zarr prefix %r in %s", prefix, resolved)
+        return NestedZarrInfo(path=resolved, prefix=prefix)
+
     with zipfile.ZipFile(resolved, mode="r") as archive:
         names = set(archive.namelist())
 
@@ -73,14 +91,28 @@ def open_nested_zip_group(
 ):
     """Return ``(store, Group, detected_prefix)`` opened read-only.
 
-    The caller owns the returned store and must close it. Each DataLoader
-    worker must call this function independently; ``ZipStore`` is intentionally
-    not cached here or shared across processes.
+    Despite the compatibility name, both ZIP and directory stores are
+    supported. The caller owns the returned store and must close it. Each
+    DataLoader worker must call this function independently; stores are not
+    cached here or shared across processes.
     """
 
     info = detect_zarr_prefix(path) if prefix is None else NestedZarrInfo(
         path=pathlib.Path(path).expanduser().resolve(), prefix=str(prefix).strip("/")
     )
+    if info.path.is_dir():
+        store = zarr.DirectoryStore(str(info.path))
+        try:
+            group = zarr.open_group(
+                store=store,
+                path=info.prefix,
+                mode="r",
+            )
+        except Exception:
+            store.close()
+            raise
+        return store, group, info.prefix
+
     store = zarr.ZipStore(str(info.path), mode="r")
     try:
         group = zarr.open_group(

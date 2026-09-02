@@ -27,6 +27,8 @@ dependencies:
   - dill=0.3.7
   - einops=0.6.1
   - diffusers=0.18.2
+  # diffusers 0.18 imports hf_cache_home, removed by huggingface_hub 0.26.
+  - huggingface_hub<0.26
   - scikit-video=1.1
   - gym=0.21.0
   # trick to avoid cpu affinity issue described in https://github.com/pytorch/pytorch/issues/99625

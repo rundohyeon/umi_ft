@@ -23,6 +23,7 @@ TELE_TASK_ABSOLUTE = 0
 class Command(enum.Enum):
     STOP = 0
     SCHEDULE_WAYPOINT = 1
+    HOLD = 2
 
 
 def _to_deg(rad_vec):
@@ -69,6 +70,9 @@ class IndyInterpolationController(mp.Process):
         # Physical fingertip TCP in the unconfigured flange/tool0 frame:
         # xyz metres + rotation-vector radians. CONTY has no registered TCP.
         flange_to_tcp_pose=(0.0, 0.0, 0.235, 0.0, 0.0, 0.0),
+        max_pos_speed=0.5,
+        max_rot_speed=1.0,
+        command_timeout_s=0.3,
     ):
         super().__init__(name="IndyPositionalController")
         self.robot_ip = robot_ip
@@ -104,6 +108,13 @@ class IndyInterpolationController(mp.Process):
         ).reshape(6)
         self._tx_flange_tcp = pose_to_mat(self.flange_to_tcp_pose)
         self._tx_tcp_flange = np.linalg.inv(self._tx_flange_tcp)
+        self.max_pos_speed = float(max_pos_speed)
+        self.max_rot_speed = float(max_rot_speed)
+        self.command_timeout_s = float(command_timeout_s)
+        if self.max_pos_speed <= 0 or self.max_rot_speed <= 0:
+            raise ValueError("Indy speed limits must be positive")
+        if self.command_timeout_s <= 0:
+            raise ValueError("Indy command timeout must be positive")
 
         if get_max_k is None:
             get_max_k = int(frequency * 5)
@@ -185,6 +196,11 @@ class IndyInterpolationController(mp.Process):
                 "target_time": float(target_time),
             }
         )
+
+    def cancel_and_hold(self):
+        """Discard queued waypoints and disarm task-space streaming."""
+        self.input_queue.clear()
+        self.input_queue.put({"cmd": Command.HOLD.value})
 
     def get_state(self, k=None, out=None):
         if k is None:
@@ -448,6 +464,7 @@ class IndyInterpolationController(mp.Process):
         pose_interp = None
         last_target_t = None
         armed = False
+        armed_deadline = None
 
         try:
             cmd_fn, cmd_name, needs_teleop = self._find_task_cmd(indy)
@@ -526,6 +543,16 @@ class IndyInterpolationController(mp.Process):
                     )
                 actual_pose = self._extract_pose_m_rad(control_data)
                 pose_cmd = actual_pose.copy()
+                if armed and armed_deadline is not None and t_now > armed_deadline:
+                    print(
+                        "[IndyPositionalController] command watchdog expired; "
+                        "disarming and holding the measured TCP."
+                    )
+                    armed = False
+                    pose_interp = PoseTrajectoryInterpolator(
+                        times=[t_now], poses=[actual_pose]
+                    )
+                    last_target_t = t_now
                 if armed:
                     pose_cmd = pose_interp(t_now)
                     try:
@@ -550,7 +577,7 @@ class IndyInterpolationController(mp.Process):
                 self.ring_buffer.put(state)
 
                 try:
-                    commands = self.input_queue.get_k(1)
+                    commands = self.input_queue.get_all()
                     n_cmd = len(commands["cmd"])
                 except Empty:
                     n_cmd = 0
@@ -560,6 +587,14 @@ class IndyInterpolationController(mp.Process):
                     if cmd == Command.STOP.value:
                         keep_running = False
                         break
+                    if cmd == Command.HOLD.value:
+                        armed = False
+                        pose_interp = PoseTrajectoryInterpolator(
+                            times=[t_now], poses=[actual_pose]
+                        )
+                        last_target_t = t_now
+                        armed_deadline = None
+                        continue
                     if cmd == Command.SCHEDULE_WAYPOINT.value:
                         if not armed:
                             # Start motion only after first explicit waypoint.
@@ -576,12 +611,13 @@ class IndyInterpolationController(mp.Process):
                         pose_interp = pose_interp.schedule_waypoint(
                             pose=target_pose,
                             time=target_time,
-                            max_pos_speed=0.5,
-                            max_rot_speed=1.0,
+                            max_pos_speed=self.max_pos_speed,
+                            max_rot_speed=self.max_rot_speed,
                             curr_time=t_now,
                             last_waypoint_time=last_target_t,
                         )
                         last_target_t = target_time
+                        armed_deadline = max(t_now, target_time) + self.command_timeout_s
 
                 if iter_idx == 0:
                     self.ready_event.set()

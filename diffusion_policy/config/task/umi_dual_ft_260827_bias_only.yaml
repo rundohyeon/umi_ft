@@ -1,0 +1,105 @@
+defaults:
+  - umi_dual_ft
+  - _self_
+
+name: umi_dual_ft_260827_bias_only
+
+model_contract:
+  version: dual_ft_786_action11_base_sidecar_bias_only_width_feedback_v6
+  pose_quaternion_order: xyzw
+  offline_pose_source_representation: axis_angle
+  vision_pretrained: true
+  ft_input_schema_version: native_dual_wrench12_bias_only_v1
+  ft_history_padding: repeat_first
+  ft_coordinate_transform: none
+  ft_channel_order: [Fx, Fy, Fz, Tx, Ty, Tz]
+  ft_force_unit: N
+  ft_torque_unit: Nm
+  ft_left_frame: left_native_sensor
+  ft_right_frame: right_native_sensor
+  ft_input_key: wrench_12d
+  ft_bias_metadata_key: wrench_episode_bias_12d
+  ft_bias_key: wrench_episode_bias_12d
+  ft_bias_removal: precomputed_in_sidecar
+  deployment_bias_requirement: startup_static_calibration
+  grasp_force_semantics_version: signed_native_fz_measurement_v1
+  grasp_force_source: derived_from_sidecar_wrench_12d
+  grasp_force_formula: "0.5*((right_Fz-right_bias_Fz)-(left_Fz-left_bias_Fz))"
+  grasp_force_alignment: linear_interpolation_to_rgb_timestamp
+  grasp_force_role: gripper_width_feedback_reference_not_direct_command_v1
+  grasp_force_feedback_control_law: bounded_proportional_width_correction_v1
+  action_pose_semantics: anchor_relative_xyz_rotation6d
+  gripper_width_semantics: absolute_measured_width_m
+
+# The model's signed force prediction is the reference for a small width
+# correction. It is never written to the RG2 force register. Live use must
+# supply a newly estimated, unloaded startup_bias_12d.
+grasp_force_feedback:
+  mode: gripper_width_correction
+  kp_m_per_n: 1.0e-4
+  force_deadband_n: 0.5
+  max_width_correction_m: 1.0e-3
+  target_force_min_n: 0.0
+  target_force_max_n: 12.0
+  width_min_m: 0.0
+  width_max_m: 0.1
+  requires_startup_bias: true
+  direct_force_command: false
+
+# Preserve the stock UMI image/pose/gripper dataset that produced the known-good
+# image-only result. Attach only the synchronized, bias-removed native 12-D
+# wrench stream from the sidecar; never train from its TCP-transformed key.
+dataset_path: session_260827/dataset.zarr.zip
+force_sidecar_path: session_260827/dataset_force_sidecar.zarr
+
+data_keys:
+  rgb: camera0_rgb
+  pose_position: robot0_eef_pos
+  pose_rotation_axis_angle: robot0_eef_rot_axis_angle
+  gripper: robot0_gripper_width
+  rgb_episode_ends: episode_ends
+
+# 260827 aligned stream audit: latest causal age max 10.958 ms. Keep a
+# fail-closed 12 ms ceiling; this does not certify the physical sync offset.
+ft_max_age_sec: 0.012
+
+ft:
+  wrench_key: wrench_12d
+  timestamp_key: wrench_timestamp_s
+  episode_ends_key: wrench_episode_ends
+  rgb_timestamp_key: rgb_timestamp_s
+  rgb_episode_ends_key: rgb_episode_ends
+  rgb_to_wrench_end_idx_key: rgb_to_wrench_end_idx
+  rgb_wrench_age_key: rgb_wrench_age_s
+  rgb_wrench_valid_key: rgb_wrench_valid
+  bias_key: wrench_episode_bias_12d
+  bias_removal: precomputed_in_sidecar
+  # A checkpoint trained with this setting must estimate a fresh static bias
+  # from unloaded live sensor samples before deployment. The offline episode
+  # bias must never be copied into a future run.
+  deployment_bias_requirement: startup_static_calibration
+  left_frame: left_native_sensor
+  right_frame: right_native_sensor
+  axis_permutation: [0, 1, 2, 3, 4, 5]
+  axis_sign: [1, 1, 1, 1, 1, 1]
+
+dataset:
+  dataset_path: ${task.dataset_path}
+  force_sidecar_path: ${task.force_sidecar_path}
+  data_keys: ${task.data_keys}
+  ft:
+    wrench_key: wrench_12d
+    timestamp_key: wrench_timestamp_s
+    episode_ends_key: wrench_episode_ends
+    rgb_timestamp_key: rgb_timestamp_s
+    rgb_episode_ends_key: rgb_episode_ends
+    rgb_to_wrench_end_idx_key: rgb_to_wrench_end_idx
+    rgb_wrench_age_key: rgb_wrench_age_s
+    rgb_wrench_valid_key: rgb_wrench_valid
+    bias_key: wrench_episode_bias_12d
+    bias_removal: precomputed_in_sidecar
+    deployment_bias_requirement: startup_static_calibration
+    left_frame: left_native_sensor
+    right_frame: right_native_sensor
+    axis_permutation: [0, 1, 2, 3, 4, 5]
+    axis_sign: [1, 1, 1, 1, 1, 1]

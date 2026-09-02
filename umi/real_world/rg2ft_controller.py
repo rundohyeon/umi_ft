@@ -24,6 +24,7 @@ class Command(enum.Enum):
     SHUTDOWN = 0
     SCHEDULE_WAYPOINT = 1
     RESTART_PUT = 2
+    HOLD = 3
 
 
 def _schedule_direct_waypoint(pending, *, target_time: float, target_pos: float):
@@ -219,6 +220,11 @@ class RG2FTController(mp.Process):
             }
         )
 
+    def cancel_and_hold(self):
+        """Discard future widths and command the currently measured width."""
+        self.input_queue.clear()
+        self.input_queue.put({"cmd": Command.HOLD.value})
+
     # ========= receive APIs ============
     def get_state(self, k=None, out=None):
         if k is None:
@@ -350,6 +356,10 @@ class RG2FTController(mp.Process):
                             + time.monotonic()
                         )
                         iter_idx = 1
+                    elif cmd == Command.HOLD.value:
+                        pending_waypoints = []
+                        final_target_pos = pos
+                        target_active = True
                     else:
                         keep_running = False
                         break

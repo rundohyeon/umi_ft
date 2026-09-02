@@ -24,3 +24,4 @@ __pycache__/
 
 # Local environments and editor metadata
 .venv/
+/session_260827/

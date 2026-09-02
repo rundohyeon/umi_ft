@@ -97,6 +97,195 @@ Multi-GPU training.
 (umi)$ accelerate --num_processes <ngpus> train.py --config-name=train_diffusion_unet_timm_umi_workspace task.dataset_path=cup_in_the_wild.zarr.zip
 ```
 
+## Indy RP2 + RG2-FT: 260827 Train and Evaluation Commands
+
+Run the following commands from the repository root in the `umi` environment.
+The effective training data is deliberately split into two inputs:
+
+![Dual F/T-conditioned diffusion policy algorithm](docs/assets/dual_ft_algorithm.svg)
+
+The upper panel shows training-time synchronization and model structure. The
+lower panel shows checkpoint-consistent real-robot inference, bounded
+force-to-width feedback, and the final safety gates.
+
+- `session_260827/dataset.zarr.zip`: stock UMI RGB, robot pose, and gripper width;
+- `session_260827/dataset_force_sidecar.zarr`: synchronized native left/right
+  F/T data with per-episode bias removed.
+
+Do not replace the stock ZIP with `dataset_multirate.zarr` or use
+`wrench_force_tcp_6d`. The policy consumes native sensor-frame
+`wrench_12d = [left 6-D, right 6-D]` without a TCP/axis coordinate transform.
+
+### Fresh 4-GPU training
+
+This uses batch 8 per GPU, so the global batch is `4 × 8 = 32`. `run2` below
+must be a new output directory; do not point a fresh run at an existing run.
+
+```bash
+accelerate launch \
+  --multi_gpu \
+  --num_processes 4 \
+  --gpu_ids 0,1,2,3 \
+  --mixed_precision no \
+  --main_process_port 29511 \
+  train.py \
+  --config-name=train_diffusion_unet_timm_umi_dual_ft_workspace \
+  task.dataset_path=session_260827/dataset.zarr.zip \
+  task.force_sidecar_path=session_260827/dataset_force_sidecar.zarr \
+  dataloader.batch_size=8 \
+  val_dataloader.batch_size=8 \
+  dataloader.num_workers=4 \
+  val_dataloader.num_workers=2 \
+  training.resume=false \
+  hydra.run.dir=data/outputs/260827_dual_ft_4gpu_b32_run2
+```
+
+Expected startup line:
+
+```text
+training distribution: processes=4 per_device_batch=8 gradient_accumulation=1 global_batch=32 mixed_precision=no
+```
+
+Only the pretrained ViT uses LR `3e-5`; the fusion Transformer uses `1e-4`,
+and the F/T CNN/projection plus the diffusion model use the base LR `3e-4`.
+
+### Resume the interrupted `run1`
+
+Resume must use the exact same `hydra.run.dir`. It loads
+`<run-dir>/checkpoints/latest.ckpt` and continues from the next epoch. Do not
+change batch size, process count, data paths, or model configuration while
+resuming.
+
+```bash
+accelerate launch \
+  --multi_gpu \
+  --num_processes 4 \
+  --gpu_ids 0,1,2,3 \
+  --mixed_precision no \
+  --main_process_port 29511 \
+  train.py \
+  --config-name=train_diffusion_unet_timm_umi_dual_ft_workspace \
+  task.dataset_path=session_260827/dataset.zarr.zip \
+  task.force_sidecar_path=session_260827/dataset_force_sidecar.zarr \
+  dataloader.batch_size=8 \
+  val_dataloader.batch_size=8 \
+  dataloader.num_workers=4 \
+  val_dataloader.num_workers=2 \
+  training.resume=true \
+  hydra.run.dir=data/outputs/260827_dual_ft_4gpu_b32_run1
+```
+
+Confirm that the log prints both `Resuming from checkpoint .../latest.ckpt`
+and `Resume state: completed_epoch=... next_epoch=...`.
+
+Check free space before restarting:
+
+```bash
+df -h .
+du -sh data/outputs/260827_dual_ft_4gpu_b32_run1/checkpoints
+```
+
+One checkpoint is currently about 2.7 GB. With `topk.k=20` plus
+`latest.ckpt`, checkpoint retention alone can require roughly 56 GB.
+
+### Checkpoint inspection and offline evaluation
+
+Metadata inspection does not connect to the robot, camera, or RG2-FT:
+
+```bash
+conda run -n umi python eval_real_indy_rg2_dual_ft.py \
+  --checkpoint data/outputs/260827_dual_ft_4gpu_b32_run1/checkpoints/latest.ckpt \
+  --inspect-checkpoint
+```
+
+Quick hardware-free validation on 256 samples:
+
+```bash
+mkdir -p data/eval_dual_ft
+
+conda run -n umi python eval_dual_ft_offline.py \
+  --checkpoint data/outputs/260827_dual_ft_4gpu_b32_run1/checkpoints/latest.ckpt \
+  --dataset session_260827/dataset.zarr.zip \
+  --force-sidecar session_260827/dataset_force_sidecar.zarr \
+  --weights auto \
+  --device cuda \
+  --batch-size 8 \
+  --max-samples 256 \
+  --seed 42 \
+  --output data/eval_dual_ft/offline_metrics.json
+```
+
+`--weights auto` selects EMA when `training.use_ema=true`. Use
+`--max-samples 0 --full-dataset-hash` for the complete validation split.
+
+### Real-robot dry-run first
+
+The dry-run below opens the robot, camera, and RG2-FT connections, performs a
+fresh unloaded startup F/T bias calibration, restores the model, and runs all
+preprocessing/timing/safety checks. It suppresses waypoint submission from the
+evaluation loop, but it is not a passive or protocol-free mode.
+
+```bash
+conda run -n umi python eval_real_indy_rg2_dual_ft.py \
+  --checkpoint data/outputs/260827_dual_ft_4gpu_b32_run1/checkpoints/latest.ckpt \
+  --robot-config example/eval_robots_config_indy_rg2.yaml \
+  --log-dir data/eval_dual_ft/dry_run1 \
+  --match-dataset session_260827/dataset.zarr.zip \
+  --n-action-steps 1 \
+  --dry-run \
+  --max-cycles 1 \
+  --reference-arg=--print_motion_debug
+```
+
+Before pressing `c`, verify the unloaded startup-bias record and align the
+live 224×224 policy image with the selected training first frame. The image
+contract matches the initial image-only commit: tag inpainting, gripper mask,
+no finger mask, resize ratio 1.0, and no distortion correction.
+
+### Low-speed live one-cycle commissioning
+
+Only after the dry-run output is correct, remove `--dry-run` while keeping one
+action step and one policy cycle:
+
+```bash
+conda run -n umi python eval_real_indy_rg2_dual_ft.py \
+  --checkpoint data/outputs/260827_dual_ft_4gpu_b32_run1/checkpoints/latest.ckpt \
+  --robot-config example/eval_robots_config_indy_rg2.yaml \
+  --log-dir data/eval_dual_ft/live_one_cycle1 \
+  --match-dataset session_260827/dataset.zarr.zip \
+  --n-action-steps 1 \
+  --max-cycles 1 \
+  --reference-arg=--print_motion_debug
+```
+
+Keep the physical emergency stop ready. Teleop remains in control until `c`
+is pressed. Use `t` to save the current start pose, `p` to request a guarded
+move to that saved pose, `n`/`b` to change the training first-frame reference,
+`s` to stop policy execution, and `Esc` to exit.
+
+The 11th action channel is a grasp-force reference used only to apply a bounded
+correction to gripper width. It is never sent as a direct RG2 force command;
+the hardware force register remains fixed by `rg2ft_force` in the robot YAML.
+
+### Continuous live evaluation
+
+After the one-cycle motion and F/T guards have been verified on the physical
+setup, run closed-loop evaluation without `--max-cycles`. Two action steps at
+20 Hz give a 100 ms replanning interval:
+
+```bash
+conda run -n umi python eval_real_indy_rg2_dual_ft.py \
+  --checkpoint data/outputs/260827_dual_ft_4gpu_b32_run1/checkpoints/latest.ckpt \
+  --robot-config example/eval_robots_config_indy_rg2.yaml \
+  --log-dir data/eval_dual_ft/live_run1 \
+  --match-dataset session_260827/dataset.zarr.zip \
+  --n-action-steps 2
+```
+
+See [the evaluation guide](docs/run_dual_ft_inference.md) and
+[the implementation/safety audit](docs/dual_ft_inference_audit.md) for the
+complete contracts and remaining commissioning limits.
+
 ## 🦾 Real-world Deployment
 In this section, we will demonstrate our real-world deployment/evaluation system with the cup arrangement policy. While this policy setup only requires a single arm and camera, the our system supports up to 2 arms and unlimited number of cameras.
 

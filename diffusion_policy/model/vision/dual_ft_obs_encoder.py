@@ -14,16 +14,24 @@ logger = logging.getLogger(__name__)
 
 
 class CausalConv1d(nn.Module):
-    """One-dimensional convolution with left-only temporal padding."""
+    """Causal convolution whose outputs align to each strided window's end.
+
+    For ``kernel_size=2, stride=2`` no padding is needed: output ``j`` is
+    aligned with input ``2*j+1`` and covers inputs ``2*j`` through ``2*j+1``.
+    Padding by ``kernel_size-1`` here would align the first output with input
+    zero and, after five downsampling stages, discard every later sample.
+    """
 
     def __init__(self, in_channels, out_channels, kernel_size=2, stride=1):
         super().__init__()
-        self.left_padding = int(kernel_size) - 1
+        kernel_size = int(kernel_size)
+        stride = int(stride)
+        self.left_padding = max(kernel_size - stride, 0)
         self.conv = nn.Conv1d(
             in_channels=int(in_channels),
             out_channels=int(out_channels),
-            kernel_size=int(kernel_size),
-            stride=int(stride),
+            kernel_size=kernel_size,
+            stride=stride,
             padding=0,
         )
 
@@ -45,6 +53,11 @@ class CausalFTEncoder(nn.Module):
         negative_slope=0.1,
     ):
         super().__init__()
+        self.register_buffer(
+            "temporal_contract_version",
+            torch.tensor(1, dtype=torch.int64),
+            persistent=True,
+        )
         dimensions = [int(input_dim), *map(int, channel_dims), int(output_dim)]
         layers = []
         for input_channels, output_channels in zip(dimensions[:-1], dimensions[1:]):
@@ -102,10 +115,16 @@ class DualFTObsEncoder(ModuleAttrMixin):
         fusion_layers: int = 1,
         fusion_feedforward_dim: int = 2048,
         fusion_dropout: float = 0.0,
+        fusion_position_encoding: str = "learnable",
         ft_channel_dims=(16, 32, 64, 128),
         share_ft_encoder: bool = False,
     ):
         super().__init__()
+        self.register_buffer(
+            "architecture_contract_version",
+            torch.tensor(2, dtype=torch.int64),
+            persistent=True,
+        )
         self.shape_meta = shape_meta
         self.left_ft_key = left_ft_key
         self.right_ft_key = right_ft_key
@@ -168,28 +187,29 @@ class DualFTObsEncoder(ModuleAttrMixin):
             int(legacy_shape_meta["obs"][key]["horizon"])
             for key in self.vision_pose_encoder.rgb_keys
         )
-        self.num_fusion_tokens = 1 + rgb_horizon + 2
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.fusion_dim))
-        self.token_embedding = nn.Parameter(
-            torch.zeros(1, self.num_fusion_tokens, self.fusion_dim)
+        self.num_fusion_tokens = rgb_horizon + 2
+        if int(fusion_layers) != 1:
+            raise ValueError(
+                "official UMI-FT fusion contract requires fusion_layers=1"
+            )
+        if str(fusion_position_encoding) != "learnable":
+            raise ValueError(
+                "official UMI-FT fusion contract requires learnable position encoding"
+            )
+        self.position_embedding = nn.Parameter(
+            torch.randn(self.num_fusion_tokens, self.fusion_dim)
         )
-        nn.init.normal_(self.cls_token, std=0.02)
-        nn.init.normal_(self.token_embedding, std=0.02)
-        fusion_layer = nn.TransformerEncoderLayer(
+        self.fusion = nn.TransformerEncoderLayer(
             d_model=self.fusion_dim,
             nhead=int(fusion_heads),
             dim_feedforward=int(fusion_feedforward_dim),
             dropout=float(fusion_dropout),
-            activation="gelu",
             batch_first=True,
-            norm_first=True,
         )
-        self.fusion = nn.TransformerEncoder(
-            fusion_layer,
-            num_layers=int(fusion_layers),
-            enable_nested_tensor=False,
+        self.fusion_projection = nn.Linear(
+            self.num_fusion_tokens * self.fusion_dim,
+            self.fusion_dim,
         )
-        self.fusion_norm = nn.LayerNorm(self.fusion_dim)
 
         self.low_dim_output_dim = sum(
             int(attr["horizon"]) * int(torch.tensor(attr["shape"]).prod())
@@ -247,16 +267,15 @@ class DualFTObsEncoder(ModuleAttrMixin):
         left = self.left_ft_encoder(obs_dict[self.left_ft_key]).unsqueeze(1)
         right = self.right_ft_encoder(obs_dict[self.right_ft_key]).unsqueeze(1)
         batch_size = visual.shape[0]
-        cls = self.cls_token.expand(batch_size, -1, -1)
-        tokens = torch.cat([cls, visual, left, right], dim=1)
+        tokens = torch.cat([visual, left, right], dim=1)
         if tokens.shape[1] != self.num_fusion_tokens:
             raise ValueError(
                 f"unexpected fusion token count {tokens.shape[1]} != "
                 f"{self.num_fusion_tokens}"
             )
-        fused = self.fusion(tokens + self.token_embedding)
-        fused_token = self.fusion_norm(fused[:, 0])
-        return torch.cat([fused_token, self._low_dim_features(obs_dict)], dim=-1)
+        fused = self.fusion(tokens + self.position_embedding.unsqueeze(0))
+        fused_feature = self.fusion_projection(fused.reshape(batch_size, -1))
+        return torch.cat([fused_feature, self._low_dim_features(obs_dict)], dim=-1)
 
     @torch.no_grad()
     def output_shape(self):

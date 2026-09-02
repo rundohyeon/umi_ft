@@ -21,6 +21,20 @@ ft_max_age_sec: 0.012
 action_horizon: 16
 ignore_proprioception: false
 
+# Serialized into every checkpoint. These markers distinguish this corrected
+# architecture/action meaning from older state dicts whose convolution weight
+# shapes were compatible despite using the first-timestep-only padding path.
+model_contract:
+  version: dual_ft_786_action11_xyzw_v3
+  condition_dim: 786
+  pose_quaternion_order: xyzw
+  ft_temporal_contract: full_32_samples_no_padding_v1
+  action_schema_version: pose9_width1_grasp_force1_v1
+  action_channels:
+    [x, y, z, r6d_0, r6d_1, r6d_2, r6d_3, r6d_4, r6d_5,
+     gripper_width_m, grasp_force_N]
+  grasp_force_source: grasp_force_0
+
 shape_meta: &shape_meta
   obs:
     camera0_rgb:
@@ -46,13 +60,6 @@ shape_meta: &shape_meta
       type: low_dim
       rotation_rep: rotation_6d
       ignore_by_policy: ${task.ignore_proprioception}
-    robot0_gripper_width:
-      shape: [1]
-      horizon: ${task.low_dim_obs_horizon}
-      latency_steps: 0
-      down_sample_steps: ${task.obs_down_sample_steps}
-      type: low_dim
-      ignore_by_policy: ${task.ignore_proprioception}
     robot0_ft_left:
       shape: [6]
       horizon: ${task.ft_obs_horizon}
@@ -67,22 +74,17 @@ shape_meta: &shape_meta
       down_sample_steps: ${task.ft_obs_stride}
       type: low_dim
       ignore_by_policy: false
-    robot0_eef_rot_axis_angle_wrt_start:
-      raw_shape: [3]
-      shape: [6]
-      horizon: ${task.low_dim_obs_horizon}
-      latency_steps: 0
-      down_sample_steps: ${task.obs_down_sample_steps}
-      type: low_dim
-      ignore_by_policy: ${task.ignore_proprioception}
   action:
-    shape: [10]
+    # [relative xyz(3), relative rotation 6D(6), gripper width(1),
+    #  grasping force(1)]
+    shape: [11]
     horizon: ${task.action_horizon}
     latency_steps: 0
     down_sample_steps: ${task.obs_down_sample_steps}
     rotation_rep: rotation_6d
 
 dataset_path: data/dataset_multirate_clean.zarr.zip
+pose_quaternion_order: xyzw
 pose_repr: &pose_repr
   obs_pose_repr: relative
   action_pose_repr: relative
@@ -95,6 +97,7 @@ data_keys: &data_keys
   pose_timestamp: robot_time_stamps_0
   gripper: gripper_0
   gripper_timestamp: gripper_time_stamps_0
+  grasp_force: grasp_force_0
   rgb_episode_ends: episode_rgb0_len
   pose_episode_ends: episode_robot0_len
   gripper_episode_ends: episode_gripper0_len
@@ -126,6 +129,8 @@ dataset:
   shape_meta: *shape_meta
   dataset_path: ${task.dataset_path}
   data_keys: *data_keys
+  # ts_pose_fb_0 is [x,y,z,qx,qy,qz,qw] (SciPy scalar-last convention).
+  pose_quaternion_order: ${task.pose_quaternion_order}
   ft: *ft
   pose_repr: *pose_repr
   action_padding: false

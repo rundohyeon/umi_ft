@@ -2,6 +2,7 @@ import tempfile
 
 import torch
 from diffusers import DDIMScheduler
+from omegaconf import OmegaConf
 
 from diffusion_policy.model.common.normalizer import (
     LinearNormalizer,
@@ -9,10 +10,15 @@ from diffusion_policy.model.common.normalizer import (
 )
 from diffusion_policy.model.vision.dual_ft_obs_encoder import (
     CausalConv1d,
+    CausalFTEncoder,
     DualFTObsEncoder,
 )
 from diffusion_policy.model.vision.timm_obs_encoder import TimmObsEncoder
 from diffusion_policy.policy.diffusion_unet_timm_policy import DiffusionUnetTimmPolicy
+from diffusion_policy.workspace.train_diffusion_unet_image_workspace import (
+    _build_optimizer_param_groups,
+    _scheduler_resume_last_epoch,
+)
 
 
 def _shape_meta(include_ft=True):
@@ -20,16 +26,6 @@ def _shape_meta(include_ft=True):
         "camera0_rgb": {"shape": [3, 64, 64], "horizon": 2, "type": "rgb"},
         "robot0_eef_pos": {"shape": [3], "horizon": 2, "type": "low_dim"},
         "robot0_eef_rot_axis_angle": {
-            "shape": [6],
-            "horizon": 2,
-            "type": "low_dim",
-        },
-        "robot0_gripper_width": {
-            "shape": [1],
-            "horizon": 2,
-            "type": "low_dim",
-        },
-        "robot0_eef_rot_axis_angle_wrt_start": {
             "shape": [6],
             "horizon": 2,
             "type": "low_dim",
@@ -52,7 +48,7 @@ def _shape_meta(include_ft=True):
         )
     return {
         "obs": obs,
-        "action": {"shape": [10], "horizon": 16, "down_sample_steps": 3},
+        "action": {"shape": [11], "horizon": 16, "down_sample_steps": 3},
     }
 
 
@@ -61,8 +57,6 @@ def _obs(batch_size=1):
         "camera0_rgb": torch.rand(batch_size, 2, 3, 64, 64),
         "robot0_eef_pos": torch.rand(batch_size, 2, 3),
         "robot0_eef_rot_axis_angle": torch.rand(batch_size, 2, 6),
-        "robot0_gripper_width": torch.rand(batch_size, 2, 1),
-        "robot0_eef_rot_axis_angle_wrt_start": torch.rand(batch_size, 2, 6),
         "robot0_ft_left": torch.rand(batch_size, 32, 6),
         "robot0_ft_right": torch.rand(batch_size, 32, 6),
     }
@@ -84,8 +78,8 @@ def _manual_normalizer(shape_meta):
                 "std": ones,
             },
         )
-    zeros = torch.zeros(10)
-    ones = torch.ones(10)
+    zeros = torch.zeros(11)
+    ones = torch.ones(11)
     normalizer["action"] = SingleFieldLinearNormalizer.create_manual(
         scale=ones,
         offset=zeros,
@@ -154,6 +148,24 @@ def test_causal_conv_output_before_change_is_future_independent():
     torch.testing.assert_close(y_original[:, :, :10], y_modified[:, :, :10])
 
 
+def test_ft_encoder_final_token_uses_all_32_timesteps():
+    encoder = CausalFTEncoder(
+        channel_dims=(8, 8, 8, 8),
+        output_dim=8,
+    )
+    with torch.no_grad():
+        for layer in encoder.modules():
+            if isinstance(layer, CausalConv1d):
+                layer.conv.weight.fill_(1.0)
+                layer.conv.bias.zero_()
+    history = torch.ones(1, 32, 6, requires_grad=True)
+    sequence = encoder.forward_sequence(history)
+    assert sequence.shape == (1, 1, 8)
+    sequence.sum().backward()
+    influence = history.grad.abs().sum(dim=-1)[0]
+    assert torch.all(influence > 0), influence
+
+
 def test_legacy_rgb_pose_forward_contract():
     shape_meta = _shape_meta(include_ft=False)
     encoder = TimmObsEncoder(
@@ -167,15 +179,18 @@ def test_legacy_rgb_pose_forward_contract():
         downsample_ratio=32,
     )
     obs = {key: value for key, value in _obs().items() if key in shape_meta["obs"]}
-    assert encoder(obs).shape == (1, 1056)
+    assert encoder(obs).shape == (1, 1042)
 
 
 def test_dual_ft_forward_backward_uses_independent_encoders():
     shape_meta = _shape_meta()
     encoder = _dual_encoder(shape_meta)
     assert encoder.left_ft_encoder is not encoder.right_ft_encoder
+    assert encoder.num_fusion_tokens == 4
+    assert encoder.fusion_projection.in_features == 4 * 64
+    assert not hasattr(encoder, "cls_token")
     result = encoder(_obs(batch_size=2))
-    assert result.shape == (2, 96)
+    assert result.shape == (2, 82)
     weights = torch.arange(1, 65, dtype=result.dtype)
     (result[:, :64].square() * weights).mean().backward()
     assert next(encoder.left_ft_encoder.parameters()).grad.abs().sum() > 0
@@ -189,7 +204,7 @@ def test_one_batch_train_step_and_checkpoint_reload():
     optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4)
     batch = {
         "obs": _obs(),
-        "action": torch.rand(1, 16, 10),
+        "action": torch.rand(1, 16, 11),
     }
     loss = policy(batch)
     assert torch.isfinite(loss)
@@ -203,3 +218,96 @@ def test_one_batch_train_step_and_checkpoint_reload():
         reloaded.load_state_dict(torch.load(checkpoint.name, map_location="cpu"))
         for expected, actual in zip(policy.parameters(), reloaded.parameters()):
             torch.testing.assert_close(expected, actual)
+
+
+def test_dual_ft_optimizer_groups_split_pretrained_and_new_modules():
+    policy = _policy(_shape_meta())
+    cfg = OmegaConf.create(
+        {
+            "optimizer": {"lr": 3e-4},
+            "policy": {"obs_encoder": {"pretrained": True}},
+            "optimizer_parameter_groups": {
+                "mode": "dual_ft",
+                "pretrained_vision_lr": 3e-5,
+                "fusion_transformer_lr": 1e-4,
+                "new_obs_lr": 3e-4,
+            },
+        }
+    )
+
+    groups = _build_optimizer_param_groups(policy, cfg)
+    by_name = {group["name"]: group for group in groups}
+    assert {name: group["lr"] for name, group in by_name.items()} == {
+        "diffusion_model": 3e-4,
+        "pretrained_vision": 3e-5,
+        "fusion_transformer": 1e-4,
+        "new_obs_modules": 3e-4,
+    }
+
+    parameter_group = {
+        id(param): name
+        for name, group in by_name.items()
+        for param in group["params"]
+    }
+    assert parameter_group[id(next(policy.model.parameters()))] == "diffusion_model"
+    vision_param = next(
+        policy.obs_encoder.vision_pose_encoder.key_model_map.parameters()
+    )
+    assert parameter_group[id(vision_param)] == "pretrained_vision"
+    assert parameter_group[id(next(policy.obs_encoder.fusion.parameters()))] == (
+        "fusion_transformer"
+    )
+    for module in (
+        policy.obs_encoder.left_ft_encoder,
+        policy.obs_encoder.right_ft_encoder,
+        policy.obs_encoder.fusion_projection,
+    ):
+        assert parameter_group[id(next(module.parameters()))] == "new_obs_modules"
+    assert parameter_group[id(policy.obs_encoder.position_embedding)] == (
+        "new_obs_modules"
+    )
+    assert len(parameter_group) == sum(
+        1 for param in policy.parameters() if param.requires_grad
+    )
+
+
+def test_four_gpu_resume_scheduler_preserves_epoch90_learning_rate():
+    base_lrs = [3e-4, 3e-5, 1e-4, 3e-4]
+    checkpoint_lrs = [
+        4.123722827092213e-05,
+        4.123722827092213e-06,
+        1.3745742756974046e-05,
+        4.123722827092213e-05,
+    ]
+    params = [torch.nn.Parameter(torch.zeros(())) for _ in base_lrs]
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": [param],
+                "lr": checkpoint_lr,
+                "initial_lr": base_lr,
+            }
+            for param, base_lr, checkpoint_lr in zip(
+                params, base_lrs, checkpoint_lrs
+            )
+        ]
+    )
+    from diffusion_policy.model.common.lr_scheduler import get_scheduler
+
+    # epoch=90 checkpoint stores global_step=298661 before its final counter
+    # increment, so resume begins at global_step=298662.
+    scheduler = get_scheduler(
+        "cosine",
+        optimizer=optimizer,
+        num_warmup_steps=2000,
+        num_training_steps=13125 * 120,
+        last_epoch=_scheduler_resume_last_epoch(298662, 4),
+    )
+
+    assert scheduler.last_epoch == 1194648
+    torch.testing.assert_close(
+        torch.tensor(scheduler.get_last_lr()),
+        torch.tensor(checkpoint_lrs),
+        rtol=0,
+        atol=0,
+    )

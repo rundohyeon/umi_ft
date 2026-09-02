@@ -154,6 +154,9 @@ training:
   seed: 42
   debug: False
   resume: False
+  # Optional explicit checkpoint. When null, resume looks for
+  # <hydra.run.dir>/checkpoints/latest.ckpt.
+  resume_path: null
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 2000

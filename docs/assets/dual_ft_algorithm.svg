@@ -1,0 +1,261 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100" role="img" aria-labelledby="title desc">
+  <title id="title">Dual F/T-conditioned diffusion policy algorithm</title>
+  <desc id="desc">Training and real-robot deployment pipeline combining RGB, proprioception, and native left and right force torque histories, with bounded force feedback applied to gripper width.</desc>
+  <defs>
+    <linearGradient id="header" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#172554"/>
+      <stop offset="1" stop-color="#312e81"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#c2410c"/>
+    </marker>
+    <style>
+      .title { font: 700 31px Arial, "Noto Sans KR", sans-serif; fill: #ffffff; }
+      .subtitle { font: 400 15px Arial, "Noto Sans KR", sans-serif; fill: #c7d2fe; }
+      .panel-title { font: 700 22px Arial, "Noto Sans KR", sans-serif; fill: #0f172a; }
+      .panel-note { font: 400 13px Arial, "Noto Sans KR", sans-serif; fill: #64748b; }
+      .box-title { font: 700 16px Arial, "Noto Sans KR", sans-serif; fill: #0f172a; }
+      .box-text { font: 400 13px Arial, "Noto Sans KR", sans-serif; fill: #334155; }
+      .small { font: 400 11.5px Arial, "Noto Sans KR", sans-serif; fill: #475569; }
+      .pill { font: 700 11px Arial, "Noto Sans KR", sans-serif; fill: #ffffff; letter-spacing: .3px; }
+      .data { fill: #eff6ff; stroke: #3b82f6; stroke-width: 1.6; }
+      .prep { fill: #ecfeff; stroke: #0891b2; stroke-width: 1.6; }
+      .model { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; }
+      .action { fill: #fff7ed; stroke: #ea580c; stroke-width: 1.6; }
+      .control { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.6; }
+      .safety { fill: #fff1f2; stroke: #e11d48; stroke-width: 1.6; }
+      .neutral { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.4; }
+      .arrow { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }
+      .arrow-dash { fill: none; stroke: #64748b; stroke-width: 1.8; stroke-dasharray: 7 5; marker-end: url(#arrow); }
+      .arrow-green { fill: none; stroke: #15803d; stroke-width: 2.2; marker-end: url(#arrowGreen); }
+      .arrow-orange { fill: none; stroke: #c2410c; stroke-width: 2.2; marker-end: url(#arrowOrange); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1100" fill="#f8fafc"/>
+  <rect x="0" y="0" width="1600" height="88" fill="url(#header)"/>
+  <text x="42" y="39" class="title">Dual F/T-conditioned Diffusion Policy</text>
+  <text x="42" y="66" class="subtitle">UMI RGB + pose + native dual 6-axis wrench → 11-D action with bounded grasp-force width feedback</text>
+
+  <!-- Legend -->
+  <g transform="translate(1030,25)">
+    <rect x="0" y="0" width="94" height="24" rx="12" fill="#2563eb"/><text x="47" y="16" text-anchor="middle" class="pill">DATA</text>
+    <rect x="102" y="0" width="94" height="24" rx="12" fill="#0891b2"/><text x="149" y="16" text-anchor="middle" class="pill">ALIGN</text>
+    <rect x="204" y="0" width="94" height="24" rx="12" fill="#7c3aed"/><text x="251" y="16" text-anchor="middle" class="pill">MODEL</text>
+    <rect x="306" y="0" width="94" height="24" rx="12" fill="#ea580c"/><text x="353" y="16" text-anchor="middle" class="pill">ACTION</text>
+    <rect x="408" y="0" width="94" height="24" rx="12" fill="#16a34a"/><text x="455" y="16" text-anchor="middle" class="pill">CONTROL</text>
+  </g>
+
+  <!-- Panel A -->
+  <rect x="28" y="108" width="1544" height="480" rx="20" fill="#ffffff" stroke="#cbd5e1" filter="url(#shadow)"/>
+  <rect x="28" y="108" width="12" height="480" rx="6" fill="#6366f1"/>
+  <text x="58" y="145" class="panel-title">A. Training — synchronized multimodal condition and diffusion objective</text>
+  <text x="58" y="168" class="panel-note">All normalization statistics come from the training split and are serialized in the checkpoint.</text>
+
+  <!-- Data boxes -->
+  <rect x="58" y="194" width="244" height="130" rx="14" class="data"/>
+  <text x="78" y="222" class="box-title">Stock UMI dataset</text>
+  <text x="78" y="248" class="box-text">
+    <tspan x="78" dy="0">RGB: 2 × 3 × 224 × 224</tspan>
+    <tspan x="78" dy="21">Pose: 2 × (xyz3 + rot6D6)</tspan>
+    <tspan x="78" dy="21">Width + future pose actions</tspan>
+    <tspan x="78" dy="21">~20 Hz anchor timestamps</tspan>
+  </text>
+
+  <rect x="58" y="354" width="244" height="142" rx="14" class="data"/>
+  <text x="78" y="382" class="box-title">F/T sidecar</text>
+  <text x="78" y="408" class="box-text">
+    <tspan x="78" dy="0">Native left/right wrench: 12-D</tspan>
+    <tspan x="78" dy="21">100 Hz, episode bias removed</tspan>
+    <tspan x="78" dy="21">No TCP transform / axis remap</tspan>
+    <tspan x="78" dy="21">Causally aligned to RGB anchor</tspan>
+  </text>
+
+  <!-- Alignment -->
+  <rect x="350" y="207" width="224" height="104" rx="14" class="prep"/>
+  <text x="370" y="235" class="box-title">RGB / pose preparation</text>
+  <text x="370" y="261" class="box-text">
+    <tspan x="370" dy="0">tag inpaint + gripper mask</tspan>
+    <tspan x="370" dy="20">relative pose + range normalize</tspan>
+  </text>
+
+  <rect x="350" y="367" width="224" height="116" rx="14" class="prep"/>
+  <text x="370" y="395" class="box-title">Causal F/T sampling</text>
+  <text x="370" y="421" class="box-text">
+    <tspan x="370" dy="0">latest sample ≤ RGB anchor</tspan>
+    <tspan x="370" dy="20">32 × 6 history per finger</tspan>
+    <tspan x="370" dy="20">repeat-first pad + normalize</tspan>
+  </text>
+
+  <!-- Encoders -->
+  <rect x="622" y="202" width="204" height="114" rx="14" class="model"/>
+  <text x="724" y="230" text-anchor="middle" class="box-title">Pretrained ViT</text>
+  <text x="724" y="255" text-anchor="middle" class="box-text">one 768-D token / frame</text>
+  <text x="724" y="278" text-anchor="middle" class="small">2 RGB tokens</text>
+  <rect x="650" y="287" width="148" height="20" rx="10" fill="#7c3aed"/>
+  <text x="724" y="301" text-anchor="middle" class="pill">LR 3×10⁻⁵</text>
+
+  <rect x="622" y="350" width="204" height="72" rx="14" class="model"/>
+  <text x="724" y="377" text-anchor="middle" class="box-title">Left causal CNN</text>
+  <text x="724" y="401" text-anchor="middle" class="small">32 → 16 → 8 → 4 → 2 → 1</text>
+
+  <rect x="622" y="438" width="204" height="72" rx="14" class="model"/>
+  <text x="724" y="465" text-anchor="middle" class="box-title">Right causal CNN</text>
+  <text x="724" y="489" text-anchor="middle" class="small">independent weights · full history</text>
+
+  <!-- Fusion -->
+  <rect x="878" y="220" width="230" height="230" rx="16" class="model"/>
+  <text x="993" y="250" text-anchor="middle" class="box-title">Multimodal fusion</text>
+  <text x="993" y="280" text-anchor="middle" class="box-text">4 ordered tokens</text>
+  <g transform="translate(902,297)">
+    <rect x="0" y="0" width="40" height="38" rx="8" fill="#dbeafe" stroke="#3b82f6"/><text x="20" y="24" text-anchor="middle" class="small">I₋₁</text>
+    <rect x="48" y="0" width="40" height="38" rx="8" fill="#dbeafe" stroke="#3b82f6"/><text x="68" y="24" text-anchor="middle" class="small">I₀</text>
+    <rect x="96" y="0" width="40" height="38" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="116" y="24" text-anchor="middle" class="small">Fᴸ</text>
+    <rect x="144" y="0" width="40" height="38" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="164" y="24" text-anchor="middle" class="small">Fᴿ</text>
+  </g>
+  <text x="993" y="362" text-anchor="middle" class="box-text">+ learnable position embedding</text>
+  <text x="993" y="386" text-anchor="middle" class="box-text">1-layer Transformer (8 heads)</text>
+  <text x="993" y="410" text-anchor="middle" class="box-text">flatten + Linear → 768-D</text>
+  <rect x="934" y="419" width="118" height="20" rx="10" fill="#7c3aed"/>
+  <text x="993" y="433" text-anchor="middle" class="pill">LR 1×10⁻⁴</text>
+
+  <!-- Proprio and condition -->
+  <rect x="878" y="470" width="230" height="70" rx="14" class="neutral"/>
+  <text x="993" y="497" text-anchor="middle" class="box-title">Pose proprioception</text>
+  <text x="993" y="521" text-anchor="middle" class="box-text">2 × (xyz3 + rot6D6) = 18-D</text>
+
+  <rect x="1160" y="242" width="176" height="116" rx="16" class="model"/>
+  <text x="1248" y="270" text-anchor="middle" class="box-title">Global condition</text>
+  <text x="1248" y="302" text-anchor="middle" style="font:700 25px Arial, sans-serif;fill:#6d28d9">786-D</text>
+  <text x="1248" y="330" text-anchor="middle" class="small">fusion 768 + pose 18</text>
+
+  <rect x="1380" y="215" width="160" height="174" rx="16" class="model"/>
+  <text x="1460" y="243" text-anchor="middle" class="box-title">Conditional</text>
+  <text x="1460" y="264" text-anchor="middle" class="box-title">1-D U-Net</text>
+  <text x="1460" y="296" text-anchor="middle" class="box-text">noisy action</text>
+  <text x="1460" y="318" text-anchor="middle" class="box-text">+ timestep emb. 32</text>
+  <text x="1460" y="340" text-anchor="middle" class="box-text">+ global condition</text>
+  <rect x="1402" y="357" width="116" height="20" rx="10" fill="#7c3aed"/>
+  <text x="1460" y="371" text-anchor="middle" class="pill">LR 3×10⁻⁴</text>
+
+  <rect x="1268" y="430" width="272" height="110" rx="16" class="action"/>
+  <text x="1404" y="458" text-anchor="middle" class="box-title">Predicted horizon: 16 × 11</text>
+  <text x="1404" y="483" text-anchor="middle" class="box-text">relative xyz3 + rotation6D6</text>
+  <text x="1404" y="505" text-anchor="middle" class="box-text">gripper width1 + grasp-force reference1</text>
+  <text x="1404" y="527" text-anchor="middle" class="small">training loss: noise-prediction MSE</text>
+
+  <!-- Training arrows -->
+  <path d="M302 256 H350" class="arrow"/>
+  <path d="M302 425 H350" class="arrow"/>
+  <path d="M574 249 H622" class="arrow"/>
+  <path d="M574 406 H602 V386 H622" class="arrow"/>
+  <path d="M574 444 H602 V474 H622" class="arrow"/>
+  <path d="M826 259 H852 V287 H878" class="arrow"/>
+  <path d="M826 386 H852 V332 H878" class="arrow"/>
+  <path d="M826 474 H852 V378 H878" class="arrow"/>
+  <path d="M574 286 H590 V527 H878" class="arrow-dash"/>
+  <path d="M1108 334 H1134 V296 H1160" class="arrow"/>
+  <path d="M1108 505 H1134 V326 H1160" class="arrow"/>
+  <path d="M1336 300 H1380" class="arrow"/>
+  <path d="M1460 389 V430" class="arrow-orange"/>
+  <path d="M302 302 V551 H1460 V540" class="arrow-dash"/>
+  <path d="M302 480 V551" class="arrow-dash"/>
+  <text x="858" y="572" text-anchor="middle" class="small">supervision: pose/width from stock + Fgrasp = ½(right Fz − left Fz) from sidecar</text>
+
+  <!-- Panel B -->
+  <rect x="28" y="610" width="1544" height="458" rx="20" fill="#ffffff" stroke="#cbd5e1" filter="url(#shadow)"/>
+  <rect x="28" y="610" width="12" height="458" rx="6" fill="#16a34a"/>
+  <text x="58" y="647" class="panel-title">B. Deployment — checkpoint-consistent inference and guarded closed-loop execution</text>
+  <text x="58" y="670" class="panel-note">The model predicts a force reference; the RG2 force register remains fixed. Only gripper width receives feedback correction.</text>
+
+  <!-- Live inputs -->
+  <rect x="58" y="700" width="220" height="112" rx="14" class="data"/>
+  <text x="78" y="728" class="box-title">Live RGB + robot pose</text>
+  <text x="78" y="754" class="box-text">
+    <tspan x="78" dy="0">tag inpaint + gripper mask</tspan>
+    <tspan x="78" dy="20">first-frame overlap check</tspan>
+    <tspan x="78" dy="20">2-frame causal history</tspan>
+  </text>
+
+  <rect x="58" y="846" width="220" height="126" rx="14" class="data"/>
+  <text x="78" y="874" class="box-title">Live native F/T</text>
+  <text x="78" y="900" class="box-text">
+    <tspan x="78" dy="0">left/right 6-axis @ 100 Hz</tspan>
+    <tspan x="78" dy="20">fresh unloaded startup bias</tspan>
+    <tspan x="78" dy="20">32-sample causal history</tspan>
+    <tspan x="78" dy="20">no coordinate transform</tspan>
+  </text>
+
+  <rect x="330" y="732" width="216" height="130" rx="14" class="prep"/>
+  <text x="438" y="760" text-anchor="middle" class="box-title">Contract checks</text>
+  <text x="438" y="786" text-anchor="middle" class="box-text">timestamps / history age</text>
+  <text x="438" y="808" text-anchor="middle" class="box-text">image preprocessing match</text>
+  <text x="438" y="830" text-anchor="middle" class="box-text">checkpoint normalizer</text>
+  <text x="438" y="850" text-anchor="middle" class="small">fail closed on mismatch</text>
+
+  <rect x="600" y="720" width="216" height="152" rx="16" class="model"/>
+  <text x="708" y="750" text-anchor="middle" class="box-title">Same trained policy</text>
+  <text x="708" y="780" text-anchor="middle" class="box-text">RGB + left/right F/T fusion</text>
+  <text x="708" y="803" text-anchor="middle" class="box-text">+ 18-D pose proprioception</text>
+  <text x="708" y="826" text-anchor="middle" class="box-text">DDIM denoise: 16 steps</text>
+  <text x="708" y="849" text-anchor="middle" class="small">output 16 × 11, execute first n</text>
+
+  <rect x="870" y="720" width="210" height="152" rx="16" class="action"/>
+  <text x="975" y="750" text-anchor="middle" class="box-title">Action decoding</text>
+  <text x="975" y="780" text-anchor="middle" class="box-text">relative pose → waypoint</text>
+  <line x1="890" y1="798" x2="1060" y2="798" stroke="#fdba74"/>
+  <text x="975" y="824" text-anchor="middle" class="box-text">policy width trajectory</text>
+  <text x="975" y="848" text-anchor="middle" class="box-text">predicted force reference</text>
+
+  <!-- Two command paths -->
+  <rect x="1132" y="692" width="230" height="116" rx="14" class="safety"/>
+  <text x="1247" y="720" text-anchor="middle" class="box-title">Motion / timing guards</text>
+  <text x="1247" y="746" text-anchor="middle" class="box-text">deadline-aware scheduling</text>
+  <text x="1247" y="768" text-anchor="middle" class="box-text">max Δposition / Δrotation</text>
+  <text x="1247" y="790" text-anchor="middle" class="box-text">stale-data + F/T overload stop</text>
+
+  <rect x="1132" y="840" width="230" height="156" rx="14" class="control"/>
+  <text x="1247" y="868" text-anchor="middle" class="box-title">Bounded width feedback</text>
+  <text x="1247" y="894" text-anchor="middle" class="box-text">Fₘ = ½(right Fz − left Fz)</text>
+  <text x="1247" y="917" text-anchor="middle" class="box-text">e = Fₘ − clip(F̂, 0, 12 N)</text>
+  <text x="1247" y="940" text-anchor="middle" class="box-text">Δw = clip(10⁻⁴e, ±1 mm)</text>
+  <text x="1247" y="963" text-anchor="middle" class="box-text">wcmd = clip(wpolicy + Δw)</text>
+  <text x="1247" y="985" text-anchor="middle" class="small">0.5 N deadband</text>
+
+  <rect x="1420" y="752" width="122" height="174" rx="16" class="control"/>
+  <text x="1481" y="783" text-anchor="middle" class="box-title">Robot</text>
+  <text x="1481" y="813" text-anchor="middle" class="box-text">Indy RP2</text>
+  <text x="1481" y="837" text-anchor="middle" class="box-text">+ RG2-FT</text>
+  <line x1="1438" y1="858" x2="1524" y2="858" stroke="#86efac"/>
+  <text x="1481" y="881" text-anchor="middle" class="small">pose waypoints</text>
+  <text x="1481" y="900" text-anchor="middle" class="small">corrected width</text>
+  <text x="1481" y="919" text-anchor="middle" class="small">fixed force register</text>
+
+  <!-- Deployment arrows -->
+  <path d="M278 756 H330" class="arrow"/>
+  <path d="M278 902 H304 V836 H330" class="arrow"/>
+  <path d="M546 797 H600" class="arrow"/>
+  <path d="M816 797 H870" class="arrow-orange"/>
+  <path d="M1080 770 H1132" class="arrow-orange"/>
+  <path d="M1080 836 H1106 V918 H1132" class="arrow-green"/>
+  <path d="M278 932 H1100 V954 H1132" class="arrow-green"/>
+  <path d="M1362 750 H1392 V805 H1420" class="arrow-orange"/>
+  <path d="M1362 918 H1420" class="arrow-green"/>
+  <path d="M1481 926 V1005 H168 V972" class="arrow-dash"/>
+  <text x="796" y="1023" text-anchor="middle" class="small">closed loop: new camera / pose / native F/T measurements</text>
+
+  <!-- Footer invariants -->
+  <rect x="58" y="1031" width="1138" height="27" rx="13.5" fill="#ecfdf5" stroke="#86efac"/>
+  <text x="627" y="1049" text-anchor="middle" style="font:700 11.5px Arial, &quot;Noto Sans KR&quot;, sans-serif;fill:#166534">
+    Core invariants: native sensor axes · startup bias only · causal histories · checkpoint normalization · force reference ≠ direct force command
+  </text>
+</svg>

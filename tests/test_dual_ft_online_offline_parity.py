@@ -34,6 +34,7 @@ class ActualZipDualFTParityTest(unittest.TestCase):
             shape_meta=task.shape_meta,
             dataset_path=str(_DATASET),
             data_keys=task.data_keys,
+            pose_quaternion_order=task.pose_quaternion_order,
             ft=task.ft,
             pose_repr=task.pose_repr,
             action_padding=False,
@@ -64,7 +65,6 @@ class ActualZipDualFTParityTest(unittest.TestCase):
         episode_start = 0 if episode == 0 else int(dataset.rgb_episode_ends[episode - 1])
         image_meta = task.shape_meta.obs.camera0_rgb
         pose_meta = task.shape_meta.obs.robot0_eef_pos
-        gripper_meta = task.shape_meta.obs.robot0_gripper_width
         image_idx = dataset._history_indices(
             int(dataset.indices[0][1]),
             episode_start,
@@ -77,12 +77,6 @@ class ActualZipDualFTParityTest(unittest.TestCase):
             int(pose_meta.horizon),
             int(pose_meta.down_sample_steps),
         )
-        gripper_idx = dataset._history_indices(
-            int(dataset.indices[0][1]),
-            episode_start,
-            int(gripper_meta.horizon),
-            int(gripper_meta.down_sample_steps),
-        )
         # Feed the same raw ZIP values through the real-evaluator assembler.
         # This is the simulated-live branch: THWC uint8 RGB, absolute pose,
         # raw width, and the timestamped causal F/T buffers above.
@@ -92,7 +86,6 @@ class ActualZipDualFTParityTest(unittest.TestCase):
             "camera0_rgb": raw_rgb,
             "robot0_eef_pos": raw_pose[:, :3],
             "robot0_eef_rot_axis_angle": raw_pose[:, 3:],
-            "robot0_gripper_width": dataset.gripper_width[gripper_idx],
             **live_obs,
         }
         live_policy_obs = get_real_umi_obs_dict(

@@ -23,6 +23,9 @@
       "indy_policy_tcp7_rot_euler_roundtrip": false,
       "indy_policy_tcp7_rot_euler_seq": null,
       "indy_policy_tcp7_rot_euler_extrinsic": null,
+      "indy_max_pos_speed_m_s": 0.3,
+      "indy_max_rot_speed_rad_s": 1.0,
+      "indy_command_timeout_s": 0.3,
       "height_threshold": -0.024,
       "sphere_radius": 0.1,
       "sphere_center": [0, -0.06, -0.185]
@@ -44,6 +47,28 @@
       "gripper_action_latency": 0.1
     }
   ],
+  "ft_startup_bias": {
+    "sample_count": 200,
+    "timeout_s": 5.0,
+    "max_force_std_n": 0.35,
+    "max_torque_std_nm": 0.03,
+    "max_force_peak_to_peak_n": 1.5,
+    "max_torque_peak_to_peak_nm": 0.15
+  },
+  "policy_safety": {
+    "max_position_delta_m": 0.015,
+    "max_rotation_delta_rad": 0.1,
+    "max_gripper_delta_m": 0.012,
+    "min_tcp_z_m": -0.024,
+    "exclusion_sphere_radius_m": 0.1,
+    "exclusion_sphere_center_m": [0.0, -0.06, -0.185]
+  },
+  "ft_safety": {
+    "max_abs_force_n": 40.0,
+    "max_abs_torque_nm": 4.0,
+    "max_abs_grasp_force_n": 20.0,
+    "max_latest_sample_age_s": 0.05
+  },
   "tx_left_right": [
     [0.99996206, 0.00661996, 0.00566226, -0.01676012],
     [-0.00663261, 0.99997554, 0.0022186, -0.60552492],

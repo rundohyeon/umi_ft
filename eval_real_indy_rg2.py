@@ -14,7 +14,7 @@ python3 eval_real_indy.py ... --pose_eval_audit --dataset_zarr auto
 Current TCP vs next waypoint each policy step:
 python3 eval_real_indy.py ... --print_motion_debug
 
-Axis check without big motion (read terminal only, robot stays put):
+Controller-connected planning check (no waypoint submission from this script):
 python3 eval_real_indy.py ... --print_motion_debug --plan_only
 
 One small step along +X only, then auto-stop:
@@ -51,6 +51,7 @@ Press "S" to stop evaluation and gain control back.
 # %%
 import csv
 import atexit
+import json
 import os
 import pathlib
 import select
@@ -71,6 +72,9 @@ import numpy as np
 import scipy.spatial.transform as st
 import torch
 from omegaconf import OmegaConf
+from diffusion_policy.common.dual_ft_contract import (
+    inspect_dual_ft_checkpoint_payload as _inspect_dual_ft_checkpoint_payload,
+)
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.cv2_util import (
     get_image_transform
@@ -90,6 +94,21 @@ from umi.real_world.real_inference_util import (
 )
 from umi.real_world.umi_env import UmiEnv
 from umi.real_world.rg2ft_obs import prepare_rg2ft_policy_obs
+from umi.real_world.grasp_force_width_feedback import (
+    GraspForceWidthFeedbackConfig,
+    GraspForceWidthFeedbackController,
+)
+from umi.real_world.rg2ft_startup_bias import (
+    FTStartupBiasConfig,
+    acquire_startup_bias,
+)
+from umi.real_world.dual_ft_policy_safety import (
+    FTSafetyConfig,
+    PolicyMotionSafetyConfig,
+    PolicySafetyError,
+    validate_ft_load,
+    validate_policy_waypoints,
+)
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -149,93 +168,9 @@ def _get_eval_workspace_class(target: str):
 
 
 def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
-    """Fail closed unless a payload is the trained 32-step dual-F/T policy.
+    """Compatibility export of the hardware-free checkpoint inspector."""
 
-    This only inspects checkpoint metadata/state dictionaries; it never
-    instantiates a robot, camera, or policy.  The normalizer is deliberately
-    required here because ``DiffusionUnetTimmPolicy.predict_action`` owns the
-    single observation/action normalization pass.
-    """
-    if not isinstance(payload, dict) or "cfg" not in payload:
-        raise ValueError("checkpoint payload is missing resolved cfg")
-    cfg = payload["cfg"]
-    obs_meta = OmegaConf.select(cfg, "task.shape_meta.obs", default=None)
-    action_meta = OmegaConf.select(cfg, "task.shape_meta.action", default=None)
-    if obs_meta is None or action_meta is None:
-        raise ValueError("checkpoint cfg is missing task.shape_meta")
-    required = ("camera0_rgb", "robot0_ft_left", "robot0_ft_right")
-    missing = [key for key in required if key not in obs_meta]
-    if missing:
-        raise ValueError(
-            "RGB-only/non-dual checkpoint rejected; missing required obs keys: "
-            + ", ".join(missing)
-        )
-    for key in ("robot0_ft_left", "robot0_ft_right"):
-        meta = obs_meta[key]
-        if tuple(meta.get("shape", ())) != (6,) or int(meta.get("horizon", -1)) != 32:
-            raise ValueError(
-                f"{key} must be [32,6], got horizon={meta.get('horizon')} "
-                f"shape={meta.get('shape')}"
-            )
-    if tuple(action_meta.get("shape", ())) != (10,) or int(action_meta.get("horizon", -1)) != 16:
-        raise ValueError(
-            "checkpoint action contract must be [16,10], got "
-            f"horizon={action_meta.get('horizon')} shape={action_meta.get('shape')}"
-        )
-    state_dicts = payload.get("state_dicts", {})
-    if not isinstance(state_dicts, dict) or not state_dicts:
-        raise ValueError("checkpoint is missing model state dictionaries")
-    state = state_dicts.get("ema_model") or state_dicts.get("model")
-    if not isinstance(state, dict):
-        raise ValueError("checkpoint is missing model/ema_model weights")
-    required_state_fragments = (
-        "obs_encoder.left_ft_encoder.",
-        "obs_encoder.right_ft_encoder.",
-        "normalizer.params_dict.robot0_ft_left.",
-        "normalizer.params_dict.robot0_ft_right.",
-        "normalizer.params_dict.action.",
-    )
-    absent = [
-        fragment for fragment in required_state_fragments
-        if not any(str(key).startswith(fragment) for key in state)
-    ]
-    if absent:
-        raise ValueError(
-            "checkpoint has no restorable dual-F/T normalizer/encoder state: "
-            + ", ".join(absent)
-        )
-    # DualFTObsEncoder builds the low-dimensional suffix from every
-    # non-RGB/non-FT observation that is not ignored.  ``low_dim_output`` is
-    # a derived constructor value, not necessarily a serialized config key.
-    left_key = str(OmegaConf.select(cfg, "policy.obs_encoder.left_ft_key", default="robot0_ft_left"))
-    right_key = str(OmegaConf.select(cfg, "policy.obs_encoder.right_ft_key", default="robot0_ft_right"))
-    low_dim_output = 0
-    for key, meta in obs_meta.items():
-        if (
-            key in (left_key, right_key)
-            or str(meta.get("type", "")) == "rgb"
-            or key.endswith("_rgb")
-        ):
-            continue
-        if bool(meta.get("ignore_by_policy", False)):
-            continue
-        low_dim_output += int(np.prod(meta.get("shape", ()))) * int(meta.get("horizon", 1))
-    serialized_low_dim_output = OmegaConf.select(
-        cfg, "policy.obs_encoder.low_dim_output", default=None
-    )
-    if serialized_low_dim_output is not None:
-        low_dim_output = int(serialized_low_dim_output)
-    return {
-        "cfg": cfg,
-        "condition_dim": int(
-            OmegaConf.select(cfg, "policy.obs_encoder.fusion_dim", default=0)
-        ) + low_dim_output,
-        "action_horizon": int(action_meta.horizon),
-        "action_dim": int(action_meta.shape[0]),
-        "ft_horizon": int(obs_meta.robot0_ft_left.horizon),
-        "ft_dim": int(obs_meta.robot0_ft_left.shape[0]),
-        "normalizer_owner": "policy.predict_action",
-    }
+    return _inspect_dual_ft_checkpoint_payload(payload)
 
 
 class _TerminalKeyPoller:
@@ -377,13 +312,22 @@ def _with_synthetic_gripper_width(
 
 def _disable_policy_image_transforms(policy) -> list[str]:
     obs_encoder = getattr(policy, "obs_encoder", None)
-    transform_map = getattr(obs_encoder, "key_transform_map", None)
-    if transform_map is None:
+    if obs_encoder is None:
         return []
+    candidates = [("obs_encoder", obs_encoder)]
+    nested = getattr(obs_encoder, "vision_pose_encoder", None)
+    if nested is not None:
+        candidates.append(("obs_encoder.vision_pose_encoder", nested))
     disabled = []
-    for key in list(transform_map.keys()):
-        transform_map[key] = torch.nn.Identity()
-        disabled.append(key)
+    seen_maps = set()
+    for prefix, encoder in candidates:
+        transform_map = getattr(encoder, "key_transform_map", None)
+        if transform_map is None or id(transform_map) in seen_maps:
+            continue
+        seen_maps.add(id(transform_map))
+        for key in list(transform_map.keys()):
+            transform_map[key] = torch.nn.Identity()
+            disabled.append(f"{prefix}.{key}")
     return disabled
 
 
@@ -856,15 +800,23 @@ def _match_episode_to_robot_tcp7(
 
 
 def _apply_slam_frame_fix(raw_action: np.ndarray, n_robots: int) -> np.ndarray:
-    """Remap raw model output (pose10d cols 0:9 per robot block) from the
+    """Remap raw model output (pose cols 0:9 of each 10/11-D block) from the
     SLAM training frame to the robot frame via _SLAM_FRAME_FIX_P.
     Position transforms as v' = P @ v. Rotation is encoded as rot6d (the
     first two ROWS of the 3x3 rotation matrix, see pose_util.rot6d_to_mat/
     mat_to_rot6d) and must transform by conjugation R' = P @ R @ P.T so the
     encoded orientation stays consistent with the remapped position frame."""
     P = _SLAM_FRAME_FIX_P
+    if raw_action.shape[-1] % n_robots != 0:
+        raise ValueError(
+            f"action dimension {raw_action.shape[-1]} is not divisible by "
+            f"n_robots={n_robots}"
+        )
+    block_dim = raw_action.shape[-1] // n_robots
+    if block_dim not in (10, 11):
+        raise ValueError(f"expected a 10-D or 11-D robot action block, got {block_dim}")
     for r in range(n_robots):
-        b = r * 10
+        b = r * block_dim
         xyz = raw_action[:, b:b + 3]
         raw_action[:, b:b + 3] = xyz @ P.T
 
@@ -1341,8 +1293,18 @@ def _print_coord_transform_audit(
 
 def _decode_real_umi_action_checked(raw_action, obs, action_pose_repr: str, tag: str):
     _check_finite_array(f"{tag} raw action_pred", raw_action)
+    decoder_action = np.asarray(raw_action)
+    if decoder_action.shape[-1] % 11 == 0:
+        n_robot_blocks = decoder_action.shape[-1] // 11
+        blocks = decoder_action.reshape(*decoder_action.shape[:-1], n_robot_blocks, 11)
+        # get_real_umi_action understands pose9 + width1. The predicted force
+        # remains available in raw_action for the bounded width-feedback path,
+        # and is never passed to the width-only hardware scheduler.
+        decoder_action = blocks[..., :10].reshape(
+            *decoder_action.shape[:-1], n_robot_blocks * 10
+        )
     try:
-        action = get_real_umi_action(raw_action, obs, action_pose_repr)
+        action = get_real_umi_action(decoder_action, obs, action_pose_repr)
     except np.linalg.LinAlgError as exc:
         raw = np.asarray(raw_action, dtype=np.float64)
         lines = [
@@ -1726,7 +1688,7 @@ def _print_policy_action_debug(tag, raw_action, action_7d, submitted=None):
             print(f"  ... ({s.shape[0]} rows total)")
 
 
-_POSE10D_LABELS = ["x", "y", "z", "r6d_0", "r6d_1", "r6d_2", "r6d_3", "r6d_4", "r6d_5", "grip"]
+_POSE10D_LABELS = ["x", "y", "z", "r6d_0", "r6d_1", "r6d_2", "r6d_3", "r6d_4", "r6d_5", "grip", "grasp_N"]
 _PANEL_W = 320
 _PANEL_H = 420   # taller than wide: text panels have ~19-22 lines, 320 clipped them
 
@@ -2057,7 +2019,10 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
     "--plan_only",
     is_flag=True,
     default=False,
-    help="Run policy inference and print debug, but do not move the robot.",
+    help=(
+        "Suppress waypoint submission from this script. This still starts the "
+        "robot controller and is not a passive/no-protocol sensor mode."
+    ),
 )
 @click.option(
     "--tcp_delta_scales",
@@ -2274,14 +2239,96 @@ def main(input, output, robot_config,
             raise click.ClickException("left/right F/T horizons must match")
         ft_obs_horizon = left_ft_horizon
         ft_obs_stride = int(left_ft_meta.get("down_sample_steps", 1))
-        if checkpoint_contract["condition_dim"] != 800:
+        if checkpoint_contract["condition_dim"] != 786:
             raise click.ClickException(
-                "dual-F/T checkpoint condition must be [1,800], got "
+                "dual-F/T checkpoint condition must be [1,786], got "
                 f"[1,{checkpoint_contract['condition_dim']}]"
             )
     else:
         ft_obs_horizon = 0
         ft_obs_stride = 1
+
+    ft_bias_removal = str(
+        OmegaConf.select(cfg, "task.ft.bias_removal", default="none")
+    )
+    if dual_ft_enabled and ft_bias_removal not in {
+        "precomputed_in_sidecar",
+        "episode_start_mean",
+    }:
+        raise click.ClickException(
+            "dual-F/T checkpoint must have been trained with bias removal; got "
+            f"task.ft.bias_removal={ft_bias_removal!r}"
+        )
+    if dual_ft_enabled and not np.allclose(
+        _ROBOT_FROM_DATASET_T, np.eye(4), atol=1e-9
+    ):
+        raise click.ClickException(
+            "dual-F/T deployment forbids an extra dataset->robot coordinate "
+            "transform. Set indy_robot_from_dataset_transform to identity; the "
+            "Indy mm/Euler/flange-to-TCP protocol conversion remains enabled."
+        )
+    if dual_ft_enabled and policy_rot_rt:
+        raise click.ClickException(
+            "dual-F/T deployment requires indy_policy_tcp7_rot_euler_roundtrip=false"
+        )
+    if dual_ft_enabled and match_g_move_robot:
+        raise click.ClickException(
+            "--match_g_move_robot is disabled for dual-F/T deployment. Use the "
+            "training first frame only as a visual alignment reference and move "
+            "to the saved/live initial pose through teleop."
+        )
+    if dual_ft_enabled:
+        image_contract_errors = []
+        if sim_fov is not None:
+            image_contract_errors.append("--sim_fov must be omitted (no distortion correction)")
+        if not eval_image_mask:
+            image_contract_errors.append("--eval_image_mask must be enabled")
+        if no_mirror:
+            image_contract_errors.append("--no_mirror must be disabled")
+        if mirror_swap:
+            image_contract_errors.append("--mirror_swap must be disabled")
+        if abs(float(policy_image_crop_ratio) - 1.0) > 1e-9:
+            image_contract_errors.append("--policy_image_crop_ratio must be 1.0")
+        if not inpaint_aruco_tags:
+            image_contract_errors.append("--inpaint_aruco_tags must be enabled")
+        if not disable_eval_image_aug:
+            image_contract_errors.append("--disable_eval_image_aug must be enabled")
+        if image_contract_errors:
+            raise click.ClickException(
+                "live image preprocessing differs from session_260827 training: "
+                + "; ".join(image_contract_errors)
+            )
+        print(
+            "training image contract: ArUco inpaint -> gripper mask "
+            "(finger mask off) -> resize/crop ratio 1.0; distortion correction off"
+        )
+
+    startup_bias_cfg = FTStartupBiasConfig.from_mapping(
+        robot_config_data.get("ft_startup_bias", {})
+    )
+    motion_safety_cfg = PolicyMotionSafetyConfig.from_mapping(
+        robot_config_data.get("policy_safety", {})
+    )
+    ft_safety_cfg = FTSafetyConfig.from_mapping(
+        robot_config_data.get("ft_safety", {})
+    )
+    force_feedback = None
+    if int(checkpoint_contract["action_dim"]) == 11:
+        feedback_mapping = OmegaConf.select(
+            cfg, "task.grasp_force_feedback", default=None
+        )
+        if feedback_mapping is None:
+            raise click.ClickException(
+                "11-D checkpoint has no task.grasp_force_feedback configuration"
+            )
+        feedback_cfg = GraspForceWidthFeedbackConfig.from_mapping(
+            OmegaConf.to_container(feedback_mapping, resolve=True)
+        )
+        force_feedback = GraspForceWidthFeedbackController(feedback_cfg)
+        print(
+            "grasp-force control: action[10] is a bounded width-feedback "
+            "reference; RG2 force register remains fixed by robot YAML"
+        )
 
     if steps_per_inference is None:
         steps_per_inference = int(
@@ -2427,7 +2474,8 @@ def main(input, output, robot_config,
         if max_policy_iters is None:
             max_policy_iters = 1
         print(
-            "plan_only: robot will not move; running "
+            "plan_only: this script will not submit waypoints, but the robot "
+            "controller is still connected; running "
             f"{max_policy_iters} inference cycle(s)."
         )
     if max_policy_iters is not None:
@@ -2480,7 +2528,9 @@ def main(input, output, robot_config,
                 dynamixel_current_limit=gc.get('dynamixel_current_limit'),
                 dynamixel_pwm_limit=gc.get('dynamixel_pwm_limit'),
                 dynamixel_move_max_speed=gc.get('dynamixel_move_max_speed', 0.05),
-                dynamixel_home_to_open=gc.get('dynamixel_home_to_open', False),
+                dynamixel_home_to_open=(
+                    False if plan_only else gc.get('dynamixel_home_to_open', False)
+                ),
                 use_gripper=(not no_gripper),
                 robot_type=rc['robot_type'],
                 tcp_offset=rc['tcp_offset'],
@@ -2488,7 +2538,7 @@ def main(input, output, robot_config,
                 obs_image_resolution=obs_res,
                 obs_float32=True,
                 camera_reorder=[int(x) for x in camera_reorder],
-                init_joints=init_joints,
+                init_joints=(False if plan_only else init_joints),
                 enable_multi_cam_vis=True,
                 camera_obs_latency=float(cfg.task.get("camera_obs_latency", 0.125)),
                 robot_obs_latency=rc['robot_obs_latency'],
@@ -2497,7 +2547,15 @@ def main(input, output, robot_config,
                 gripper_action_latency=gc.get('gripper_action_latency', 0.1),
                 camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
                 robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
-                gripper_obs_horizon=cfg.task.shape_meta.obs.robot0_gripper_width.horizon,
+                gripper_obs_horizon=int(
+                    OmegaConf.select(
+                        cfg,
+                        "task.shape_meta.obs.robot0_gripper_width.horizon",
+                        default=OmegaConf.select(
+                            cfg, "task.low_dim_obs_horizon", default=2
+                        ),
+                    )
+                ),
                 ft_obs_horizon=ft_obs_horizon,
                 ft_obs_stride=ft_obs_stride,
                 ft_obs_frequency=ft_sample_frequency,
@@ -2509,8 +2567,11 @@ def main(input, output, robot_config,
                 inpaint_aruco_tags=inpaint_aruco_tags,
                 aruco_config_path=aruco_config,
                 mirror_swap=mirror_swap,
-                max_pos_speed=2.0,
-                max_rot_speed=6.0,
+                max_pos_speed=float(rc.get("indy_max_pos_speed_m_s", 0.3)),
+                max_rot_speed=float(rc.get("indy_max_rot_speed_rad_s", 1.0)),
+                indy_command_timeout_s=float(
+                    rc.get("indy_command_timeout_s", 0.3)
+                ),
                 indy_task_rot_is_euler=rc.get("indy_task_rot_is_euler", True),
                 indy_task_rot_euler_seq=rc.get("indy_task_rot_euler_seq", "xyz"),
                 indy_task_rot_euler_in_degrees=rc.get(
@@ -2546,6 +2607,51 @@ def main(input, output, robot_config,
                 )
             print("Waiting for camera")
             time.sleep(1.0)
+
+            startup_bias_result = None
+            if dual_ft_enabled:
+                click.confirm(
+                    "Remove all contact/load from both RG2 fingers, keep the "
+                    "gripper and robot still, then continue with startup F/T bias calibration",
+                    abort=True,
+                )
+                print(
+                    "Calibrating native left/right F/T startup bias from "
+                    f"{startup_bias_cfg.sample_count} unique samples..."
+                )
+                try:
+                    startup_bias_result = acquire_startup_bias(
+                        env.gripper, startup_bias_cfg
+                    )
+                except (KeyError, ValueError, TimeoutError) as exc:
+                    raise click.ClickException(
+                        f"live F/T startup bias calibration failed: {exc}"
+                    ) from exc
+                startup_bias_12d = np.asarray(
+                    startup_bias_result["bias_12d"], dtype=np.float64
+                )
+                env.set_ft_startup_bias(startup_bias_12d)
+                calibration_record = {
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "coordinate_frame": "native left[6] + native right[6]",
+                    "used_for": "this process only; never an offline episode bias",
+                    "config": vars(startup_bias_cfg),
+                    **{
+                        key: (value.tolist() if isinstance(value, np.ndarray) else value)
+                        for key, value in startup_bias_result.items()
+                    },
+                }
+                calibration_path = pathlib.Path(output).joinpath(
+                    "ft_startup_bias_" + time.strftime("%Y%m%d_%H%M%S") + ".json"
+                )
+                calibration_path.write_text(
+                    json.dumps(calibration_record, indent=2), encoding="utf-8"
+                )
+                print(
+                    "F/T startup bias accepted:",
+                    np.array2string(startup_bias_12d, precision=5),
+                )
+                print("F/T calibration provenance:", calibration_path)
 
             # load match_dataset
             episode_first_frame_map = dict()
@@ -2596,12 +2702,12 @@ def main(input, output, robot_config,
                 policy = workspace.ema_model
             if dual_ft_enabled:
                 encoder_shape = tuple(policy.obs_encoder.output_shape())
-                if encoder_shape != (1, 800):
+                if encoder_shape != (1, 786):
                     raise RuntimeError(
                         "restored dual-F/T observation encoder must emit "
-                        f"condition [1,800], got {encoder_shape}"
+                        f"condition [1,786], got {encoder_shape}"
                     )
-                print("restored observation-encoder condition shape: [1,800]")
+                print("restored observation-encoder condition shape: [1,786]")
             if disable_eval_image_aug:
                 disabled_keys = _disable_policy_image_transforms(policy)
                 if disabled_keys:
@@ -2674,10 +2780,14 @@ def main(input, output, robot_config,
                 obs_for_model = prepare_rg2ft_policy_obs(
                     obs, cfg.task.shape_meta
                 )
-                obs_for_model = _apply_slam_frame_fix_to_obs(
-                    obs_for_model, n_robots
-                )
-                episode_start_pose_for_model = _apply_slam_frame_fix_to_start_pose(episode_start_pose)
+                episode_start_pose_for_model = episode_start_pose
+                if not dual_ft_enabled:
+                    obs_for_model = _apply_slam_frame_fix_to_obs(
+                        obs_for_model, n_robots
+                    )
+                    episode_start_pose_for_model = _apply_slam_frame_fix_to_start_pose(
+                        episode_start_pose
+                    )
                 obs_dict_np = get_real_umi_obs_dict(
                     env_obs=obs_for_model, shape_meta=cfg.task.shape_meta,
                     obs_pose_repr=obs_pose_rep,
@@ -2724,16 +2834,23 @@ def main(input, output, robot_config,
                         "policy must return its full trained trajectory; got "
                         f"{raw_pred.shape}, expected {expected_action_shape}"
                     )
-                _check_finite_array("[warmup] raw action_pred before frame fix", raw_pred)
-                raw_pred = _apply_slam_frame_fix(raw_pred, n_robots)
-                _check_finite_array("[warmup] raw action_pred after frame fix", raw_pred)
+                _check_finite_array("[warmup] raw action_pred", raw_pred)
+                if force_feedback is not None:
+                    _check_finite_array(
+                        "[warmup] predicted grasp force reference",
+                        raw_pred[:, 10],
+                    )
+                if not dual_ft_enabled:
+                    raw_pred = _apply_slam_frame_fix(raw_pred, n_robots)
                 action_dataset = _decode_real_umi_action_checked(
                     raw_pred, obs_for_model, action_pose_repr, "[warmup dataset]"
                 )
-                action = _transform_tcp7_action(
-                    action_dataset, _ROBOT_FROM_DATASET_T, n_robots
-                )
-                _check_finite_array("[warmup] robot-frame tcp7 action", action)
+                action = action_dataset
+                if not dual_ft_enabled:
+                    action = _transform_tcp7_action(
+                        action_dataset, _ROBOT_FROM_DATASET_T, n_robots
+                    )
+                _check_finite_array("[warmup] tcp7 action", action)
                 action = _apply_policy_tcp7_rot_roundtrip(
                     action,
                     enabled=policy_rot_rt,
@@ -3023,6 +3140,16 @@ def main(input, output, robot_config,
                                 target_pose[0] = robot_pose
                                 gripper_target_pos[0] = grip
                                 time.sleep(duration)
+                        elif (
+                            key == ord("v")
+                            and match_replay_buffer is not None
+                            and dual_ft_enabled
+                        ):
+                            print(
+                                "[dual-F/T] absolute replay of a SLAM training "
+                                "trajectory is disabled; use first-frame overlap "
+                                "and teleop initialization only."
+                            )
                         elif key == ord("v") and match_replay_buffer is not None:
                             if plan_only:
                                 print("[plan_only] skipped match trajectory replay.")
@@ -3260,8 +3387,61 @@ def main(input, output, robot_config,
                                     "no saved start pose. Press s at the desired "
                                     f"pose first (writes {_SAVED_START_POSE_PATH})."
                                 )
+                            elif plan_only:
+                                print("[plan_only] skipped saved-start robot move.")
                             else:
                                 pose = saved_start_tcp6.copy()
+                                live_pose = _tcp6_from_obs(obs)
+                                start_pos_gap = float(
+                                    np.linalg.norm(pose[:3] - live_pose[:3])
+                                )
+                                start_rot_gap = float(
+                                    (
+                                        st.Rotation.from_rotvec(pose[3:6])
+                                        * st.Rotation.from_rotvec(
+                                            live_pose[3:6]
+                                        ).inv()
+                                    ).magnitude()
+                                )
+                                if (
+                                    start_pos_gap
+                                    > 10.0 * motion_safety_cfg.max_position_delta_m
+                                    or start_rot_gap
+                                    > 5.0 * motion_safety_cfg.max_rotation_delta_rad
+                                ):
+                                    print(
+                                        "saved-start move refused: current gap "
+                                        f"position={start_pos_gap:.4f} m, "
+                                        f"rotation={start_rot_gap:.4f} rad. "
+                                        "Teleop closer or save a new start pose."
+                                    )
+                                    continue
+                                start_move_safety_cfg = PolicyMotionSafetyConfig(
+                                    **{
+                                        **vars(motion_safety_cfg),
+                                        "max_position_delta_m": 10.0
+                                        * motion_safety_cfg.max_position_delta_m,
+                                        "max_rotation_delta_rad": 5.0
+                                        * motion_safety_cfg.max_rotation_delta_rad,
+                                    }
+                                )
+                                try:
+                                    validate_policy_waypoints(
+                                        np.concatenate(
+                                            [pose, [gripper_target_pos[0]]]
+                                        )[None],
+                                        live_pose,
+                                        gripper_target_pos[0],
+                                        start_move_safety_cfg,
+                                    )
+                                except PolicySafetyError as exc:
+                                    print(f"saved-start move refused: {exc}")
+                                    continue
+                                if not click.confirm(
+                                    "Move the robot to the saved start pose?",
+                                    default=False,
+                                ):
+                                    continue
                                 duration = 4.0
                                 print(
                                     f"moving to saved start pose over {duration}s: "
@@ -3367,7 +3547,9 @@ def main(input, output, robot_config,
                         # Only send command when there is an explicit human input.
                         has_motion_cmd = (np.linalg.norm(dpos) > 1e-9) or (np.linalg.norm(drot_xyz) > 1e-9)
                         has_grip_cmd = abs(grip_delta) > 1e-9
-                        if has_motion_cmd or has_grip_cmd:
+                        if (has_motion_cmd or has_grip_cmd) and plan_only:
+                            print("[plan_only] skipped manual robot/gripper command.")
+                        elif has_motion_cmd or has_grip_cmd:
                             if has_grip_cmd and direct_gripper is not None:
                                 clipped, _ = direct_gripper.command_width(
                                     float(action[6])
@@ -3409,6 +3591,7 @@ def main(input, output, robot_config,
                 except KeyboardInterrupt:
                     print("Interrupted (Ctrl+C). Flushing episode and exiting.")
                     try:
+                        env.hold_robot()
                         env.end_episode()
                     except Exception:
                         pass
@@ -3466,7 +3649,11 @@ def main(input, output, robot_config,
                             obs['robot0_eef_rot_axis_angle'],
                         ], axis=-1)[-1]
                     ]
-                    episode_start_pose_for_model = _apply_slam_frame_fix_to_start_pose(episode_start_pose)
+                    episode_start_pose_for_model = episode_start_pose
+                    if not dual_ft_enabled:
+                        episode_start_pose_for_model = _apply_slam_frame_fix_to_start_pose(
+                            episode_start_pose
+                        )
 
                     # wait for 1/30 sec to get the closest frame actually
                     # reduces overall latency
@@ -3528,9 +3715,10 @@ def main(input, output, robot_config,
                             obs_for_model = prepare_rg2ft_policy_obs(
                                 obs, cfg.task.shape_meta
                             )
-                            obs_for_model = _apply_slam_frame_fix_to_obs(
-                                obs_for_model, n_robots
-                            )
+                            if not dual_ft_enabled:
+                                obs_for_model = _apply_slam_frame_fix_to_obs(
+                                    obs_for_model, n_robots
+                                )
                             obs_dict_np = get_real_umi_obs_dict(
                                 env_obs=obs_for_model, shape_meta=cfg.task.shape_meta,
                                 obs_pose_repr=obs_pose_rep,
@@ -3577,23 +3765,31 @@ def main(input, output, robot_config,
                                     f"{raw_action.shape}, expected {expected_action_shape}"
                                 )
                             _check_finite_array(
-                                f"[policy iter={iter_idx}] raw action_pred before frame fix",
+                                f"[policy iter={iter_idx}] raw action_pred",
                                 raw_action,
                             )
-                            raw_action = _apply_slam_frame_fix(raw_action, n_robots)
-                            _check_finite_array(
-                                f"[policy iter={iter_idx}] raw action_pred after frame fix",
-                                raw_action,
-                            )
+                            predicted_force_reference = None
+                            if force_feedback is not None:
+                                predicted_force_reference = raw_action[:, 10].copy()
+                                _check_finite_array(
+                                    f"[policy iter={iter_idx}] predicted grasp force reference",
+                                    predicted_force_reference,
+                                )
+                            if not dual_ft_enabled:
+                                raw_action = _apply_slam_frame_fix(
+                                    raw_action, n_robots
+                                )
                             action_dataset = _decode_real_umi_action_checked(
                                 raw_action,
                                 obs_for_model,
                                 action_pose_repr,
                                 f"[policy iter={iter_idx} dataset]",
                             )
-                            action = _transform_tcp7_action(
-                                action_dataset, _ROBOT_FROM_DATASET_T, n_robots
-                            )
+                            action = action_dataset
+                            if not dual_ft_enabled:
+                                action = _transform_tcp7_action(
+                                    action_dataset, _ROBOT_FROM_DATASET_T, n_robots
+                                )
                             _check_finite_array(
                                 f"[policy iter={iter_idx}] robot-frame tcp7 action",
                                 action,
@@ -3648,14 +3844,17 @@ def main(input, output, robot_config,
                         # actions; scheduling late-horizon rows after inference latency
                         # causes jumpy biased motion.
                         n_exec = min(int(steps_per_inference), len(action))
-                        this_target_poses = action[:n_exec]
+                        this_target_poses = action[:n_exec].copy()
+                        this_force_reference = None
+                        if predicted_force_reference is not None:
+                            this_force_reference = predicted_force_reference[:n_exec].copy()
                         assert this_target_poses.shape[1] == 7 * n_robots
 
                         # deal with timing
                         # Schedule from the next available control tick. Basing these
                         # stamps on obs_timestamps[-1] can skip the first several
                         # near-term actions when obs + inference latency is high.
-                        action_exec_latency = 0.01
+                        action_exec_latency = max(0.002, float(command_latency))
                         curr_time = time.time()
                         next_step_idx = int(np.ceil(
                             (curr_time + action_exec_latency - eval_t_start) / dt
@@ -3668,15 +3867,18 @@ def main(input, output, robot_config,
                         is_new = action_timestamps > (curr_time + action_exec_latency)
                         runtime_metrics["deadline_misses"] += int(np.sum(~is_new))
                         if np.sum(is_new) == 0:
-                            # exceeded time budget, still do something
+                            # Keep the pose/reference row paired and schedule it
+                            # strictly in the future even after a long inference.
                             this_target_poses = this_target_poses[[-1]]
-                            # schedule on next available step
-                            next_step_idx = int(np.ceil((curr_time - eval_t_start) / dt))
-                            action_timestamp = eval_t_start + (next_step_idx) * dt
+                            if this_force_reference is not None:
+                                this_force_reference = this_force_reference[[-1]]
+                            action_timestamp = curr_time + action_exec_latency
                             print('Over budget', action_timestamp - curr_time)
                             action_timestamps = np.array([action_timestamp])
                         else:
                             this_target_poses = this_target_poses[is_new]
+                            if this_force_reference is not None:
+                                this_force_reference = this_force_reference[is_new]
                             action_timestamps = action_timestamps[is_new]
 
                         if (
@@ -3694,6 +3896,60 @@ def main(input, output, robot_config,
                                 freeze_rotation_ref_pose=episode_start_pose,
                             )
 
+                        force_feedback_result = None
+                        if force_feedback is not None:
+                            latest_ft = env.get_latest_ft_state()
+                            raw_left = latest_ft["left_raw"]
+                            raw_right = latest_ft["right_raw"]
+                            force_feedback_result = force_feedback.correct_from_native_wrenches(
+                                policy_width_m=this_target_poses[:, 6],
+                                predicted_force_n=this_force_reference,
+                                left_wrench=raw_left,
+                                right_wrench=raw_right,
+                                startup_bias_12d=startup_bias_12d,
+                            )
+                            corrected_left = latest_ft["left"]
+                            corrected_right = latest_ft["right"]
+                            validate_ft_load(
+                                corrected_left,
+                                corrected_right,
+                                force_feedback_result["measured_force_n"],
+                                ft_safety_cfg,
+                                latest_sample_age_s=(
+                                    time.time() - latest_ft["timestamp"]
+                                ),
+                            )
+                            this_target_poses[:, 6] = force_feedback_result[
+                                "corrected_width_m"
+                            ]
+                            print(
+                                "F/T width feedback: measured="
+                                f"{force_feedback_result['measured_force_n']:.3f} N "
+                                "target="
+                                f"{float(this_force_reference[0]):.3f} N "
+                                "width_correction="
+                                f"{float(force_feedback_result['width_correction_m'][0]) * 1000.0:.3f} mm"
+                            )
+
+                        current_tcp6 = np.concatenate(
+                            [
+                                np.asarray(obs["robot0_eef_pos"][-1], dtype=np.float64),
+                                np.asarray(
+                                    obs["robot0_eef_rot_axis_angle"][-1],
+                                    dtype=np.float64,
+                                ),
+                            ]
+                        )
+                        current_width_m = float(
+                            np.asarray(obs["robot0_gripper_width"][-1]).reshape(-1)[0]
+                        )
+                        validate_policy_waypoints(
+                            this_target_poses,
+                            current_tcp6,
+                            current_width_m,
+                            motion_safety_cfg,
+                        )
+
                         if print_policy_output:
                             _print_policy_action_debug(
                                 f"[policy iter={iter_idx} -> exec]",
@@ -3710,7 +3966,11 @@ def main(input, output, robot_config,
                                 n_robots=n_robots,
                             )
 
-                        if direct_gripper is not None and len(this_target_poses) > 0:
+                        if (
+                            (not plan_only)
+                            and direct_gripper is not None
+                            and len(this_target_poses) > 0
+                        ):
                             clipped_width, _ = direct_gripper.command_width(
                                 float(this_target_poses[0, 6])
                             )
@@ -3751,6 +4011,18 @@ def main(input, output, robot_config,
                             else converted_row)
                         accum_xyz_cm = (obs_pos - np.asarray(episode_start_pose[0][:3],
                             dtype=np.float64)) * 100.0
+                        measured_force_n = (
+                            float(force_feedback_result["measured_force_n"])
+                            if force_feedback_result is not None else float("nan")
+                        )
+                        predicted_force_n = (
+                            float(force_feedback_result["predicted_force_n"][0])
+                            if force_feedback_result is not None else float("nan")
+                        )
+                        width_correction_m = (
+                            float(force_feedback_result["width_correction_m"][0])
+                            if force_feedback_result is not None else float("nan")
+                        )
 
                         if not eval_csv_header_written:
                             eval_csv_writer.writerow(
@@ -3761,7 +4033,12 @@ def main(input, output, robot_config,
                                 + [f'raw_action_{i}' for i in range(len(raw_row))]
                                 + [f'converted_{i}' for i in range(len(converted_row))]
                                 + [f'sent_{i}' for i in range(len(sent_row))]
-                                + ['n_submitted']
+                                + [
+                                    'n_submitted',
+                                    'measured_grasp_force_n',
+                                    'predicted_grasp_force_n',
+                                    'width_correction_m',
+                                ]
                                 + [f'accum_cm_{i}' for i in range(3)]
                             )
                             eval_csv_header_written = True
@@ -3769,7 +4046,12 @@ def main(input, output, robot_config,
                             [iter_idx, time.time()]
                             + obs_pos.tolist() + obs_rot.tolist() + obs_grip.tolist()
                             + raw_row.tolist() + converted_row.tolist() + sent_row.tolist()
-                            + [len(this_target_poses)]
+                            + [
+                                len(this_target_poses),
+                                measured_force_n,
+                                predicted_force_n,
+                                width_correction_m,
+                            ]
                             + accum_xyz_cm.tolist()
                         )
                         eval_csv_file.flush()
@@ -3864,9 +4146,14 @@ def main(input, output, robot_config,
                             print(f"max_policy_iters={max_policy_iters} reached.")
                             stop_episode = True
                         if stop_episode:
-                            if (not plan_only) and len(action_timestamps) > 0:
+                            if (
+                                key != ord("s")
+                                and (not plan_only)
+                                and len(action_timestamps) > 0
+                            ):
                                 final_wait = float(action_timestamps[-1]) + dt
                                 precise_wait(final_wait, time_func=time.time)
+                            env.hold_robot()
                             env.end_episode()
                             break
 
@@ -3874,9 +4161,15 @@ def main(input, output, robot_config,
                         precise_wait(t_cycle_end - frame_latency)
                         iter_idx += steps_per_inference
 
+                except PolicySafetyError as exc:
+                    env.hold_robot()
+                    env.end_episode()
+                    raise click.ClickException(
+                        f"policy safety stop (pending waypoints cancelled): {exc}"
+                    ) from exc
                 except KeyboardInterrupt:
                     print("Interrupted!")
-                    # stop robot.
+                    env.hold_robot()
                     env.end_episode()
                 finally:
                     if eval_csv_file is not None:
