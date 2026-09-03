@@ -2571,16 +2571,11 @@ def main(input, output, robot_config,
                 obs_image_resolution=obs_res,
                 obs_float32=True,
                 camera_reorder=[int(x) for x in camera_reorder],
-<<<<<<< HEAD
                 init_joints=(False if plan_only else init_joints),
-                enable_multi_cam_vis=True,
-=======
-                init_joints=init_joints,
                 # The raw "Multi Cam Vis" window bypasses the match overlay and
                 # is easily mistaken for the evaluation view.  The main window
                 # below is the single full-resolution camera view.
                 enable_multi_cam_vis=False,
->>>>>>> 1ba40c3 (inference debugged)
                 camera_obs_latency=float(cfg.task.get("camera_obs_latency", 0.125)),
                 robot_obs_latency=rc['robot_obs_latency'],
                 gripper_obs_latency=gc.get('gripper_obs_latency', 0.01),

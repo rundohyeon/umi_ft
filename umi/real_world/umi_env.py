@@ -31,15 +31,11 @@ from diffusion_policy.common.cv2_util import (
 from umi.common.usb_util import reset_all_elgato_devices, get_sorted_v4l_paths
 from umi.common.pose_util import pose_to_pos_rot
 from umi.common.interpolation_util import get_interp1d, PoseInterpolator
-<<<<<<< HEAD
-from umi.real_world.rg2ft_obs import causal_ft_history_from_streams
-from umi.real_world.rg2ft_startup_bias import subtract_startup_bias
-=======
 from umi.real_world.rg2ft_obs import (
     causal_ft_history_from_streams,
     compute_ft_tare_offset,
 )
->>>>>>> 1ba40c3 (inference debugged)
+from umi.real_world.rg2ft_startup_bias import subtract_startup_bias
 
 
 def _camera_capture_profile(dev_path: str):
