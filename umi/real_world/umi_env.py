@@ -31,8 +31,15 @@ from diffusion_policy.common.cv2_util import (
 from umi.common.usb_util import reset_all_elgato_devices, get_sorted_v4l_paths
 from umi.common.pose_util import pose_to_pos_rot
 from umi.common.interpolation_util import get_interp1d, PoseInterpolator
+<<<<<<< HEAD
 from umi.real_world.rg2ft_obs import causal_ft_history_from_streams
 from umi.real_world.rg2ft_startup_bias import subtract_startup_bias
+=======
+from umi.real_world.rg2ft_obs import (
+    causal_ft_history_from_streams,
+    compute_ft_tare_offset,
+)
+>>>>>>> 1ba40c3 (inference debugged)
 
 
 def _camera_capture_profile(dev_path: str):
@@ -81,6 +88,8 @@ class UmiEnv:
             rg2ft_home_to_open=False,
             rg2ft_move_max_speed=0.2,
             rg2ft_open_tolerance=0.005,
+            rg2ft_zero_on_start=False,
+            rg2ft_zero_samples=25,
             gripper_commands_enabled=True,
             gripper_serial_port=None,
             dynamixel_id=1,
@@ -545,6 +554,13 @@ class UmiEnv:
         self.gripper = gripper
         self.use_gripper = use_gripper
         self.gripper_commands_enabled = bool(gripper_commands_enabled)
+        self.rg2ft_zero_on_start = bool(
+            rg2ft_zero_on_start and use_gripper and gripper_type != 'dynamixel'
+        )
+        self.rg2ft_zero_samples = int(rg2ft_zero_samples)
+        if self.rg2ft_zero_samples <= 0:
+            raise ValueError("rg2ft_zero_samples must be positive")
+        self.rg2ft_ft_offset = np.zeros(12, dtype=np.float64)
         self.multi_cam_vis = multi_cam_vis
         self.frequency = frequency
         self.max_obs_buffer_size = max_obs_buffer_size
@@ -639,9 +655,43 @@ class UmiEnv:
             camera.video_recorder.start_wait()
         if self.use_gripper and self.gripper is not None:
             self.gripper.start_wait()
+            if self.rg2ft_zero_on_start:
+                self._zero_rg2ft_from_recent_samples()
         self.robot.start_wait()
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.start_wait()
+
+    def _zero_rg2ft_from_recent_samples(self):
+        """Match collection-time software tare using recent raw samples."""
+        deadline = time.monotonic() + max(
+            2.0,
+            2.0 * self.rg2ft_zero_samples / max(self.ft_obs_frequency, 1.0),
+        )
+        samples = None
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                state = self.gripper.get_all_state()
+                samples = np.asarray(state['gripper_ft'], dtype=np.float64)
+                if len(samples) >= self.rg2ft_zero_samples:
+                    break
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.01)
+        if samples is None or len(samples) == 0:
+            detail = "" if last_error is None else f": {last_error}"
+            raise RuntimeError(f"F/T auto-zero received no sensor samples{detail}")
+        self.rg2ft_ft_offset = compute_ft_tare_offset(
+            samples,
+            n_avg=self.rg2ft_zero_samples,
+        )
+        left = np.array2string(self.rg2ft_ft_offset[:6], precision=4)
+        right = np.array2string(self.rg2ft_ft_offset[6:], precision=4)
+        print(
+            "[F/T auto-zero] software tare applied from "
+            f"{min(len(samples), self.rg2ft_zero_samples)} samples; "
+            f"left={left} right={right}"
+        )
     
     def stop_wait(self):
         self.robot.stop_wait()
@@ -740,6 +790,12 @@ class UmiEnv:
         last_gripper_data = None
         if self.use_gripper and self.gripper is not None:
             last_gripper_data = self.gripper.get_all_state()
+        tared_gripper_ft = None
+        if last_gripper_data is not None:
+            tared_gripper_ft = (
+                np.asarray(last_gripper_data['gripper_ft'], dtype=np.float64)
+                - self.rg2ft_ft_offset
+            )
 
         last_timestamp = self.last_camera_data[self.align_camera_idx]['timestamp'][-1]
         dt = 1 / self.frequency
@@ -784,7 +840,7 @@ class UmiEnv:
             gripper_width = gripper_interpolator(gripper_obs_timestamps)
             ft_interpolator = get_interp1d(
                 t=last_gripper_data['gripper_timestamp'],
-                x=last_gripper_data['gripper_ft']
+                x=tared_gripper_ft,
             )
             robot0_ft = ft_interpolator(gripper_obs_timestamps)
         else:
@@ -819,9 +875,11 @@ class UmiEnv:
             # the training dataset's two causal lookups.
             causal_raw = causal_ft_history_from_streams(
                 last_gripper_data['gripper_timestamp'],
-                last_gripper_data['gripper_ft_left'],
+                np.asarray(last_gripper_data['gripper_ft_left'])
+                - self.rg2ft_ft_offset[:6],
                 last_gripper_data['gripper_timestamp'],
-                last_gripper_data['gripper_ft_right'],
+                np.asarray(last_gripper_data['gripper_ft_right'])
+                - self.rg2ft_ft_offset[6:],
                 anchor_timestamp=last_timestamp,
                 num_steps=self.ft_obs_horizon,
                 stride=self.ft_obs_stride,
@@ -873,7 +931,7 @@ class UmiEnv:
                 self.obs_accumulator.put(
                     data={
                         'robot0_gripper_width': last_gripper_data['gripper_position'][...,None],
-                        'robot0_ft': last_gripper_data['gripper_ft']
+                        'robot0_ft': tared_gripper_ft,
                     },
                     timestamps=last_gripper_data['gripper_timestamp']
                 )

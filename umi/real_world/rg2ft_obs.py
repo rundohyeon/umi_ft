@@ -3,6 +3,21 @@ from __future__ import annotations
 import numpy as np
 
 
+def compute_ft_tare_offset(combined_ft, n_avg=25):
+    """Average the newest raw 12-axis samples for a software F/T tare."""
+    values = np.asarray(combined_ft, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 12:
+        raise ValueError(f"combined F/T tare samples must be [N,12], got {values.shape}")
+    if len(values) == 0:
+        raise ValueError("cannot tare F/T without a sensor sample")
+    if np.any(~np.isfinite(values)):
+        raise ValueError("F/T tare samples contain NaN or Inf")
+    n_avg = int(n_avg)
+    if n_avg <= 0:
+        raise ValueError("F/T tare sample count must be positive")
+    return np.mean(values[-n_avg:], axis=0)
+
+
 def _validate_ft_stream(name, timestamps, values):
     """Return a validated timestamped six-axis F/T stream.
 

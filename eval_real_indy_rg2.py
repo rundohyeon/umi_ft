@@ -662,6 +662,16 @@ def _resize_rgb_like_policy(match_rgb, out_hw: tuple[int, int]) -> np.ndarray:
     return np.ascontiguousarray(tf(rgb))
 
 
+def _blend_match_rgb_on_live_bgr(
+    live_bgr: np.ndarray,
+    match_rgb: np.ndarray,
+) -> np.ndarray:
+    """Overlay a training RGB frame on a live OpenCV BGR frame at 50/50."""
+    resized_match_rgb = _resize_rgb_like_policy(match_rgb, live_bgr.shape[:2])
+    match_bgr = cv2.cvtColor(resized_match_rgb, cv2.COLOR_RGB2BGR)
+    return cv2.addWeighted(live_bgr, 0.5, match_bgr, 0.5, 0)
+
+
 def _show_policy_input_window(obs, label: str, match_rgb=None) -> None:
     live_rgb = _policy_input_rgb_from_obs(obs)
     if live_rgb is None:
@@ -2009,6 +2019,22 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
     ),
 )
 @click.option(
+    "--zero_ft_on_start/--no_zero_ft_on_start",
+    default=True,
+    show_default=True,
+    help=(
+        "Software-tare both RG2-FT finger sensors at startup from recent raw "
+        "samples. Keep the unloaded gripper still while the program starts."
+    ),
+)
+@click.option(
+    "--ft_zero_samples",
+    default=25,
+    type=click.IntRange(min=1),
+    show_default=True,
+    help="Number of recent 100 Hz RG2-FT samples averaged for startup tare.",
+)
+@click.option(
     "--max_policy_iters",
     "-mpi",
     default=None,
@@ -2071,6 +2097,7 @@ def main(input, output, robot_config,
     mirror_swap, print_policy_output,
     pose_eval_audit, dataset_zarr, dataset_z_stride, print_model_input,
     show_policy_image, policy_input_audit, coord_transform_audit,
+    zero_ft_on_start, ft_zero_samples,
     print_motion_debug, vis_pose, max_policy_iters, plan_only,
     tcp_delta_scales, action_scale, freeze_rotation, match_g_move_robot,
     auto_start_policy):
@@ -2339,9 +2366,13 @@ def main(input, output, robot_config,
             OmegaConf.select(
                 cfg,
                 "execution.allowed_n_action_steps",
-                default=[1, 2, 4, 8],
+                default=[1, 2, 4, 6, 8],
             )
         )
+        # Existing dual-F/T checkpoints predate the validated 6-step runtime
+        # option and therefore serialize [1, 2, 4, 8]. The prediction horizon
+        # is 16, so executing six predicted rows is supported without retraining.
+        allowed_steps = sorted(set(map(int, allowed_steps)) | {6})
         if int(steps_per_inference) not in set(map(int, allowed_steps)):
             raise click.ClickException(
                 f"dual-F/T steps_per_inference must be one of {allowed_steps}"
@@ -2513,6 +2544,8 @@ def main(input, output, robot_config,
                 ),
                 rg2ft_move_max_speed=gc.get('rg2ft_move_max_speed', 0.2),
                 rg2ft_open_tolerance=gc.get('rg2ft_open_tolerance', 0.005),
+                rg2ft_zero_on_start=zero_ft_on_start,
+                rg2ft_zero_samples=ft_zero_samples,
                 gripper_commands_enabled=(not plan_only),
                 gripper_serial_port=gc.get('gripper_serial_port'),
                 dynamixel_id=gc.get('dynamixel_id', 1),
@@ -2538,8 +2571,16 @@ def main(input, output, robot_config,
                 obs_image_resolution=obs_res,
                 obs_float32=True,
                 camera_reorder=[int(x) for x in camera_reorder],
+<<<<<<< HEAD
                 init_joints=(False if plan_only else init_joints),
                 enable_multi_cam_vis=True,
+=======
+                init_joints=init_joints,
+                # The raw "Multi Cam Vis" window bypasses the match overlay and
+                # is easily mistaken for the evaluation view.  The main window
+                # below is the single full-resolution camera view.
+                enable_multi_cam_vis=False,
+>>>>>>> 1ba40c3 (inference debugged)
                 camera_obs_latency=float(cfg.task.get("camera_obs_latency", 0.125)),
                 robot_obs_latency=rc['robot_obs_latency'],
                 gripper_obs_latency=gc.get('gripper_obs_latency', 0.01),
@@ -3031,19 +3072,10 @@ def main(input, output, robot_config,
 
                         match_has_first_frame = match_episode_id in episode_first_frame_map
                         if match_episode_id in episode_first_frame_map:
-                            match_img = episode_first_frame_map[match_episode_id]
-                            ih, iw, _ = match_img.shape
-                            oh, ow, _ = vis_img.shape
-                            tf = get_image_transform(
-                                input_res=(iw, ih),
-                                output_res=(ow, oh),
-                                bgr_to_rgb=False,
+                            vis_img = _blend_match_rgb_on_live_bgr(
+                                vis_img,
+                                episode_first_frame_map[match_episode_id],
                             )
-                            match_bgr = cv2.cvtColor(tf(match_img), cv2.COLOR_RGB2BGR)
-                            vis_img = (
-                                (vis_img.astype(np.float32) + match_bgr.astype(np.float32))
-                                / 2.0
-                            ).astype(np.uint8)
 
                         header = (
                             f"Eval ep: {episode_id} | Match ep: "
@@ -4097,9 +4129,24 @@ def main(input, output, robot_config,
                         # visualize (full-res camera feed; obs rgb is masked 224x224 for policy)
                         episode_id = env.replay_buffer.n_episodes
                         vis_img = _get_live_display_bgr(env, camera_idx=match_camera)
+                        match_policy_rgb = None
+                        if selected_match_episode_for_eval is not None:
+                            match_policy_rgb = episode_first_policy_frame_map.get(
+                                int(selected_match_episode_for_eval)
+                            )
+                        if match_policy_rgb is not None:
+                            vis_img = _blend_match_rgb_on_live_bgr(
+                                vis_img,
+                                match_policy_rgb,
+                            )
                         header = "Episode: {}, Time: {:.1f}".format(
                             episode_id, time.monotonic() - t_start
                         )
+                        if selected_match_episode_for_eval is not None:
+                            header += (
+                                " | Match ep: "
+                                f"{int(selected_match_episode_for_eval)} | overlap 50/50"
+                            )
                         if vis_pose:
                             next_tcp = (
                                 this_target_poses[0][:6]
@@ -4117,11 +4164,6 @@ def main(input, output, robot_config,
                             vis_img = _overlay_episode_text(vis_img, header)
                         cv2.imshow("default", vis_img)
                         if show_policy_image:
-                            match_policy_rgb = None
-                            if selected_match_episode_for_eval is not None:
-                                match_policy_rgb = episode_first_policy_frame_map.get(
-                                    int(selected_match_episode_for_eval)
-                                )
                             _show_policy_input_window(
                                 obs,
                                 f"policy input | t={time.monotonic() - t_start:.1f}s",

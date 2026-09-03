@@ -28,6 +28,22 @@ The default hardware configuration is
 
 Confirm these addresses on the deployment machine before connecting.
 
+## First-scene camera overlay
+
+The launcher loads `data/dataset.zarr.zip` by default and overlays episode 0's
+first `camera0_rgb` image at 50% opacity on the live camera pop-up.  Select a
+different initial scene with `MATCH_EPISODE=<index>`, or provide another Zarr
+dataset with `MATCH_DATASET=/path/to/dataset.zarr.zip`.
+
+## F/T zero at startup
+
+Evaluation software-tares both RG2-FT finger sensors automatically at startup.
+It averages the latest 25 raw samples (about 0.25 seconds at 100 Hz) and
+subtracts that 12-channel baseline from all policy and eval-recording F/T
+values. Keep the unloaded gripper still while the program starts. Use
+`--no_zero_ft_on_start` only when raw sensor values are intentionally required;
+change the averaging window with `--ft_zero_samples N`.
+
 ## Python dependency
 
 Install the additional pinned dependency in the full UMI eval environment:

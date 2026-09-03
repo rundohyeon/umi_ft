@@ -2,10 +2,31 @@ import unittest
 
 import numpy as np
 
-from umi.real_world.rg2ft_obs import causal_ft_history, prepare_rg2ft_policy_obs
+from umi.real_world.rg2ft_obs import (
+    causal_ft_history,
+    compute_ft_tare_offset,
+    prepare_rg2ft_policy_obs,
+)
 
 
 class RG2FTPolicyObsTest(unittest.TestCase):
+    def test_tare_offset_averages_only_newest_requested_samples(self):
+        samples = np.stack(
+            [
+                np.full(12, 100.0),
+                np.full(12, 2.0),
+                np.full(12, 4.0),
+            ]
+        )
+        offset = compute_ft_tare_offset(samples, n_avg=2)
+        np.testing.assert_array_equal(offset, np.full(12, 3.0))
+
+    def test_tare_offset_rejects_non_finite_samples(self):
+        samples = np.zeros((2, 12))
+        samples[1, 3] = np.nan
+        with self.assertRaisesRegex(ValueError, "NaN or Inf"):
+            compute_ft_tare_offset(samples)
+
     def test_causal_history_never_selects_future_ft(self):
         timestamps = np.array([1.01, 1.02, 1.03, 1.04])
         ft = np.arange(48, dtype=np.float32).reshape(4, 12)

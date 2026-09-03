@@ -18,6 +18,8 @@ fi
 CHECKPOINT="${RG2_CHECKPOINT:-$ROOT/umi_18.45.44_latest.ckpt}"
 OUTPUT_DIR="${EVAL_OUTPUT_DIR:-$ROOT/data/eval_indy_rg2}"
 ROBOT_CONFIG="${RG2_ROBOT_CONFIG:-$ROOT/example/eval_robots_config_indy_rg2.yaml}"
+MATCH_DATASET="${MATCH_DATASET:-$ROOT/data/dataset.zarr.zip}"
+MATCH_EPISODE="${MATCH_EPISODE:-0}"
 ACTION_SCALE="${ACTION_SCALE:-0.2}"
 
 if [[ "$PYTHON_BIN" == */* ]]; then
@@ -31,7 +33,7 @@ elif ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Set PYTHON_BIN to the UMI environment containing requirements_rg2ft.txt." >&2
   exit 1
 fi
-for required in "$CHECKPOINT" "$ROBOT_CONFIG"; do
+for required in "$CHECKPOINT" "$ROBOT_CONFIG" "$MATCH_DATASET"; do
   if [[ ! -f "$required" ]]; then
     echo "Missing required file: $required" >&2
     exit 1
@@ -53,6 +55,8 @@ exec "$PYTHON_BIN" "$ROOT/eval_real_indy_rg2.py" \
   --input "$CHECKPOINT" \
   --output "$OUTPUT_DIR" \
   --robot_config "$ROBOT_CONFIG" \
+  --match_dataset "$MATCH_DATASET" \
+  --match_episode "$MATCH_EPISODE" \
   --allow_rotation \
   --action_scale "$ACTION_SCALE" \
   --vis_pose \
