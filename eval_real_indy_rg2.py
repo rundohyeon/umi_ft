@@ -101,6 +101,7 @@ from umi.real_world.grasp_force_width_feedback import (
 from umi.real_world.rg2ft_startup_bias import (
     FTStartupBiasConfig,
     acquire_startup_bias,
+    startup_residual_after_software_tare,
 )
 from umi.real_world.dual_ft_policy_safety import (
     FTSafetyConfig,
@@ -1699,8 +1700,179 @@ def _print_policy_action_debug(tag, raw_action, action_7d, submitted=None):
 
 
 _POSE10D_LABELS = ["x", "y", "z", "r6d_0", "r6d_1", "r6d_2", "r6d_3", "r6d_4", "r6d_5", "grip", "grasp_N"]
+_FT_CHANNEL_LABELS = ("fx", "fy", "fz", "tx", "ty", "tz")
+_FT_CHANNEL_UNITS = ("N", "N", "N", "Nm", "Nm", "Nm")
 _PANEL_W = 320
 _PANEL_H = 420   # taller than wide: text panels have ~19-22 lines, 320 clipped them
+
+
+def _tensor_to_numpy(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu").numpy()
+    return np.asarray(value)
+
+
+def _normalized_ft_policy_inputs(policy, obs_dict) -> dict[str, np.ndarray]:
+    """Return the two F/T histories after the checkpoint normalizer.
+
+    ``obs_dict`` is the same tensor dictionary passed to ``predict_action``.
+    The operation is cheap (no vision/diffusion forward pass) and makes the
+    recorded CSV explicitly distinguish physical sensor units from model input.
+    """
+    normalizer = getattr(policy, "normalizer", None)
+    if normalizer is None:
+        return {}
+    try:
+        normalized = normalizer.normalize(obs_dict)
+    except Exception as exc:
+        print(f"[eval_log] could not normalize F/T diagnostic input: {exc}")
+        return {}
+    return {
+        key: _tensor_to_numpy(normalized[key])[0]
+        for key in ("robot0_ft_left", "robot0_ft_right")
+        if key in normalized
+    }
+
+
+def _write_ft_input_history(
+    writer,
+    *,
+    iter_idx: int,
+    wall_time: float,
+    obs: dict,
+    obs_dict_np: dict,
+    normalized_ft: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Save every causal 6-D F/T sample used by one policy decision."""
+    histories = []
+    for side in ("left", "right"):
+        key = f"robot0_ft_{side}"
+        values = np.asarray(obs_dict_np.get(key), dtype=np.float64)
+        if values.ndim != 2 or values.shape[-1] != 6:
+            return None
+        normalized = np.asarray(normalized_ft.get(key), dtype=np.float64)
+        if normalized.shape != values.shape:
+            normalized = np.full_like(values, np.nan, dtype=np.float64)
+        timestamps = np.asarray(
+            obs.get(f"robot0_ft_{side}_timestamps", np.full(len(values), np.nan)),
+            dtype=np.float64,
+        ).reshape(-1)
+        if len(timestamps) != len(values):
+            timestamps = np.full(len(values), np.nan, dtype=np.float64)
+        for sample_idx, (timestamp, raw_row, normalized_row) in enumerate(
+            zip(timestamps, values, normalized)
+        ):
+            writer.writerow(
+                [iter_idx, wall_time, side, sample_idx, int(sample_idx == len(values) - 1), timestamp]
+                + raw_row.tolist()
+                + normalized_row.tolist()
+            )
+        histories.append(values)
+    return tuple(histories)
+
+
+def _render_ft_input_timeline(path: pathlib.Path, rows: list[dict]) -> bool:
+    """Render latest causal F/T sample per policy iteration without matplotlib."""
+    if not rows:
+        return False
+    left = np.asarray([row["left"] for row in rows], dtype=np.float64)
+    right = np.asarray([row["right"] for row in rows], dtype=np.float64)
+    if left.ndim != 2 or left.shape[1] != 6 or right.shape != left.shape:
+        return False
+
+    width, height = 1440, 900
+    canvas = np.full((height, width, 3), 250, dtype=np.uint8)
+    cv2.putText(
+        canvas,
+        "Policy F/T input timeline (latest causal sample per inference)",
+        (28, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.78,
+        (20, 20, 20),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "blue: left finger   red: right finger   values before checkpoint normalization",
+        (28, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (60, 60, 60),
+        1,
+        cv2.LINE_AA,
+    )
+    n_rows = len(rows)
+    pad_x, top, gap_x, gap_y = 52, 90, 34, 55
+    panel_w = (width - 2 * pad_x - 2 * gap_x) // 3
+    panel_h = (height - top - 52 - gap_y) // 2
+    for channel_idx, (label, unit) in enumerate(zip(_FT_CHANNEL_LABELS, _FT_CHANNEL_UNITS)):
+        col, row = channel_idx % 3, channel_idx // 3
+        x0 = pad_x + col * (panel_w + gap_x)
+        y0 = top + row * (panel_h + gap_y)
+        x1, y1 = x0 + panel_w, y0 + panel_h
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (160, 160, 160), 1)
+        values = np.concatenate([left[:, channel_idx], right[:, channel_idx]])
+        finite = values[np.isfinite(values)]
+        if len(finite) == 0:
+            lo, hi = -1.0, 1.0
+        else:
+            lo, hi = float(finite.min()), float(finite.max())
+            margin = max(1e-6, 0.08 * max(hi - lo, 1e-3))
+            lo, hi = lo - margin, hi + margin
+        cv2.putText(
+            canvas, f"{label} [{unit}]  {lo:.3g} .. {hi:.3g}",
+            (x0 + 6, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+            (30, 30, 30), 1, cv2.LINE_AA,
+        )
+        for frac in (0.25, 0.5, 0.75):
+            y = int(y0 + frac * panel_h)
+            cv2.line(canvas, (x0, y), (x1, y), (225, 225, 225), 1)
+        def point(i, value):
+            x = x0 if n_rows <= 1 else int(x0 + i * panel_w / (n_rows - 1))
+            y = int(y1 - (float(value) - lo) * panel_h / (hi - lo))
+            return x, int(np.clip(y, y0, y1))
+        for series, color in ((left[:, channel_idx], (210, 80, 30)), (right[:, channel_idx], (35, 35, 210))):
+            valid_idx = np.flatnonzero(np.isfinite(series))
+            for i0, i1 in zip(valid_idx[:-1], valid_idx[1:]):
+                if i1 == i0 + 1:
+                    cv2.line(canvas, point(i0, series[i0]), point(i1, series[i1]), color, 2)
+    return bool(cv2.imwrite(str(path), canvas))
+
+
+def _render_fusion_attention_heatmap(
+    path: pathlib.Path, token_names: list[str], attention: np.ndarray
+) -> bool:
+    """Render mean query-to-key fusion attention; rows=query, columns=key."""
+    matrix = np.asarray(attention, dtype=np.float64)
+    n_tokens = len(token_names)
+    if matrix.shape != (n_tokens, n_tokens) or not np.all(np.isfinite(matrix)):
+        return False
+    cell, left, top = 145, 220, 125
+    canvas = np.full((top + cell * n_tokens + 90, left + cell * n_tokens + 45, 3), 255, dtype=np.uint8)
+    cv2.putText(canvas, "Mean fusion self-attention (query row -> key column)", (20, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.66, (20, 20, 20), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "descriptive attention only; not causal feature attribution", (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (80, 80, 80), 1, cv2.LINE_AA)
+    for idx, name in enumerate(token_names):
+        cv2.putText(canvas, name, (left + idx * cell + 4, top - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (30, 30, 30), 1, cv2.LINE_AA)
+        cv2.putText(canvas, name, (8, top + idx * cell + 78),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (30, 30, 30), 1, cv2.LINE_AA)
+    for q_idx in range(n_tokens):
+        for k_idx in range(n_tokens):
+            value = float(np.clip(matrix[q_idx, k_idx], 0.0, 1.0))
+            color = cv2.applyColorMap(
+                np.array([[int(round(value * 255.0))]], dtype=np.uint8),
+                cv2.COLORMAP_VIRIDIS,
+            )[0, 0].tolist()
+            x0, y0 = left + k_idx * cell, top + q_idx * cell
+            cv2.rectangle(canvas, (x0, y0), (x0 + cell, y0 + cell), color, -1)
+            cv2.rectangle(canvas, (x0, y0), (x0 + cell, y0 + cell), (210, 210, 210), 1)
+            text_color = (0, 0, 0) if value > 0.55 else (255, 255, 255)
+            cv2.putText(canvas, f"{value:.3f}", (x0 + 35, y0 + 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2, cv2.LINE_AA)
+    return bool(cv2.imwrite(str(path), canvas))
 
 
 def _render_text_panel(lines, width=_PANEL_W, height=_PANEL_H, bg_color=(30, 30, 30)):
@@ -1785,9 +1957,155 @@ def _load_match_episode_debug_data(zarr_path: str | None, episode_idx: int | Non
         return None
 
 
-def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp6,
-        live_tcp6, *, source_idx: int | None, match_episode_id: int | None):
-    """3-panel eval video: original zarr frame | current image | original coordinate."""
+def _render_policy_output_video_panel(
+    raw_action_h0,
+    decoded_action_h0,
+    scheduled_action_h0,
+    *,
+    predicted_force_n: float | None,
+    measured_force_n: float | None,
+    width_correction_m: float | None,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Compact first-waypoint output readout for the comparison video."""
+    lines = ["4. policy output, horizon 0 (pre-safety)"]
+    raw = None if raw_action_h0 is None else np.asarray(raw_action_h0, dtype=np.float64).ravel()
+    decoded = (
+        None if decoded_action_h0 is None
+        else np.asarray(decoded_action_h0, dtype=np.float64).ravel()
+    )
+    scheduled = (
+        None if scheduled_action_h0 is None
+        else np.asarray(scheduled_action_h0, dtype=np.float64).ravel()
+    )
+    if raw is None or raw.size < 11:
+        lines.append("model output: waiting for first inference")
+    else:
+        lines.extend([
+            f"raw xyz: {raw[0]:+.4f} {raw[1]:+.4f} {raw[2]:+.4f}",
+            "raw R6D: " + " ".join(f"{x:+.3f}" for x in raw[3:9]),
+            f"raw grip={raw[9]:+.4f}  grasp_N={raw[10]:+.3f}",
+        ])
+    if decoded is not None and decoded.size >= 7:
+        lines.extend([
+            "decoded TCP (before scale/F/T):",
+            f" xyz: {decoded[0]:+.4f} {decoded[1]:+.4f} {decoded[2]:+.4f} m",
+            " rotvec: " + " ".join(f"{x:+.3f}" for x in decoded[3:6]),
+            f" width: {decoded[6]:+.4f} m",
+        ])
+    if scheduled is not None and scheduled.size >= 7:
+        lines.extend([
+            "candidate after scale/F/T:",
+            f" xyz: {scheduled[0]:+.4f} {scheduled[1]:+.4f} {scheduled[2]:+.4f} m",
+            " rotvec: " + " ".join(f"{x:+.3f}" for x in scheduled[3:6]),
+            f" width: {scheduled[6]:+.4f} m",
+        ])
+    if predicted_force_n is not None or measured_force_n is not None:
+        force_text = "F/T grasp N: "
+        force_text += "pred=" + (
+            "n/a" if predicted_force_n is None else f"{predicted_force_n:+.3f}"
+        )
+        force_text += " meas=" + (
+            "n/a" if measured_force_n is None else f"{measured_force_n:+.3f}"
+        )
+        lines.append(force_text)
+    if width_correction_m is not None:
+        lines.append(f"F/T width correction: {width_correction_m * 1000.0:+.3f} mm")
+    return _render_text_panel(lines, width=width, height=height)
+
+
+def _render_fusion_attention_video_panel(
+    attention,
+    token_names: list[str],
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Small live query-to-key attention heatmap for comparison.mp4."""
+    panel = np.full((height, width, 3), (30, 30, 30), dtype=np.uint8)
+    cv2.putText(
+        panel, "5. live fusion attention (heads mean)", (6, 16),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel, "row=query, column=key; descriptive, not causal", (6, 32),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 200, 200), 1, cv2.LINE_AA,
+    )
+    names = [str(name).replace("camera0_", "").replace("robot0_", "") for name in token_names]
+    matrix = None if attention is None else np.asarray(attention, dtype=np.float64)
+    n_tokens = len(names)
+    if (
+        n_tokens == 0
+        or matrix is None
+        or matrix.shape != (n_tokens, n_tokens)
+        or not np.all(np.isfinite(matrix))
+    ):
+        cv2.putText(
+            panel, "attention: waiting / capture disabled", (10, 64),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 180, 255), 1, cv2.LINE_AA,
+        )
+        return panel
+
+    left, top = 96, 57
+    cell = min(72, max(38, (width - left - 8) // n_tokens), max(32, (height - top - 50) // n_tokens))
+    for idx, name in enumerate(names):
+        short_name = name.replace("_", " ")[:11]
+        cv2.putText(
+            panel, short_name, (left + idx * cell + 2, top - 7),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (230, 230, 230), 1, cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel, short_name, (4, top + idx * cell + cell // 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (230, 230, 230), 1, cv2.LINE_AA,
+        )
+    for query_idx in range(n_tokens):
+        for key_idx in range(n_tokens):
+            value = float(np.clip(matrix[query_idx, key_idx], 0.0, 1.0))
+            color = cv2.applyColorMap(
+                np.array([[int(round(value * 255.0))]], dtype=np.uint8),
+                cv2.COLORMAP_VIRIDIS,
+            )[0, 0].tolist()
+            x0, y0 = left + key_idx * cell, top + query_idx * cell
+            cv2.rectangle(panel, (x0, y0), (x0 + cell, y0 + cell), color, -1)
+            cv2.rectangle(panel, (x0, y0), (x0 + cell, y0 + cell), (235, 235, 235), 1)
+            cv2.putText(
+                panel, f"{value:.2f}", (x0 + 4, y0 + cell // 2 + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                (20, 20, 20) if value > 0.55 else (255, 255, 255),
+                1, cv2.LINE_AA,
+            )
+    key_mean = matrix.mean(axis=0)
+    cv2.putText(
+        panel,
+        "key mean: " + " ".join(
+            f"{name[:6]}={value:.2f}" for name, value in zip(names, key_mean)
+        ),
+        (6, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+        (200, 255, 200), 1, cv2.LINE_AA,
+    )
+    return panel
+
+
+def _render_eval_video_frame(
+    original_rgb,
+    current_bgr,
+    original_tcp6,
+    robot_tcp6,
+    live_tcp6,
+    *,
+    source_idx: int | None,
+    match_episode_id: int | None,
+    raw_action_h0=None,
+    decoded_action_h0=None,
+    scheduled_action_h0=None,
+    predicted_force_n: float | None = None,
+    measured_force_n: float | None = None,
+    width_correction_m: float | None = None,
+    fusion_attention=None,
+    fusion_attention_tokens: list[str] | None = None,
+):
+    """Video with matching images, coordinates, live output, and attention."""
     if original_rgb is None:
         left = np.full((_PANEL_H, _PANEL_W, 3), (20, 20, 20), dtype=np.uint8)
         left = _overlay_episode_text(left, "1. original video unavailable")
@@ -1822,7 +2140,92 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
     right = _render_text_panel(coord_lines)
 
     sep = np.full((_PANEL_H, 4, 3), (255, 255, 255), dtype=np.uint8)
-    return np.concatenate([left, sep, middle, sep, right], axis=1)
+    top_row = np.concatenate([left, sep, middle, sep, right], axis=1)
+
+    bottom_h = 250
+    output_w = top_row.shape[1] // 2 - 2
+    attention_w = top_row.shape[1] - output_w - 4
+    output_panel = _render_policy_output_video_panel(
+        raw_action_h0,
+        decoded_action_h0,
+        scheduled_action_h0,
+        predicted_force_n=predicted_force_n,
+        measured_force_n=measured_force_n,
+        width_correction_m=width_correction_m,
+        width=output_w,
+        height=bottom_h,
+    )
+    attention_panel = _render_fusion_attention_video_panel(
+        fusion_attention,
+        [] if fusion_attention_tokens is None else fusion_attention_tokens,
+        width=attention_w,
+        height=bottom_h,
+    )
+    horizontal_sep = np.full((4, top_row.shape[1], 3), (255, 255, 255), dtype=np.uint8)
+    bottom_sep = np.full((bottom_h, 4, 3), (255, 255, 255), dtype=np.uint8)
+    bottom_row = np.concatenate([output_panel, bottom_sep, attention_panel], axis=1)
+    return np.concatenate([top_row, horizontal_sep, bottom_row], axis=0)
+
+
+def _make_eval_comparison_frame(
+    obs,
+    match_debug_data,
+    source_idx: int | None,
+    *,
+    env: UmiEnv | None = None,
+    camera_idx: int = 0,
+    raw_action_h0=None,
+    decoded_action_h0=None,
+    scheduled_action_h0=None,
+    predicted_force_n: float | None = None,
+    measured_force_n: float | None = None,
+    width_correction_m: float | None = None,
+    fusion_attention=None,
+    fusion_attention_tokens: list[str] | None = None,
+):
+    """Build one fixed-size comparison-video frame from a live observation."""
+    original_rgb = None
+    original_tcp6 = None
+    robot_tcp6 = None
+    match_episode_id = None
+    if match_debug_data is not None:
+        n_src = len(match_debug_data["raw_pose6"])
+        if n_src > 0:
+            source_idx = int(np.clip(
+                0 if source_idx is None else source_idx, 0, n_src - 1
+            ))
+            original_tcp6 = match_debug_data["raw_pose6"][source_idx]
+            robot_tcp6 = match_debug_data["robot_pose6"][source_idx]
+            if match_debug_data.get("rgb") is not None:
+                original_rgb = match_debug_data["rgb"][source_idx]
+            match_episode_id = match_debug_data["episode"]
+        else:
+            source_idx = None
+    else:
+        source_idx = None
+    current_bgr = _policy_input_bgr_from_obs(obs)
+    if current_bgr is None and env is not None:
+        try:
+            current_bgr = _get_live_display_bgr(env, camera_idx=camera_idx)
+        except Exception as exc:
+            print(f"[eval_log] could not obtain live fallback video frame: {exc}")
+    return _render_eval_video_frame(
+        original_rgb,
+        current_bgr,
+        original_tcp6,
+        robot_tcp6,
+        _tcp6_from_obs(obs),
+        source_idx=source_idx,
+        match_episode_id=match_episode_id,
+        raw_action_h0=raw_action_h0,
+        decoded_action_h0=decoded_action_h0,
+        scheduled_action_h0=scheduled_action_h0,
+        predicted_force_n=predicted_force_n,
+        measured_force_n=measured_force_n,
+        width_correction_m=width_correction_m,
+        fusion_attention=fusion_attention,
+        fusion_attention_tokens=fusion_attention_tokens,
+    )
 
 
 @click.command()
@@ -2010,6 +2413,15 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
     ),
 )
 @click.option(
+    "--save_fusion_attention/--no_save_fusion_attention",
+    default=False,
+    show_default=True,
+    help=(
+        "Save the Dual-F/T fusion layer's per-head 4x4 self-attention to the "
+        "eval log. This is descriptive attention, not causal attribution."
+    ),
+)
+@click.option(
     "--coord_transform_audit",
     is_flag=True,
     default=False,
@@ -2096,7 +2508,7 @@ def main(input, output, robot_config,
     inpaint_aruco_tags, aruco_config, disable_eval_image_aug,
     mirror_swap, print_policy_output,
     pose_eval_audit, dataset_zarr, dataset_z_stride, print_model_input,
-    show_policy_image, policy_input_audit, coord_transform_audit,
+    show_policy_image, policy_input_audit, save_fusion_attention, coord_transform_audit,
     zero_ft_on_start, ft_zero_samples,
     print_motion_debug, vis_pose, max_policy_iters, plan_only,
     tcp_delta_scales, action_scale, freeze_rotation, match_g_move_robot,
@@ -2502,12 +2914,9 @@ def main(input, output, robot_config,
     )
     tcp_delta_scale_vec = _parse_tcp_delta_scales(tcp_delta_scales)
     if plan_only:
-        if max_policy_iters is None:
-            max_policy_iters = 1
         print(
             "plan_only: this script will not submit waypoints, but the robot "
-            "controller is still connected; running "
-            f"{max_policy_iters} inference cycle(s)."
+            "controller is still connected; running until stopped."
         )
     if max_policy_iters is not None:
         print("max_policy_iters:", max_policy_iters)
@@ -2666,11 +3075,30 @@ def main(input, output, robot_config,
                 startup_bias_12d = np.asarray(
                     startup_bias_result["bias_12d"], dtype=np.float64
                 )
-                env.set_ft_startup_bias(startup_bias_12d)
+                software_tare_offset_12d = np.asarray(
+                    env.rg2ft_ft_offset, dtype=np.float64
+                ).copy()
+                startup_residual_bias_12d = startup_residual_after_software_tare(
+                    startup_bias_12d, software_tare_offset_12d
+                )
+                # Training applies software tare first and removes only the
+                # remaining stationary episode bias.  The sampler above reads
+                # native raw wrenches, so convert it to that tared frame before
+                # giving it to UmiEnv.
+                env.set_ft_startup_bias(startup_residual_bias_12d)
                 calibration_record = {
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "coordinate_frame": "native left[6] + native right[6]",
+                    "calibration_order": (
+                        "raw native -> subtract software_tare_offset_12d -> "
+                        "subtract startup_residual_after_software_tare_12d"
+                    ),
                     "used_for": "this process only; never an offline episode bias",
+                    "software_tare_offset_12d": software_tare_offset_12d.tolist(),
+                    "raw_startup_bias_12d": startup_bias_12d.tolist(),
+                    "startup_residual_after_software_tare_12d": (
+                        startup_residual_bias_12d.tolist()
+                    ),
                     "config": vars(startup_bias_cfg),
                     **{
                         key: (value.tolist() if isinstance(value, np.ndarray) else value)
@@ -2684,8 +3112,12 @@ def main(input, output, robot_config,
                     json.dumps(calibration_record, indent=2), encoding="utf-8"
                 )
                 print(
-                    "F/T startup bias accepted:",
+                    "F/T raw startup baseline accepted:",
                     np.array2string(startup_bias_12d, precision=5),
+                )
+                print(
+                    "F/T residual after software tare applied to policy/feedback:",
+                    np.array2string(startup_residual_bias_12d, precision=5),
                 )
                 print("F/T calibration provenance:", calibration_path)
 
@@ -2796,6 +3228,27 @@ def main(input, output, robot_config,
                     "--device must be auto, cpu, cuda, or cuda:N; got "
                     f"{requested_device!r}"
                 )
+
+            fusion_attention_enabled = False
+            fusion_attention_tokens = []
+            if save_fusion_attention:
+                capture_attention = getattr(
+                    policy.obs_encoder, "set_fusion_attention_capture", None
+                )
+                token_names = getattr(policy.obs_encoder, "fusion_token_names", None)
+                if not dual_ft_enabled or not callable(capture_attention) or not callable(token_names):
+                    print(
+                        "[eval_log] fusion-attention capture unavailable for this "
+                        "checkpoint; F/T/output diagnostics remain enabled."
+                    )
+                else:
+                    capture_attention(True)
+                    fusion_attention_tokens = list(token_names())
+                    fusion_attention_enabled = True
+                    print(
+                        "[eval_log] fusion-attention capture enabled: "
+                        + ", ".join(fusion_attention_tokens)
+                    )
 
             print("Warming up policy inference")
             obs = env.get_obs()
@@ -3630,6 +4083,17 @@ def main(input, output, robot_config,
                 eval_csv_header_written = False
                 eval_video_writer = None
                 eval_log_dir = None
+                ft_input_csv_file = None
+                ft_input_csv_writer = None
+                policy_output_csv_file = None
+                policy_output_csv_writer = None
+                scheduled_action_csv_file = None
+                scheduled_action_csv_writer = None
+                fusion_attention_csv_file = None
+                fusion_attention_csv_writer = None
+                ft_timeline_rows = []
+                fusion_attention_sum = None
+                fusion_attention_count = 0
                 try:
                     # start episode
                     policy.reset()
@@ -3646,6 +4110,75 @@ def main(input, output, robot_config,
                     eval_log_dir.mkdir(parents=True, exist_ok=True)
                     eval_csv_file = open(eval_log_dir.joinpath('log.csv'), 'w', newline='')
                     eval_csv_writer = csv.writer(eval_csv_file)
+                    policy_output_csv_file = open(
+                        eval_log_dir.joinpath('policy_outputs.csv'), 'w', newline=''
+                    )
+                    policy_output_csv_writer = csv.writer(policy_output_csv_file)
+                    policy_output_csv_writer.writerow(
+                        ['iter_idx', 'wall_time', 'horizon_idx']
+                        + [f'raw_{name}' for name in _POSE10D_LABELS]
+                        + [
+                            'decoded_tcp_x_m', 'decoded_tcp_y_m', 'decoded_tcp_z_m',
+                            'decoded_tcp_rx_rad', 'decoded_tcp_ry_rad', 'decoded_tcp_rz_rad',
+                            'decoded_gripper_width_m',
+                        ]
+                    )
+                    scheduled_action_csv_file = open(
+                        eval_log_dir.joinpath('scheduled_actions.csv'), 'w', newline=''
+                    )
+                    scheduled_action_csv_writer = csv.writer(scheduled_action_csv_file)
+                    scheduled_action_csv_writer.writerow(
+                        [
+                            'iter_idx', 'wall_time', 'source_horizon_idx',
+                            'target_timestamp', 'will_send_to_robot',
+                            'sent_tcp_x_m', 'sent_tcp_y_m', 'sent_tcp_z_m',
+                            'sent_tcp_rx_rad', 'sent_tcp_ry_rad', 'sent_tcp_rz_rad',
+                            'sent_gripper_width_m', 'predicted_grasp_force_n',
+                        ]
+                    )
+                    if dual_ft_enabled:
+                        ft_input_csv_file = open(
+                            eval_log_dir.joinpath('input_ft_history.csv'), 'w', newline=''
+                        )
+                        ft_input_csv_writer = csv.writer(ft_input_csv_file)
+                        ft_input_csv_writer.writerow(
+                            [
+                                'iter_idx', 'wall_time', 'finger', 'sample_idx_oldest_to_latest',
+                                'is_latest_causal_sample', 'source_timestamp',
+                            ]
+                            + [f'physical_{name}_{unit}' for name, unit in zip(_FT_CHANNEL_LABELS, _FT_CHANNEL_UNITS)]
+                            + [f'normalized_{name}' for name in _FT_CHANNEL_LABELS]
+                        )
+                    if fusion_attention_enabled:
+                        fusion_attention_csv_file = open(
+                            eval_log_dir.joinpath('fusion_attention.csv'), 'w', newline=''
+                        )
+                        fusion_attention_csv_writer = csv.writer(fusion_attention_csv_file)
+                        fusion_attention_csv_writer.writerow(
+                            ['iter_idx', 'wall_time', 'head', 'query_token', 'key_token', 'weight']
+                        )
+                    diagnostic_manifest = {
+                        'format_version': 1,
+                        'video': 'comparison.mp4',
+                        'ft_input_history': 'input_ft_history.csv' if dual_ft_enabled else None,
+                        'ft_input_plot': 'input_ft_timeline.png' if dual_ft_enabled else None,
+                        'policy_outputs': 'policy_outputs.csv',
+                        'scheduled_actions': 'scheduled_actions.csv',
+                        'fusion_attention': (
+                            'fusion_attention.csv' if fusion_attention_enabled else None
+                        ),
+                        'fusion_attention_note': (
+                            'query-to-key self-attention, descriptive only; not causal attribution'
+                            if fusion_attention_enabled else None
+                        ),
+                        'checkpoint': str(input),
+                        'robot_config': str(robot_config),
+                        'plan_only': bool(plan_only),
+                        'action_scale': float(action_scale),
+                    }
+                    eval_log_dir.joinpath('diagnostic_manifest.json').write_text(
+                        json.dumps(diagnostic_manifest, indent=2), encoding='utf-8'
+                    )
                     print(f"[eval_log] logging to {eval_log_dir}")
                     match_debug_data = _load_match_episode_debug_data(
                         match_zarr_path,
@@ -3681,6 +4214,31 @@ def main(input, output, robot_config,
                         episode_start_pose_for_model = _apply_slam_frame_fix_to_start_pose(
                             episode_start_pose
                         )
+
+                    # Persist a frame before the first inference.  This makes
+                    # comparison.mp4 available even when waypoint safety rejects
+                    # the first model output before the regular end-of-loop video
+                    # logging is reached.
+                    initial_eval_frame = _make_eval_comparison_frame(
+                        obs,
+                        match_debug_data,
+                        source_idx=0,
+                        env=env,
+                        camera_idx=match_camera,
+                    )
+                    fh, fw = initial_eval_frame.shape[:2]
+                    eval_video_writer = cv2.VideoWriter(
+                        str(eval_log_dir.joinpath('comparison.mp4')),
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        max(1.0, 1.0 / dt),
+                        (fw, fh),
+                    )
+                    if eval_video_writer.isOpened():
+                        eval_video_writer.write(initial_eval_frame)
+                    else:
+                        print("[eval_log] could not open comparison.mp4 for writing")
+                        eval_video_writer.release()
+                        eval_video_writer = None
 
                     # wait for 1/30 sec to get the closest frame actually
                     # reduces overall latency
@@ -3782,6 +4340,7 @@ def main(input, output, robot_config,
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
                             raw_action = result["action_pred"][0].detach().to("cpu").numpy()
+                            raw_model_action = raw_action.copy()
                             expected_action_shape = (
                                 int(checkpoint_contract["action_horizon"]),
                                 int(checkpoint_contract["action_dim"]) * n_robots,
@@ -3828,6 +4387,85 @@ def main(input, output, robot_config,
                                 euler_extrinsic=policy_rot_ext,
                                 n_robots=n_robots,
                             )
+                            # These diagnostics are intentionally written before
+                            # motion safety validation. A rejected first waypoint
+                            # is exactly the case where its policy output and F/T
+                            # input are needed for debugging.
+                            fusion_attention_for_video = None
+                            try:
+                                diagnostic_wall_time = time.time()
+                                if ft_input_csv_writer is not None:
+                                    normalized_ft = _normalized_ft_policy_inputs(
+                                        policy, obs_dict
+                                    )
+                                    ft_histories = _write_ft_input_history(
+                                        ft_input_csv_writer,
+                                        iter_idx=iter_idx,
+                                        wall_time=diagnostic_wall_time,
+                                        obs=obs,
+                                        obs_dict_np=obs_dict_np,
+                                        normalized_ft=normalized_ft,
+                                    )
+                                    if ft_histories is not None:
+                                        ft_timeline_rows.append(
+                                            {
+                                                'iter_idx': int(iter_idx),
+                                                'wall_time': diagnostic_wall_time,
+                                                'left': ft_histories[0][-1].copy(),
+                                                'right': ft_histories[1][-1].copy(),
+                                            }
+                                        )
+                                    ft_input_csv_file.flush()
+                                if policy_output_csv_writer is not None:
+                                    for horizon_idx, (raw_row_full, decoded_row) in enumerate(
+                                        zip(raw_model_action, action)
+                                    ):
+                                        policy_output_csv_writer.writerow(
+                                            [iter_idx, diagnostic_wall_time, horizon_idx]
+                                            + np.asarray(raw_row_full, dtype=np.float64).ravel().tolist()
+                                            + np.asarray(decoded_row, dtype=np.float64).ravel().tolist()
+                                        )
+                                    policy_output_csv_file.flush()
+                                if fusion_attention_csv_writer is not None:
+                                    attention = getattr(
+                                        policy.obs_encoder, 'last_fusion_attention', None
+                                    )
+                                    attention = _tensor_to_numpy(attention)
+                                    if attention.ndim != 4 or attention.shape[0] < 1:
+                                        raise ValueError(
+                                            'captured fusion attention must be [B,heads,query,key], '
+                                            f'got {attention.shape}'
+                                        )
+                                    attention = np.asarray(attention[0], dtype=np.float64)
+                                    if attention.shape[1:] != (
+                                        len(fusion_attention_tokens),
+                                        len(fusion_attention_tokens),
+                                    ):
+                                        raise ValueError(
+                                            'captured fusion-attention token shape does not match '
+                                            f'{fusion_attention_tokens}: {attention.shape}'
+                                        )
+                                    for head_idx in range(attention.shape[0]):
+                                        for query_idx, query_name in enumerate(fusion_attention_tokens):
+                                            for key_idx, key_name in enumerate(fusion_attention_tokens):
+                                                fusion_attention_csv_writer.writerow(
+                                                    [
+                                                        iter_idx, diagnostic_wall_time, head_idx,
+                                                        query_name, key_name,
+                                                        float(attention[head_idx, query_idx, key_idx]),
+                                                    ]
+                                                )
+                                    batch_attention_sum = attention.sum(axis=0)
+                                    fusion_attention_for_video = attention.mean(axis=0)
+                                    fusion_attention_sum = (
+                                        batch_attention_sum
+                                        if fusion_attention_sum is None
+                                        else fusion_attention_sum + batch_attention_sum
+                                    )
+                                    fusion_attention_count += int(attention.shape[0])
+                                    fusion_attention_csv_file.flush()
+                            except Exception as exc:
+                                print(f"[eval_log] diagnostic capture failed at iter={iter_idx}: {exc}")
                             if (
                                 coord_transform_audit_enabled
                                 and not coord_transform_audit_printed
@@ -3872,6 +4510,7 @@ def main(input, output, robot_config,
                         # causes jumpy biased motion.
                         n_exec = min(int(steps_per_inference), len(action))
                         this_target_poses = action[:n_exec].copy()
+                        source_horizon_indices = np.arange(n_exec, dtype=np.int64)
                         this_force_reference = None
                         if predicted_force_reference is not None:
                             this_force_reference = predicted_force_reference[:n_exec].copy()
@@ -3899,6 +4538,7 @@ def main(input, output, robot_config,
                             this_target_poses = this_target_poses[[-1]]
                             if this_force_reference is not None:
                                 this_force_reference = this_force_reference[[-1]]
+                            source_horizon_indices = source_horizon_indices[[-1]]
                             action_timestamp = curr_time + action_exec_latency
                             print('Over budget', action_timestamp - curr_time)
                             action_timestamps = np.array([action_timestamp])
@@ -3906,6 +4546,7 @@ def main(input, output, robot_config,
                             this_target_poses = this_target_poses[is_new]
                             if this_force_reference is not None:
                                 this_force_reference = this_force_reference[is_new]
+                            source_horizon_indices = source_horizon_indices[is_new]
                             action_timestamps = action_timestamps[is_new]
 
                         if (
@@ -3937,15 +4578,6 @@ def main(input, output, robot_config,
                             )
                             corrected_left = latest_ft["left"]
                             corrected_right = latest_ft["right"]
-                            validate_ft_load(
-                                corrected_left,
-                                corrected_right,
-                                force_feedback_result["measured_force_n"],
-                                ft_safety_cfg,
-                                latest_sample_age_s=(
-                                    time.time() - latest_ft["timestamp"]
-                                ),
-                            )
                             this_target_poses[:, 6] = force_feedback_result[
                                 "corrected_width_m"
                             ]
@@ -3956,6 +4588,74 @@ def main(input, output, robot_config,
                                 f"{float(this_force_reference[0]):.3f} N "
                                 "width_correction="
                                 f"{float(force_feedback_result['width_correction_m'][0]) * 1000.0:.3f} mm"
+                            )
+
+                        # Record this iteration before either F/T or waypoint
+                        # safety validation.  A stopped run therefore contains
+                        # the exact candidate output and attention that caused it.
+                        eval_frame = None
+                        try:
+                            video_source_idx = None
+                            if match_debug_data is not None:
+                                elapsed_s = max(0.0, time.monotonic() - t_start)
+                                video_source_idx = int(round(
+                                    elapsed_s * float(match_debug_data["fps"])
+                                ))
+                            video_predicted_force = (
+                                None if this_force_reference is None
+                                else float(this_force_reference[0])
+                            )
+                            video_measured_force = (
+                                None if force_feedback_result is None
+                                else float(force_feedback_result["measured_force_n"])
+                            )
+                            video_width_correction = (
+                                None if force_feedback_result is None
+                                else float(force_feedback_result["width_correction_m"][0])
+                            )
+                            eval_frame = _make_eval_comparison_frame(
+                                obs,
+                                match_debug_data,
+                                source_idx=video_source_idx,
+                                env=env,
+                                camera_idx=match_camera,
+                                raw_action_h0=raw_model_action[0],
+                                decoded_action_h0=action[0],
+                                scheduled_action_h0=(
+                                    this_target_poses[0]
+                                    if len(this_target_poses) > 0 else None
+                                ),
+                                predicted_force_n=video_predicted_force,
+                                measured_force_n=video_measured_force,
+                                width_correction_m=video_width_correction,
+                                fusion_attention=fusion_attention_for_video,
+                                fusion_attention_tokens=fusion_attention_tokens,
+                            )
+                            if eval_video_writer is None:
+                                fh, fw = eval_frame.shape[:2]
+                                eval_video_writer = cv2.VideoWriter(
+                                    str(eval_log_dir.joinpath('comparison.mp4')),
+                                    cv2.VideoWriter_fourcc(*'mp4v'),
+                                    max(1.0, 1.0 / dt), (fw, fh),
+                                )
+                            if eval_video_writer.isOpened():
+                                eval_video_writer.write(eval_frame)
+                            else:
+                                print("[eval_log] could not open comparison.mp4 for writing")
+                                eval_video_writer.release()
+                                eval_video_writer = None
+                        except Exception as exc:
+                            print(f"[eval_log] failed to add output/attention video frame: {exc}")
+
+                        if force_feedback_result is not None:
+                            validate_ft_load(
+                                corrected_left,
+                                corrected_right,
+                                force_feedback_result["measured_force_n"],
+                                ft_safety_cfg,
+                                latest_sample_age_s=(
+                                    time.time() - latest_ft["timestamp"]
+                                ),
                             )
 
                         current_tcp6 = np.concatenate(
@@ -4011,6 +4711,25 @@ def main(input, output, robot_config,
                                 direct_gripper.width_min_m,
                                 direct_gripper.width_max_m,
                             )
+
+                        if scheduled_action_csv_writer is not None:
+                            scheduled_wall_time = time.time()
+                            for scheduled_idx, target_row in enumerate(this_target_poses):
+                                force_reference = float('nan')
+                                if this_force_reference is not None:
+                                    force_reference = float(this_force_reference[scheduled_idx])
+                                scheduled_action_csv_writer.writerow(
+                                    [
+                                        iter_idx,
+                                        scheduled_wall_time,
+                                        int(source_horizon_indices[scheduled_idx]),
+                                        float(action_timestamps[scheduled_idx]),
+                                        int(not plan_only),
+                                    ]
+                                    + np.asarray(target_row, dtype=np.float64).ravel().tolist()
+                                    + [force_reference]
+                                )
+                            scheduled_action_csv_file.flush()
 
                         # execute actions
                         if plan_only:
@@ -4083,44 +4802,6 @@ def main(input, output, robot_config,
                         )
                         eval_csv_file.flush()
 
-                        original_rgb = None
-                        original_tcp6 = None
-                        robot_tcp6 = None
-                        source_idx = None
-                        if match_debug_data is not None:
-                            elapsed_s = max(0.0, time.monotonic() - t_start)
-                            source_idx = int(round(elapsed_s * float(match_debug_data["fps"])))
-                            n_src = len(match_debug_data["raw_pose6"])
-                            source_idx = int(np.clip(source_idx, 0, max(0, n_src - 1)))
-                            original_tcp6 = match_debug_data["raw_pose6"][source_idx]
-                            robot_tcp6 = match_debug_data["robot_pose6"][source_idx]
-                            if match_debug_data.get("rgb") is not None:
-                                original_rgb = match_debug_data["rgb"][source_idx]
-                        current_bgr = _policy_input_bgr_from_obs(obs)
-                        if current_bgr is None:
-                            current_bgr = _get_live_display_bgr(
-                                env, camera_idx=match_camera
-                            )
-                        eval_frame = _render_eval_video_frame(
-                            original_rgb,
-                            current_bgr,
-                            original_tcp6,
-                            robot_tcp6,
-                            _tcp6_from_obs(obs),
-                            source_idx=source_idx,
-                            match_episode_id=(
-                                None if match_debug_data is None
-                                else match_debug_data["episode"]
-                            ),
-                        )
-                        if eval_video_writer is None:
-                            fh, fw = eval_frame.shape[:2]
-                            eval_video_writer = cv2.VideoWriter(
-                                str(eval_log_dir.joinpath('comparison.mp4')),
-                                cv2.VideoWriter_fourcc(*'mp4v'),
-                                max(1.0, 1.0 / dt), (fw, fh))
-                        eval_video_writer.write(eval_frame)
-
                         # visualize (full-res camera feed; obs rgb is masked 224x224 for policy)
                         episode_id = env.replay_buffer.n_episodes
                         vis_img = _get_live_display_bgr(env, camera_idx=match_camera)
@@ -4164,6 +4845,8 @@ def main(input, output, robot_config,
                                 f"policy input | t={time.monotonic() - t_start:.1f}s",
                                 match_rgb=match_policy_rgb,
                             )
+                            if eval_frame is not None:
+                                cv2.imshow("policy output + attention", eval_frame)
                         key = _poll_control_key(terminal_key_poller)
                         stop_episode = False
                         if key == ord("s"):
@@ -4211,9 +4894,76 @@ def main(input, output, robot_config,
                 finally:
                     if eval_csv_file is not None:
                         eval_csv_file.close()
+                    if ft_input_csv_file is not None:
+                        ft_input_csv_file.close()
+                    if policy_output_csv_file is not None:
+                        policy_output_csv_file.close()
+                    if scheduled_action_csv_file is not None:
+                        scheduled_action_csv_file.close()
+                    if fusion_attention_csv_file is not None:
+                        fusion_attention_csv_file.close()
                     if eval_video_writer is not None:
                         eval_video_writer.release()
                     if eval_log_dir is not None:
+                        saved_diagnostics = [
+                            'log.csv', 'policy_outputs.csv', 'scheduled_actions.csv'
+                        ]
+                        if eval_video_writer is not None:
+                            saved_diagnostics.append('comparison.mp4')
+                        if ft_input_csv_file is not None:
+                            saved_diagnostics.append('input_ft_history.csv')
+                            try:
+                                if _render_ft_input_timeline(
+                                    eval_log_dir.joinpath('input_ft_timeline.png'),
+                                    ft_timeline_rows,
+                                ):
+                                    saved_diagnostics.append('input_ft_timeline.png')
+                            except Exception as exc:
+                                print(f"[eval_log] failed to render F/T timeline: {exc}")
+                        if fusion_attention_count > 0 and fusion_attention_sum is not None:
+                            mean_attention = fusion_attention_sum / float(
+                                fusion_attention_count
+                            )
+                            received_attention = mean_attention.mean(axis=0)
+                            emitted_attention = mean_attention.mean(axis=1)
+                            attention_summary = {
+                                'kind': 'Dual-F/T fusion self-attention',
+                                'interpretation': (
+                                    'Rows are query tokens and columns are key tokens. '
+                                    'Attention is descriptive only and must not be treated as '
+                                    'causal action attribution.'
+                                ),
+                                'token_order': fusion_attention_tokens,
+                                'head_matrices_averaged': int(fusion_attention_count),
+                                'mean_query_to_key': mean_attention.tolist(),
+                                'mean_attention_received_by_key': {
+                                    name: float(value)
+                                    for name, value in zip(
+                                        fusion_attention_tokens, received_attention
+                                    )
+                                },
+                                'mean_attention_emitted_by_query': {
+                                    name: float(value)
+                                    for name, value in zip(
+                                        fusion_attention_tokens, emitted_attention
+                                    )
+                                },
+                            }
+                            try:
+                                eval_log_dir.joinpath('fusion_attention_summary.json').write_text(
+                                    json.dumps(attention_summary, indent=2), encoding='utf-8'
+                                )
+                                saved_diagnostics.extend(
+                                    ['fusion_attention.csv', 'fusion_attention_summary.json']
+                                )
+                                if _render_fusion_attention_heatmap(
+                                    eval_log_dir.joinpath('fusion_attention_mean.png'),
+                                    fusion_attention_tokens,
+                                    mean_attention,
+                                ):
+                                    saved_diagnostics.append('fusion_attention_mean.png')
+                            except Exception as exc:
+                                print(f"[eval_log] failed to render fusion attention: {exc}")
                         # chown to host user (uid/gid 1000), container runs as root
                         try:
                             for p in eval_log_dir.glob('*'):
@@ -4221,7 +4971,10 @@ def main(input, output, robot_config,
                             os.chown(eval_log_dir, 1000, 1000)
                         except Exception:
                             pass
-                        print(f"[eval_log] saved log.csv + comparison.mp4 to {eval_log_dir}")
+                        print(
+                            "[eval_log] saved " + ", ".join(saved_diagnostics)
+                            + f" to {eval_log_dir}"
+                        )
                     if 'runtime_metrics' in locals():
                         print("[dual-F/T runtime summary]")
                         print(

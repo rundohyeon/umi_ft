@@ -35,7 +35,7 @@ from umi.real_world.rg2ft_obs import (
     causal_ft_history_from_streams,
     compute_ft_tare_offset,
 )
-from umi.real_world.rg2ft_startup_bias import subtract_startup_bias
+from umi.real_world.rg2ft_startup_bias import correct_native_wrenches
 
 
 def _camera_capture_profile(dev_path: str):
@@ -708,10 +708,27 @@ class UmiEnv:
 
     # ========= async env API ===========
     def set_ft_startup_bias(self, bias_12d):
+        """Set the small stationary bias measured *after* software tare.
+
+        ``rg2ft_ft_offset`` stores the collection-matching software tare.
+        This value is the residual in that already-tared sensor frame, not a
+        second raw-sensor baseline.
+        """
         bias = np.asarray(bias_12d, dtype=np.float64)
         if bias.shape != (12,) or np.any(~np.isfinite(bias)):
             raise ValueError("live F/T startup bias must be a finite [12] vector")
         self.ft_startup_bias_12d = bias.copy()
+
+    def _correct_native_ft(self, left_wrenches, right_wrenches):
+        """Match training F/T preprocessing for policy, feedback, and safety."""
+        if self.ft_startup_bias_12d is None:
+            raise RuntimeError("native F/T correction requested before startup bias calibration")
+        return correct_native_wrenches(
+            left_wrenches,
+            right_wrenches,
+            software_tare_offset_12d=self.rg2ft_ft_offset,
+            startup_residual_bias_12d=self.ft_startup_bias_12d,
+        )
 
     def hold_robot(self):
         """Cancel pending robot/gripper waypoints and hold measured targets."""
@@ -730,12 +747,12 @@ class UmiEnv:
         state = self.gripper.get_state()
         left_raw = np.asarray(state['gripper_ft_left'], dtype=np.float64).reshape(6)
         right_raw = np.asarray(state['gripper_ft_right'], dtype=np.float64).reshape(6)
-        left, right = subtract_startup_bias(
-            left_raw[None], right_raw[None], self.ft_startup_bias_12d
-        )
+        left, right = self._correct_native_ft(left_raw[None], right_raw[None])
         return {
             'left_raw': left_raw,
             'right_raw': right_raw,
+            'left_after_software_tare': left_raw - self.rg2ft_ft_offset[:6],
+            'right_after_software_tare': right_raw - self.rg2ft_ft_offset[6:],
             'left': left[0],
             'right': right[0],
             'timestamp': float(state['gripper_timestamp']),
@@ -792,6 +809,8 @@ class UmiEnv:
                 np.asarray(last_gripper_data['gripper_ft'], dtype=np.float64)
                 - self.rg2ft_ft_offset
             )
+            if self.ft_startup_bias_12d is not None:
+                tared_gripper_ft = tared_gripper_ft - self.ft_startup_bias_12d
 
         last_timestamp = self.last_camera_data[self.align_camera_idx]['timestamp'][-1]
         dt = 1 / self.frequency
@@ -869,29 +888,27 @@ class UmiEnv:
             # side-specific streams currently share this wall-clock timestamp.
             # The assembler nevertheless samples them independently, matching
             # the training dataset's two causal lookups.
-            causal_raw = causal_ft_history_from_streams(
+            causal_native = causal_ft_history_from_streams(
                 last_gripper_data['gripper_timestamp'],
-                np.asarray(last_gripper_data['gripper_ft_left'])
-                - self.rg2ft_ft_offset[:6],
+                np.asarray(last_gripper_data['gripper_ft_left']),
                 last_gripper_data['gripper_timestamp'],
-                np.asarray(last_gripper_data['gripper_ft_right'])
-                - self.rg2ft_ft_offset[6:],
+                np.asarray(last_gripper_data['gripper_ft_right']),
                 anchor_timestamp=last_timestamp,
                 num_steps=self.ft_obs_horizon,
                 stride=self.ft_obs_stride,
                 frequency=self.ft_obs_frequency,
                 max_age=self.ft_max_age,
             )
-            corrected_left, corrected_right = subtract_startup_bias(
-                causal_raw['robot0_ft_left'],
-                causal_raw['robot0_ft_right'],
-                self.ft_startup_bias_12d,
+            corrected_left, corrected_right = self._correct_native_ft(
+                causal_native['robot0_ft_left'],
+                causal_native['robot0_ft_right'],
             )
-            causal = dict(causal_raw)
+            causal = dict(causal_native)
             causal['robot0_ft_left'] = corrected_left.astype(np.float32)
             causal['robot0_ft_right'] = corrected_right.astype(np.float32)
-            causal['robot0_ft_left_raw'] = causal_raw['robot0_ft_left'].copy()
-            causal['robot0_ft_right_raw'] = causal_raw['robot0_ft_right'].copy()
+            causal['robot0_ft_left_raw'] = causal_native['robot0_ft_left'].copy()
+            causal['robot0_ft_right_raw'] = causal_native['robot0_ft_right'].copy()
+            causal['robot0_ft_software_tare_offset'] = self.rg2ft_ft_offset.copy()
             causal['robot0_ft_startup_bias'] = self.ft_startup_bias_12d.copy()
             latest_left_raw = np.asarray(
                 last_gripper_data['gripper_ft_left'][-1], dtype=np.float64
@@ -899,10 +916,8 @@ class UmiEnv:
             latest_right_raw = np.asarray(
                 last_gripper_data['gripper_ft_right'][-1], dtype=np.float64
             )
-            latest_left, latest_right = subtract_startup_bias(
-                latest_left_raw[None],
-                latest_right_raw[None],
-                self.ft_startup_bias_12d,
+            latest_left, latest_right = self._correct_native_ft(
+                latest_left_raw[None], latest_right_raw[None]
             )
             causal['robot0_ft_left_latest_raw'] = latest_left_raw
             causal['robot0_ft_right_latest_raw'] = latest_right_raw

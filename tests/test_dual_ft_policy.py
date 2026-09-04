@@ -197,6 +197,27 @@ def test_dual_ft_forward_backward_uses_independent_encoders():
     assert next(encoder.right_ft_encoder.parameters()).grad.abs().sum() > 0
 
 
+def test_dual_ft_attention_capture_preserves_fusion_output():
+    """Eval-only attention logging must not change the policy feature."""
+    torch.manual_seed(0)
+    encoder = _dual_encoder(_shape_meta()).eval()
+    obs = _obs(batch_size=2)
+    with torch.no_grad():
+        expected = encoder(obs)
+        encoder.set_fusion_attention_capture(True)
+        actual = encoder(obs)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    attention = encoder.last_fusion_attention
+    assert attention is not None
+    assert attention.shape == (2, 8, 4, 4)
+    torch.testing.assert_close(
+        attention.sum(dim=-1),
+        torch.ones((2, 8, 4), dtype=attention.dtype),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 def test_one_batch_train_step_and_checkpoint_reload():
     torch.manual_seed(0)
     shape_meta = _shape_meta()

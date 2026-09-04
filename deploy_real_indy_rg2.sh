@@ -18,9 +18,10 @@ fi
 CHECKPOINT="${RG2_CHECKPOINT:-$ROOT/umi_18.45.44_latest.ckpt}"
 OUTPUT_DIR="${EVAL_OUTPUT_DIR:-$ROOT/data/eval_indy_rg2}"
 ROBOT_CONFIG="${RG2_ROBOT_CONFIG:-$ROOT/example/eval_robots_config_indy_rg2.yaml}"
-MATCH_DATASET="${MATCH_DATASET:-$ROOT/data/dataset.zarr.zip}"
+MATCH_DATASET="${MATCH_DATASET:-$ROOT/data/dataset_ft.zarr.zip}"
 MATCH_EPISODE="${MATCH_EPISODE:-0}"
 ACTION_SCALE="${ACTION_SCALE:-0.2}"
+RG2_SAVE_FUSION_ATTENTION="${RG2_SAVE_FUSION_ATTENTION:-1}"
 
 if [[ "$PYTHON_BIN" == */* ]]; then
   if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -43,13 +44,28 @@ done
 mkdir -p "$(dirname -- "$OUTPUT_DIR")"
 
 RG2_ENABLE_MOTION="${RG2_ENABLE_MOTION:-1}"
-SAFETY_ARGS=(--plan_only --print_motion_debug --max_policy_iters 1)
+SAFETY_ARGS=(--plan_only --print_motion_debug)
 if [[ "$RG2_ENABLE_MOTION" == "1" ]]; then
   SAFETY_ARGS=()
   echo "Motion default: robot and RG2-FT motion are enabled."
 else
   echo "RG2_ENABLE_MOTION=$RG2_ENABLE_MOTION: plan-only; RG2-FT connects read-only and receives no width command."
 fi
+
+DIAGNOSTIC_ARGS=()
+case "${RG2_SAVE_FUSION_ATTENTION,,}" in
+  1|true|yes|on)
+    DIAGNOSTIC_ARGS+=(--save_fusion_attention)
+    echo "Eval diagnostics: F/T input, full policy outputs, comparison video, and fusion attention will be logged."
+    ;;
+  0|false|no|off)
+    echo "Eval diagnostics: F/T input, full policy outputs, and comparison video will be logged (fusion attention disabled)."
+    ;;
+  *)
+    echo "RG2_SAVE_FUSION_ATTENTION must be 0/1 or true/false, got: $RG2_SAVE_FUSION_ATTENTION" >&2
+    exit 2
+    ;;
+esac
 
 exec "$PYTHON_BIN" "$ROOT/eval_real_indy_rg2.py" \
   --input "$CHECKPOINT" \
@@ -60,5 +76,6 @@ exec "$PYTHON_BIN" "$ROOT/eval_real_indy_rg2.py" \
   --allow_rotation \
   --action_scale "$ACTION_SCALE" \
   --vis_pose \
+  "${DIAGNOSTIC_ARGS[@]}" \
   "${SAFETY_ARGS[@]}" \
   "$@"

@@ -3,7 +3,9 @@ import pytest
 
 from umi.real_world.rg2ft_startup_bias import (
     FTStartupBiasConfig,
+    correct_native_wrenches,
     estimate_startup_bias,
+    startup_residual_after_software_tare,
     subtract_startup_bias,
 )
 
@@ -35,3 +37,34 @@ def test_estimate_startup_bias_rejects_duplicate_timestamps_and_contact_motion()
     samples[:, 0] = [0, 0, 0, 0, 5]
     with pytest.raises(ValueError, match="startup bias rejected"):
         estimate_startup_bias(np.arange(5), samples[:, :6], samples[:, 6:], cfg)
+
+
+def test_software_tare_and_startup_residual_match_training_calibration_order():
+    # Mimic the large fixed native offsets recorded during collection and the
+    # small residual per-episode bias removed from the training sidecar.
+    software_tare = np.asarray(
+        [5.8, 2.6, 146.7, 0.36, 0.11, 0.07, 1.6, -5.3, -137.2, 0.43, 0.27, -0.12],
+        dtype=np.float64,
+    )
+    residual = np.asarray(
+        [0.02, -0.01, 0.03, 0.001, 0.0, -0.002, -0.03, 0.02, -0.04, 0.002, 0.0, 0.001],
+        dtype=np.float64,
+    )
+    raw_startup_baseline = software_tare + residual
+    inferred_residual = startup_residual_after_software_tare(
+        raw_startup_baseline, software_tare
+    )
+    np.testing.assert_allclose(inferred_residual, residual)
+
+    signal = np.asarray(
+        [[0.08, 0.01, -0.04, 0.002, 0.0, 0.001, -0.05, 0.03, 0.12, -0.001, 0.0, 0.002]],
+        dtype=np.float64,
+    )
+    raw = raw_startup_baseline[None] + signal
+    left, right = correct_native_wrenches(
+        raw[:, :6],
+        raw[:, 6:],
+        software_tare_offset_12d=software_tare,
+        startup_residual_bias_12d=inferred_residual,
+    )
+    np.testing.assert_allclose(np.concatenate([left, right], axis=1), signal)

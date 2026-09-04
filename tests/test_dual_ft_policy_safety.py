@@ -34,6 +34,18 @@ def test_policy_waypoint_guard_checks_every_consecutive_delta():
         validate_policy_waypoints(invalid, current, 0.04, _motion_cfg())
 
 
+def test_default_motion_guard_allows_a_fifteen_mm_gripper_step():
+    current = np.zeros(6)
+    target = np.asarray([[0, 0, 0, 0, 0, 0, 0.015]])
+    np.testing.assert_array_equal(
+        validate_policy_waypoints(target, current, 0.0, PolicyMotionSafetyConfig()),
+        target,
+    )
+    target[0, 6] = 0.01501
+    with pytest.raises(PolicySafetyError, match="gripper delta"):
+        validate_policy_waypoints(target, current, 0.0, PolicyMotionSafetyConfig())
+
+
 def test_ft_guard_is_fail_closed_for_force_torque_and_grasp_load():
     cfg = FTSafetyConfig(10.0, 1.0, 5.0, 0.05)
     validate_ft_load(

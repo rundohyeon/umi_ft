@@ -210,6 +210,11 @@ class DualFTObsEncoder(ModuleAttrMixin):
             self.num_fusion_tokens * self.fusion_dim,
             self.fusion_dim,
         )
+        # Disabled unless the real-robot evaluator explicitly requests a
+        # diagnostic capture.  Keeping this state out of the checkpoint makes
+        # it impossible for an eval-only switch to alter training behavior.
+        self.capture_fusion_attention = False
+        self.last_fusion_attention = None
 
         self.low_dim_output_dim = sum(
             int(attr["horizon"]) * int(torch.tensor(attr["shape"]).prod())
@@ -262,6 +267,68 @@ class DualFTObsEncoder(ModuleAttrMixin):
             )
         return torch.cat(features, dim=-1)
 
+    def set_fusion_attention_capture(self, enabled: bool) -> None:
+        """Capture per-head fusion self-attention during the next forward pass.
+
+        The returned attention is descriptive only: it is the 4-token fusion
+        layer's query-to-key weight matrix, not a causal action attribution.
+        """
+        self.capture_fusion_attention = bool(enabled)
+        self.last_fusion_attention = None
+
+    def fusion_token_names(self) -> list[str]:
+        """Stable labels for the query/key axes of ``last_fusion_attention``."""
+        names = []
+        for key in self.vision_pose_encoder.rgb_keys:
+            horizon = int(self.shape_meta["obs"][key]["horizon"])
+            names.extend(f"{key}[t={idx}]" for idx in range(horizon))
+        names.extend([self.left_ft_key, self.right_ft_key])
+        if len(names) != self.num_fusion_tokens:
+            raise AssertionError(
+                f"fusion token labels {len(names)} != {self.num_fusion_tokens}"
+            )
+        return names
+
+    def _fuse_tokens(self, tokens):
+        """Run the fusion layer, optionally retaining its exact attention map."""
+        src = tokens + self.position_embedding.unsqueeze(0)
+        if not self.capture_fusion_attention:
+            return self.fusion(src)
+
+        # TransformerEncoderLayer normally calls MultiheadAttention with
+        # need_weights=False. Reproduce that layer's forward exactly while
+        # requesting its [B, heads, query, key] weights for eval diagnostics.
+        # There is no mask/cross-attention in this fixed four-token fusion.
+        fusion = self.fusion
+        if fusion.norm_first:
+            attn_src = fusion.norm1(src)
+            attn_out, attn_weights = fusion.self_attn(
+                attn_src,
+                attn_src,
+                attn_src,
+                need_weights=True,
+                average_attn_weights=False,
+                is_causal=False,
+            )
+            fused = src + fusion.dropout1(attn_out)
+            fused = fused + fusion._ff_block(fusion.norm2(fused))
+        else:
+            attn_out, attn_weights = fusion.self_attn(
+                src,
+                src,
+                src,
+                need_weights=True,
+                average_attn_weights=False,
+                is_causal=False,
+            )
+            fused = fusion.norm1(src + fusion.dropout1(attn_out))
+            fused = fusion.norm2(fused + fusion._ff_block(fused))
+
+        self.last_fusion_attention = attn_weights.detach().to(
+            device="cpu", dtype=torch.float32
+        )
+        return fused
+
     def forward(self, obs_dict):
         visual = self._visual_tokens(obs_dict)
         left = self.left_ft_encoder(obs_dict[self.left_ft_key]).unsqueeze(1)
@@ -273,7 +340,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
                 f"unexpected fusion token count {tokens.shape[1]} != "
                 f"{self.num_fusion_tokens}"
             )
-        fused = self.fusion(tokens + self.position_embedding.unsqueeze(0))
+        fused = self._fuse_tokens(tokens)
         fused_feature = self.fusion_projection(fused.reshape(batch_size, -1))
         return torch.cat([fused_feature, self._low_dim_features(obs_dict)], dim=-1)
 
