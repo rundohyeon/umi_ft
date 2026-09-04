@@ -16,7 +16,7 @@ class PolicySafetyError(RuntimeError):
 class PolicyMotionSafetyConfig:
     max_position_delta_m: float = 0.015
     max_rotation_delta_rad: float = 0.10
-    max_gripper_delta_m: float = 0.012
+    max_gripper_delta_m: float = 0.015
     min_tcp_z_m: float = -0.024
     exclusion_sphere_radius_m: float = 0.1
     exclusion_sphere_center_m: tuple = (0.0, -0.06, -0.185)
@@ -140,7 +140,8 @@ def validate_policy_waypoints(targets, current_tcp6, current_width_m, config):
         if width_delta > cfg.max_gripper_delta_m:
             raise PolicySafetyError(
                 f"waypoint[{idx}] gripper delta {width_delta:.5f} m > "
-                f"{cfg.max_gripper_delta_m:.5f} m"
+                f"{cfg.max_gripper_delta_m:.5f} m "
+                f"(current={previous[6]:.5f} m, target={target[6]:.5f} m)"
             )
         if float(target[2]) < cfg.min_tcp_z_m:
             raise PolicySafetyError(

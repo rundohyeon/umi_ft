@@ -136,6 +136,13 @@ class MultiUvcCamera:
             out[i] = this_out
         return out
 
+    def get_all(self) -> Dict[int, Dict[str, np.ndarray]]:
+        """Return each camera's currently retained ring-buffer history."""
+        return {
+            i: camera.get_all()
+            for i, camera in enumerate(self.cameras.values())
+        }
+
     def get_vis(self, out=None):
         results = list()
         for i, camera in enumerate(self.cameras.values()):

@@ -13,7 +13,7 @@ prediction_horizon: ${task.action_horizon}
 execution:
   action_frequency: ${task.action_frequency}
   n_action_steps: 2
-  allowed_n_action_steps: [1, 2, 4, 8]
+  allowed_n_action_steps: [1, 2, 4, 6, 8]
   replanning_interval_ms: ${eval:'1000.0 * ${execution.n_action_steps} / ${execution.action_frequency}'}
 n_action_steps: ${execution.n_action_steps}
 

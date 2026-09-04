@@ -51,12 +51,15 @@ Press "S" to stop evaluation and gain control back.
 # %%
 import csv
 import atexit
+import collections
+import hashlib
 import json
 import os
 import pathlib
 import select
 import sys
 import termios
+import threading
 import time
 import tty
 from contextlib import nullcontext
@@ -94,6 +97,10 @@ from umi.real_world.real_inference_util import (
 )
 from umi.real_world.umi_env import UmiEnv
 from umi.real_world.rg2ft_obs import prepare_rg2ft_policy_obs
+from umi.real_world.valve_state_context import (
+    ValveStateContextRuntime,
+    sha256_file as _sha256_file,
+)
 from umi.real_world.grasp_force_width_feedback import (
     GraspForceWidthFeedbackConfig,
     GraspForceWidthFeedbackController,
@@ -101,6 +108,7 @@ from umi.real_world.grasp_force_width_feedback import (
 from umi.real_world.rg2ft_startup_bias import (
     FTStartupBiasConfig,
     acquire_startup_bias,
+    startup_residual_after_software_tare,
 )
 from umi.real_world.dual_ft_policy_safety import (
     FTSafetyConfig,
@@ -121,6 +129,9 @@ _DEFAULT_SIM_FOV = None
 _DEFAULT_CAMERA_INTRINSICS = str(
     _PROJECT_ROOT.joinpath(
         "gopro13_1080p_calib_export", "gopro13_1920x1080.yaml")
+)
+_DEFAULT_VALVE_CLASSIFIER_CHECKPOINT = str(
+    _PROJECT_ROOT / "valve_state_classifier_v4" / "model" / "final.pt"
 )
 _SYNTHETIC_GRIPPER_WIDTH = np.float32(0.05651384)
 _DEFAULT_GRIPPER_CALIB_ZARR = str(
@@ -641,6 +652,723 @@ def _policy_input_rgb_from_obs(obs) -> np.ndarray | None:
     return _rgb_uint8_from_any(img)
 
 
+class _ValveContextInputCapture:
+    """Persist the exact frozen-classifier input stream for later inspection.
+
+    Images are lossless PNG copies of the final 224x224 RGB image passed to
+    the classifier.  F/T is stored once at its native 100 Hz rate rather than
+    duplicating a 50-sample window for every RGB row.  ``context_frames.csv``
+    joins each image to the latest preceding wrench timestamp and to the TCP
+    low-dimensional values consumed by the classifier.
+
+    The HDMI/Elgato capture path has no physical IMU telemetry.  It is
+    deliberately recorded as unavailable instead of emitting fake zeros: the
+    classifier uses robot TCP position/axis-angle, not an IMU.
+    """
+
+    def __init__(self, root: pathlib.Path, *, episode_start_timestamp_s: float):
+        self.root = pathlib.Path(root)
+        self.image_dir = self.root.joinpath("images")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.image_dir.mkdir(parents=True, exist_ok=True)
+        self.episode_start_timestamp_s = float(episode_start_timestamp_s)
+        self._last_wrench_timestamp = -np.inf
+        self._frame_idx = 0
+        self._wrench_idx = 0
+        self._closed = False
+
+        self._frame_file = open(self.root.joinpath("context_frames.csv"), "w", newline="")
+        self._frame_writer = csv.writer(self._frame_file)
+        self._frame_writer.writerow(
+            [
+                "frame_idx", "rgb_timestamp_s", "image_file",
+                "latest_wrench_timestamp_s",
+                "tcp_x_m", "tcp_y_m", "tcp_z_m",
+                "tcp_rotvec_x_rad", "tcp_rotvec_y_rad", "tcp_rotvec_z_rad",
+                "gripper_width_m",
+                "phase", "error_reason", "warmed_up",
+                "phase_approach", "phase_turning", "phase_endpoint_reached",
+                "phase_task_complete", "phase_error", "reason_none",
+                "reason_turn_no_contact", "reason_post_contact_drop", "reason_other",
+            ]
+        )
+
+        self._wrench_file = open(self.root.joinpath("context_wrenches.csv"), "w", newline="")
+        self._wrench_writer = csv.writer(self._wrench_file)
+        self._wrench_writer.writerow(
+            ["wrench_idx", "timestamp_s"]
+            + [f"left_{name}_{unit}" for name, unit in zip(_FT_CHANNEL_LABELS, _FT_CHANNEL_UNITS)]
+            + [f"right_{name}_{unit}" for name, unit in zip(_FT_CHANNEL_LABELS, _FT_CHANNEL_UNITS)]
+        )
+
+        self._imu_file = open(self.root.joinpath("context_imu.csv"), "w", newline="")
+        self._imu_writer = csv.writer(self._imu_file)
+        self._imu_writer.writerow(
+            [
+                "frame_idx", "rgb_timestamp_s", "imu_available", "imu_source",
+                "imu_timestamp_s", "accel_x_m_s2", "accel_y_m_s2", "accel_z_m_s2",
+                "gyro_x_rad_s", "gyro_y_rad_s", "gyro_z_rad_s",
+            ]
+        )
+
+        self.root.joinpath("capture_manifest.json").write_text(
+            json.dumps(
+                {
+                    "format_version": 1,
+                    "image_encoding": "lossless PNG; RGB pixels exactly passed to classifier",
+                    "image_resolution": [224, 224, 3],
+                    "frame_csv": "context_frames.csv",
+                    "wrench_csv": "context_wrenches.csv",
+                    "wrench_contract": (
+                        "startup-bias-corrected native left[Fx,Fy,Fz,Tx,Ty,Tz] + "
+                        "right[Fx,Fy,Fz,Tx,Ty,Tz], N/Nm; no external scaling"
+                    ),
+                    "imu_csv": "context_imu.csv",
+                    "physical_imu_available": False,
+                    "physical_imu_note": (
+                        "The live HDMI/Elgato camera pipeline carries no IMU. "
+                        "The classifier instead consumes TCP position, raw axis-angle "
+                        "rotation, and gripper width in context_frames.csv."
+                    ),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    @property
+    def frame_count(self) -> int:
+        return self._frame_idx
+
+    @property
+    def wrench_count(self) -> int:
+        return self._wrench_idx
+
+    def append_wrenches(
+        self,
+        timestamps,
+        left_wrenches,
+        right_wrenches,
+        *,
+        anchor_timestamp_s: float,
+    ) -> float | None:
+        """Record only new causal samples, matching runtime append semantics."""
+        timestamps = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+        left_wrenches = np.asarray(left_wrenches, dtype=np.float32)
+        right_wrenches = np.asarray(right_wrenches, dtype=np.float32)
+        if left_wrenches.shape != (len(timestamps), 6) or right_wrenches.shape != (
+            len(timestamps), 6
+        ):
+            raise ValueError("context capture F/T requires matching [N,6] arrays")
+        if not np.isfinite(timestamps).all() or not np.isfinite(left_wrenches).all() or not np.isfinite(right_wrenches).all():
+            raise ValueError("context capture F/T contains NaN or Inf")
+        if np.any(np.diff(timestamps) < 0.0):
+            raise ValueError("context capture F/T timestamps must be sorted")
+        if np.any(timestamps > float(anchor_timestamp_s) + 1e-6):
+            raise ValueError("context capture received F/T newer than its RGB anchor")
+
+        for timestamp_s, left, right in zip(timestamps, left_wrenches, right_wrenches):
+            if timestamp_s < self.episode_start_timestamp_s:
+                continue
+            if timestamp_s <= self._last_wrench_timestamp:
+                continue
+            self._wrench_writer.writerow(
+                [self._wrench_idx, float(timestamp_s)]
+                + np.asarray(left, dtype=np.float64).tolist()
+                + np.asarray(right, dtype=np.float64).tolist()
+            )
+            self._wrench_idx += 1
+            self._last_wrench_timestamp = float(timestamp_s)
+        return (
+            float(self._last_wrench_timestamp)
+            if np.isfinite(self._last_wrench_timestamp)
+            else None
+        )
+
+    def append_frame(
+        self,
+        *,
+        timestamp_s: float,
+        rgb: np.ndarray,
+        position_m: np.ndarray,
+        rotation_axis_angle_rad: np.ndarray,
+        gripper_width_m: float,
+        latest_wrench_timestamp_s: float | None,
+        context_record,
+    ) -> None:
+        rgb = _rgb_uint8_from_any(rgb)
+        if rgb.shape != (224, 224, 3):
+            raise ValueError(f"context capture RGB must be [224,224,3], got {rgb.shape}")
+        position_m = np.asarray(position_m, dtype=np.float64).reshape(3)
+        rotation_axis_angle_rad = np.asarray(
+            rotation_axis_angle_rad, dtype=np.float64
+        ).reshape(3)
+        if not np.isfinite(position_m).all() or not np.isfinite(rotation_axis_angle_rad).all():
+            raise ValueError("context capture TCP input contains NaN or Inf")
+        if not np.isfinite(gripper_width_m):
+            raise ValueError("context capture gripper width is not finite")
+        if not np.isclose(float(context_record.timestamp_s), float(timestamp_s), atol=1e-6):
+            raise ValueError("context capture record timestamp does not match RGB timestamp")
+
+        image_relpath = pathlib.Path("images").joinpath(
+            f"frame_{self._frame_idx:08d}.png"
+        )
+        image_path = self.root.joinpath(image_relpath)
+        if not cv2.imwrite(
+            str(image_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        ):
+            raise RuntimeError(f"failed to save lossless context image: {image_path}")
+        values = np.asarray(context_record.values, dtype=np.float64).reshape(10)
+        self._frame_writer.writerow(
+            [
+                self._frame_idx,
+                float(timestamp_s),
+                str(image_relpath),
+                "" if latest_wrench_timestamp_s is None else float(latest_wrench_timestamp_s),
+                *position_m.tolist(),
+                *rotation_axis_angle_rad.tolist(),
+                float(gripper_width_m),
+                context_record.phase_name,
+                context_record.error_reason_name,
+                int(context_record.warmed_up),
+                *values[:9].tolist(),
+            ]
+        )
+        # Explicitly mark physical IMU absence.  Empty fields are intentional,
+        # never substitute zeros for an unobserved sensor.
+        self._imu_writer.writerow(
+            [
+                self._frame_idx,
+                float(timestamp_s),
+                0,
+                "not_available_over_hdmi_elgato",
+                "", "", "", "", "", "", "",
+            ]
+        )
+        self._frame_idx += 1
+
+    def flush(self) -> None:
+        self._frame_file.flush()
+        self._wrench_file.flush()
+        self._imu_file.flush()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.flush()
+        self._frame_file.close()
+        self._wrench_file.close()
+        self._imu_file.close()
+        self._closed = True
+
+
+class _ValveContextWorker:
+    """Own the stateful frozen classifier at camera rate, off the policy loop.
+
+    The diffusion policy replans at about 20 Hz but the frozen context model
+    was trained on every camera observation.  This worker polls an independent
+    long camera history, replays each previously unseen frame in timestamp
+    order, and retains a short timestamp-indexed record cache.  The policy
+    thread waits only for the record with its exact RGB anchor and never feeds
+    a newer context value into an older policy image.
+    """
+
+    def __init__(
+        self,
+        runtime: ValveStateContextRuntime,
+        stream_provider,
+        *,
+        input_capture: _ValveContextInputCapture | None = None,
+        poll_hz: float = 60.0,
+        max_cached_records: int = 256,
+        history_frames: int = 120,
+        initial_history_frames: int = 1,
+        anchor_recovery_history_frames: int = 32,
+    ):
+        if not np.isfinite(poll_hz) or poll_hz <= 0.0:
+            raise ValueError("context worker poll_hz must be positive")
+        if int(max_cached_records) < 2:
+            raise ValueError("context worker needs at least two cached records")
+        if int(history_frames) < 2:
+            raise ValueError("context worker recovery needs at least two frames")
+        if not 1 <= int(initial_history_frames) <= int(history_frames):
+            raise ValueError("initial context history must be within worker history")
+        if not 1 <= int(anchor_recovery_history_frames) <= int(history_frames):
+            raise ValueError("anchor recovery history must be within worker history")
+        self.runtime = runtime
+        self.stream_provider = stream_provider
+        self.input_capture = input_capture
+        self.poll_period_s = 1.0 / float(poll_hz)
+        self.max_cached_records = int(max_cached_records)
+        self.history_frames = int(history_frames)
+        self.initial_history_frames = int(initial_history_frames)
+        self.anchor_recovery_history_frames = int(anchor_recovery_history_frames)
+        self._records = collections.OrderedDict()
+        self._condition = threading.Condition()
+        self._wake_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._error = None
+        self._initial_history_pending = True
+        self._anchor_recovery_request = None
+        self._episode_start_timestamp_s = -np.inf
+        self._last_frame_timestamp_s = -np.inf
+        self._last_camera_timestamp_s = None
+        self._last_camera_step_idx = None
+        # Estimate the physical camera period from timestamps.  ``step_idx``
+        # is calculated against the requested put rate (60 Hz), so a healthy
+        # 40 Hz UVC source naturally advances it by two on some frames.
+        self._recent_camera_periods_s = collections.deque(maxlen=12)
+        self._metrics = {
+            "processed_frames": 0,
+            "max_frame_gap_s": 0.0,
+            "sum_frame_gap_s": 0.0,
+            "frame_gap_count": 0,
+            "poll_count": 0,
+            "recovery_polls": 0,
+            "anchor_recovery_polls": 0,
+            "last_record_timestamp_s": None,
+        }
+
+    @staticmethod
+    def _timestamp_key(timestamp_s: float) -> int:
+        return int(round(float(timestamp_s) * 1_000_000.0))
+
+    @staticmethod
+    def _rgb_fingerprint(rgb: np.ndarray) -> bytes:
+        array = np.ascontiguousarray(_rgb_uint8_from_any(rgb))
+        return hashlib.sha256(array.tobytes()).digest()
+
+    def start(self, *, episode_start_timestamp_s: float) -> None:
+        if self._thread is not None:
+            raise RuntimeError("context worker may only be started once")
+        episode_start_timestamp_s = float(episode_start_timestamp_s)
+        if not np.isfinite(episode_start_timestamp_s):
+            raise ValueError("context worker episode start must be finite")
+        self.runtime.reset(episode_start_timestamp_s=episode_start_timestamp_s)
+        self._episode_start_timestamp_s = episode_start_timestamp_s
+        self._thread = threading.Thread(
+            target=self._run,
+            name="ValveContextWorker",
+            daemon=True,
+        )
+        self._thread.start()
+        self._wake_event.set()
+
+    def stop(self, *, timeout_s: float = 2.0) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.0, float(timeout_s)))
+            if self._thread.is_alive():
+                raise RuntimeError("context worker did not stop within timeout")
+        with self._condition:
+            self._condition.notify_all()
+
+    def _store_record(self, timestamp_s: float, rgb: np.ndarray, record) -> None:
+        key = self._timestamp_key(timestamp_s)
+        fingerprint = self._rgb_fingerprint(rgb)
+        with self._condition:
+            self._records[key] = (float(timestamp_s), record, fingerprint)
+            self._records.move_to_end(key)
+            while len(self._records) > self.max_cached_records:
+                self._records.popitem(last=False)
+            self._metrics["processed_frames"] += 1
+            if np.isfinite(self._last_frame_timestamp_s):
+                gap_s = float(timestamp_s) - self._last_frame_timestamp_s
+                if gap_s > 0.0:
+                    self._metrics["frame_gap_count"] += 1
+                    self._metrics["sum_frame_gap_s"] += gap_s
+                    self._metrics["max_frame_gap_s"] = max(
+                        self._metrics["max_frame_gap_s"], gap_s
+                    )
+            self._last_frame_timestamp_s = float(timestamp_s)
+            self._metrics["last_record_timestamp_s"] = float(timestamp_s)
+            self._condition.notify_all()
+
+    def _process_stream(self, stream: dict) -> None:
+        timestamps = np.asarray(stream.get("rgb_timestamp_s"), dtype=np.float64)
+        camera_step_indices = np.asarray(
+            stream.get("camera_step_idx"), dtype=np.int64
+        )
+        rgb_frames = np.asarray(stream.get("camera0_rgb"))
+        positions = np.asarray(stream.get("robot0_eef_pos"), dtype=np.float64)
+        rotations = np.asarray(
+            stream.get("robot0_eef_rot_axis_angle"), dtype=np.float64
+        )
+        widths = np.asarray(stream.get("robot0_gripper_width"), dtype=np.float64)
+        ft_timestamps = np.asarray(stream.get("ft_timestamp_s"), dtype=np.float64)
+        ft_left = np.asarray(stream.get("robot0_ft_left"), dtype=np.float32)
+        ft_right = np.asarray(stream.get("robot0_ft_right"), dtype=np.float32)
+        n = len(timestamps)
+        if (
+            rgb_frames.shape[0] != n
+            or camera_step_indices.shape != (n,)
+            or positions.shape != (n, 3)
+            or rotations.shape != (n, 3)
+            or widths.shape[0] != n
+        ):
+            raise ValueError("context worker received inconsistent camera-rate stream")
+        if n == 0 or not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) < 0.0):
+            raise ValueError("context worker RGB timestamps must be finite and sorted")
+        # UVC ``step_idx`` is an arrival-rate estimate used only to notice a
+        # missed poll.  A shared-memory recovery read can include frames from
+        # either side of a capture-process restart, so it is not a reliable
+        # chronological clock.  ``rgb_timestamp_s`` above is the authoritative
+        # classifier timeline and remains strictly validated/sorted.
+        if (
+            ft_left.shape != (len(ft_timestamps), 6)
+            or ft_right.shape != (len(ft_timestamps), 6)
+            or not np.isfinite(ft_timestamps).all()
+            or np.any(np.diff(ft_timestamps) < 0.0)
+        ):
+            raise ValueError("context worker received invalid F/T stream")
+
+        for idx, timestamp_s in enumerate(timestamps):
+            timestamp_s = float(timestamp_s)
+            if timestamp_s < self._episode_start_timestamp_s:
+                continue
+            if timestamp_s <= self.runtime.last_prediction_timestamp:
+                continue
+            ft_end = int(np.searchsorted(ft_timestamps, timestamp_s, side="right"))
+            latest_wrench_timestamp_s = None
+            if self.input_capture is not None:
+                latest_wrench_timestamp_s = self.input_capture.append_wrenches(
+                    ft_timestamps[:ft_end],
+                    ft_left[:ft_end],
+                    ft_right[:ft_end],
+                    anchor_timestamp_s=timestamp_s,
+                )
+            rgb = _rgb_uint8_from_any(rgb_frames[idx])
+            record = self.runtime.predict(
+                timestamp_s=timestamp_s,
+                rgb=rgb,
+                position_m=positions[idx],
+                rotation_axis_angle_rad=rotations[idx],
+                gripper_width_m=float(np.asarray(widths[idx]).reshape(-1)[0]),
+                ft_timestamps=ft_timestamps[:ft_end],
+                ft_left=ft_left[:ft_end],
+                ft_right=ft_right[:ft_end],
+            )
+            if self.input_capture is not None:
+                self.input_capture.append_frame(
+                    timestamp_s=timestamp_s,
+                    rgb=rgb,
+                    position_m=positions[idx],
+                    rotation_axis_angle_rad=rotations[idx],
+                    gripper_width_m=float(np.asarray(widths[idx]).reshape(-1)[0]),
+                    latest_wrench_timestamp_s=latest_wrench_timestamp_s,
+                    context_record=record,
+                )
+            self._store_record(timestamp_s, rgb, record)
+        if self.input_capture is not None:
+            self.input_capture.flush()
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                self._wake_event.wait(timeout=self.poll_period_s)
+                self._wake_event.clear()
+                if self._stop_event.is_set():
+                    break
+                recover_history = False
+                anchor_recovery = False
+                with self._condition:
+                    anchor_request = self._anchor_recovery_request
+                    self._anchor_recovery_request = None
+                if anchor_request is not None:
+                    # A policy anchor can be older than the worker's newest
+                    # one-frame poll because camera timestamps are latency
+                    # compensated.  Recover it by timestamp/RGB, never by
+                    # substituting a newer classifier result.
+                    stream = self.stream_provider(
+                        history_frames=self.anchor_recovery_history_frames
+                    )
+                    anchor_recovery = True
+                    with self._condition:
+                        self._metrics["anchor_recovery_polls"] += 1
+                elif self._initial_history_pending:
+                    # At episode handoff, the first policy RGB can predate
+                    # eval_t_start by one camera-latency interval.  Seed from
+                    # a short retained history so that exact first anchor is
+                    # available without using a future context value.
+                    stream = self.stream_provider(
+                        history_frames=self.initial_history_frames
+                    )
+                    self._initial_history_pending = False
+                else:
+                    # The common path transfers one newest frame.  Detect
+                    # actual capture gaps from camera timestamps, not UVC
+                    # ``step_idx``: the latter is based on requested 60 Hz and
+                    # can skip values normally when source is slower.
+                    stream = self.stream_provider(history_frames=1)
+                    timestamps = np.asarray(
+                        stream.get("rgb_timestamp_s"), dtype=np.float64
+                    )
+                    step_indices = np.asarray(
+                        stream.get("camera_step_idx"), dtype=np.int64
+                    )
+                    if timestamps.shape != (1,) or step_indices.shape != (1,):
+                        raise ValueError(
+                            "context worker newest-frame stream must contain one "
+                            "RGB timestamp and camera step index"
+                        )
+                    newest_timestamp_s = float(timestamps[0])
+                    newest_step_idx = int(step_indices[0])
+                    if (
+                        self._last_camera_timestamp_s is not None
+                        and newest_timestamp_s > self._last_camera_timestamp_s
+                    ):
+                        period_s = newest_timestamp_s - self._last_camera_timestamp_s
+                        if len(self._recent_camera_periods_s) >= 3:
+                            expected_period_s = float(
+                                np.median(self._recent_camera_periods_s)
+                            )
+                            # A one-frame loss is ~2x normal period.  Leave
+                            # room for small UVC timestamp jitter.
+                            recover_history = period_s > 1.75 * expected_period_s
+                        elif (
+                            self._last_camera_step_idx is not None
+                            and newest_step_idx > self._last_camera_step_idx + 2
+                        ):
+                            # Before a timestamp-rate estimate exists, recover
+                            # only a clearly large initial jump.  A two-step
+                            # jump is normal for a healthy ~40 Hz source
+                            # requested at 60 Hz.
+                            recover_history = True
+                    if recover_history:
+                        stream = self.stream_provider(
+                            history_frames=self.history_frames
+                        )
+                        with self._condition:
+                            self._metrics["recovery_polls"] += 1
+                self._process_stream(stream)
+                processed_timestamps = np.asarray(
+                    stream.get("rgb_timestamp_s"), dtype=np.float64
+                )
+                processed_indices = np.asarray(
+                    stream.get("camera_step_idx"), dtype=np.int64
+                )
+                if (
+                    processed_timestamps.ndim != 1
+                    or len(processed_timestamps) == 0
+                    or processed_indices.shape != processed_timestamps.shape
+                ):
+                    raise ValueError("context worker stream has no camera timestamps")
+                newest_timestamp_s = float(processed_timestamps[-1])
+                if (
+                    self._last_camera_timestamp_s is not None
+                    and newest_timestamp_s > self._last_camera_timestamp_s
+                    and not recover_history
+                    and not anchor_recovery
+                ):
+                    self._recent_camera_periods_s.append(
+                        newest_timestamp_s - self._last_camera_timestamp_s
+                    )
+                self._last_camera_timestamp_s = newest_timestamp_s
+                self._last_camera_step_idx = int(processed_indices[-1])
+                with self._condition:
+                    self._metrics["poll_count"] += 1
+                    self._condition.notify_all()
+        except Exception as exc:
+            with self._condition:
+                self._error = exc
+                self._condition.notify_all()
+
+    def record_for_policy_anchor(
+        self,
+        *,
+        timestamp_s: float,
+        rgb: np.ndarray,
+        timeout_s: float = 0.10,
+    ):
+        """Return the classifier result for exactly this policy RGB frame."""
+        timestamp_s = float(timestamp_s)
+        if not np.isfinite(timestamp_s):
+            raise ValueError("policy anchor timestamp must be finite")
+        desired_key = self._timestamp_key(timestamp_s)
+        desired_fingerprint = self._rgb_fingerprint(rgb)
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        self._wake_event.set()
+        requested_history_recovery = False
+        with self._condition:
+            while True:
+                if self._error is not None:
+                    raise RuntimeError("context worker failed") from self._error
+                item = self._records.get(desired_key)
+                if item is not None:
+                    record_timestamp_s, record, fingerprint = item
+                    if not np.isclose(record_timestamp_s, timestamp_s, atol=1e-6):
+                        raise RuntimeError("context worker timestamp-key collision")
+                    if fingerprint != desired_fingerprint:
+                        raise RuntimeError(
+                            "context worker RGB differs from the policy RGB at the same timestamp"
+                        )
+                    return record
+                if not requested_history_recovery:
+                    self._anchor_recovery_request = (
+                        timestamp_s, desired_key, desired_fingerprint
+                    )
+                    requested_history_recovery = True
+                    self._wake_event.set()
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0.0:
+                    last_timestamp_s = self._metrics["last_record_timestamp_s"]
+                    raise TimeoutError(
+                        "context worker did not produce the policy anchor within "
+                        f"{timeout_s:.3f}s (anchor={timestamp_s:.6f}, "
+                        f"latest={last_timestamp_s})"
+                    )
+                self._condition.wait(timeout=remaining_s)
+
+    def summary(self) -> dict:
+        with self._condition:
+            summary = dict(self._metrics)
+            gaps = int(summary.pop("frame_gap_count"))
+            total_gap_s = float(summary.pop("sum_frame_gap_s"))
+            summary["mean_frame_period_s"] = (
+                total_gap_s / gaps if gaps > 0 else None
+            )
+            summary["episode_start_timestamp_s"] = self._episode_start_timestamp_s
+            summary["cached_records"] = len(self._records)
+            summary["error"] = None if self._error is None else repr(self._error)
+            return summary
+
+
+def _add_valve_context_to_policy_observation(
+    obs: dict,
+    *,
+    runtime: ValveStateContextRuntime,
+    input_capture: _ValveContextInputCapture | None = None,
+) -> tuple[dict, object]:
+    """Replay every unseen policy-preprocessed RGB frame through classifier v4.
+
+    ``UmiEnv`` supplies a short overlapping camera-rate stream on each
+    replanning call.  Replaying unseen frames makes the classifier run at the
+    camera rate even though diffusion action inference is slower.  Each call
+    receives only startup-bias-corrected physical F/T samples at or before its
+    RGB timestamp; classifier-side wrench scaling remains untouched.
+    """
+
+    stream = obs.get("valve_context_stream")
+    if isinstance(stream, dict):
+        timestamps = np.asarray(stream.get("rgb_timestamp_s"), dtype=np.float64)
+        rgb_frames = np.asarray(stream.get("camera0_rgb"))
+        positions = np.asarray(stream.get("robot0_eef_pos"), dtype=np.float64)
+        rotations = np.asarray(
+            stream.get("robot0_eef_rot_axis_angle"), dtype=np.float64
+        )
+        widths = np.asarray(stream.get("robot0_gripper_width"), dtype=np.float64)
+        ft_timestamps = np.asarray(stream.get("ft_timestamp_s"), dtype=np.float64)
+        ft_left = np.asarray(stream.get("robot0_ft_left"), dtype=np.float32)
+        ft_right = np.asarray(stream.get("robot0_ft_right"), dtype=np.float32)
+        n = len(timestamps)
+        if (
+            rgb_frames.shape[0] != n
+            or positions.shape != (n, 3)
+            or rotations.shape != (n, 3)
+            or widths.shape[0] != n
+        ):
+            raise ValueError("valve_context_stream has inconsistent camera-rate shapes")
+        if not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) < 0.0):
+            raise ValueError("valve_context_stream RGB timestamps must be finite/sorted")
+        if n == 0:
+            raise ValueError("valve_context_stream contains no camera frames")
+        policy_rgb = _policy_input_rgb_from_obs(obs)
+        if policy_rgb is None or not np.array_equal(
+            _rgb_uint8_from_any(rgb_frames[-1]), policy_rgb
+        ):
+            raise ValueError(
+                "classifier RGB must exactly equal the final latest policy image"
+            )
+        if not np.isclose(
+            timestamps[-1], float(np.asarray(obs["timestamp"])[-1]), atol=1e-6
+        ):
+            raise ValueError(
+                "valve_context_stream latest RGB timestamp must equal policy anchor"
+            )
+        for idx, timestamp_s in enumerate(timestamps):
+            if timestamp_s <= runtime.last_prediction_timestamp:
+                continue
+            ft_end = int(np.searchsorted(ft_timestamps, timestamp_s, side="right"))
+            latest_wrench_timestamp_s = None
+            if input_capture is not None:
+                latest_wrench_timestamp_s = input_capture.append_wrenches(
+                    ft_timestamps[:ft_end],
+                    ft_left[:ft_end],
+                    ft_right[:ft_end],
+                    anchor_timestamp_s=float(timestamp_s),
+                )
+            record = runtime.predict(
+                timestamp_s=float(timestamp_s),
+                rgb=_rgb_uint8_from_any(rgb_frames[idx]),
+                position_m=positions[idx],
+                rotation_axis_angle_rad=rotations[idx],
+                gripper_width_m=float(np.asarray(widths[idx]).reshape(-1)[0]),
+                ft_timestamps=ft_timestamps[:ft_end],
+                ft_left=ft_left[:ft_end],
+                ft_right=ft_right[:ft_end],
+            )
+            if input_capture is not None:
+                input_capture.append_frame(
+                    timestamp_s=float(timestamp_s),
+                    rgb=_rgb_uint8_from_any(rgb_frames[idx]),
+                    position_m=positions[idx],
+                    rotation_axis_angle_rad=rotations[idx],
+                    gripper_width_m=float(np.asarray(widths[idx]).reshape(-1)[0]),
+                    latest_wrench_timestamp_s=latest_wrench_timestamp_s,
+                    context_record=record,
+                )
+        if input_capture is not None:
+            input_capture.flush()
+    if runtime.last_record is None:
+        # This is intentionally a strict fallback for test/offline callers;
+        # live UmiEnv always provides the camera-rate stream above.
+        anchor = float(np.asarray(obs["timestamp"])[-1])
+        if input_capture is not None:
+            latest_wrench_timestamp_s = input_capture.append_wrenches(
+                np.asarray(obs["robot0_ft_left_timestamps"]),
+                np.asarray(obs["robot0_ft_left"]),
+                np.asarray(obs["robot0_ft_right"]),
+                anchor_timestamp_s=anchor,
+            )
+        record = runtime.predict(
+            timestamp_s=anchor,
+            rgb=_policy_input_rgb_from_obs(obs),
+            position_m=np.asarray(obs["robot0_eef_pos"])[-1],
+            rotation_axis_angle_rad=np.asarray(obs["robot0_eef_rot_axis_angle"])[-1],
+            gripper_width_m=float(np.asarray(obs["robot0_gripper_width"])[-1].reshape(-1)[0]),
+            ft_timestamps=np.asarray(obs["robot0_ft_left_timestamps"]),
+            ft_left=np.asarray(obs["robot0_ft_left"]),
+            ft_right=np.asarray(obs["robot0_ft_right"]),
+        )
+        if input_capture is not None:
+            input_capture.append_frame(
+                timestamp_s=anchor,
+                rgb=_policy_input_rgb_from_obs(obs),
+                position_m=np.asarray(obs["robot0_eef_pos"])[-1],
+                rotation_axis_angle_rad=np.asarray(obs["robot0_eef_rot_axis_angle"])[-1],
+                gripper_width_m=float(
+                    np.asarray(obs["robot0_gripper_width"])[-1].reshape(-1)[0]
+                ),
+                latest_wrench_timestamp_s=latest_wrench_timestamp_s,
+                context_record=record,
+            )
+            input_capture.flush()
+    latest = runtime.last_record
+    if latest.timestamp_s > float(np.asarray(obs["timestamp"])[-1]) + 1e-6:
+        raise ValueError("valve classifier context is newer than policy RGB anchor")
+    if not np.isclose(
+        latest.timestamp_s, float(np.asarray(obs["timestamp"])[-1]), atol=1e-6
+    ):
+        raise ValueError(
+            "classifier prediction is not aligned to the current policy RGB anchor"
+        )
+    obs_for_model = dict(obs)
+    obs_for_model["valve_context"] = latest.values.reshape(1, -1)
+    return obs_for_model, latest
+
+
 def _policy_input_bgr_from_obs(obs) -> np.ndarray | None:
     img = _policy_input_rgb_from_obs(obs)
     if img is None:
@@ -660,6 +1388,16 @@ def _resize_rgb_like_policy(match_rgb, out_hw: tuple[int, int]) -> np.ndarray:
         bgr_to_rgb=False,
     )
     return np.ascontiguousarray(tf(rgb))
+
+
+def _blend_match_rgb_on_live_bgr(
+    live_bgr: np.ndarray,
+    match_rgb: np.ndarray,
+) -> np.ndarray:
+    """Overlay a training RGB frame on a live OpenCV BGR frame at 50/50."""
+    resized_match_rgb = _resize_rgb_like_policy(match_rgb, live_bgr.shape[:2])
+    match_bgr = cv2.cvtColor(resized_match_rgb, cv2.COLOR_RGB2BGR)
+    return cv2.addWeighted(live_bgr, 0.5, match_bgr, 0.5, 0)
 
 
 def _show_policy_input_window(obs, label: str, match_rgb=None) -> None:
@@ -1689,8 +2427,179 @@ def _print_policy_action_debug(tag, raw_action, action_7d, submitted=None):
 
 
 _POSE10D_LABELS = ["x", "y", "z", "r6d_0", "r6d_1", "r6d_2", "r6d_3", "r6d_4", "r6d_5", "grip", "grasp_N"]
+_FT_CHANNEL_LABELS = ("fx", "fy", "fz", "tx", "ty", "tz")
+_FT_CHANNEL_UNITS = ("N", "N", "N", "Nm", "Nm", "Nm")
 _PANEL_W = 320
 _PANEL_H = 420   # taller than wide: text panels have ~19-22 lines, 320 clipped them
+
+
+def _tensor_to_numpy(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu").numpy()
+    return np.asarray(value)
+
+
+def _normalized_ft_policy_inputs(policy, obs_dict) -> dict[str, np.ndarray]:
+    """Return the two F/T histories after the checkpoint normalizer.
+
+    ``obs_dict`` is the same tensor dictionary passed to ``predict_action``.
+    The operation is cheap (no vision/diffusion forward pass) and makes the
+    recorded CSV explicitly distinguish physical sensor units from model input.
+    """
+    normalizer = getattr(policy, "normalizer", None)
+    if normalizer is None:
+        return {}
+    try:
+        normalized = normalizer.normalize(obs_dict)
+    except Exception as exc:
+        print(f"[eval_log] could not normalize F/T diagnostic input: {exc}")
+        return {}
+    return {
+        key: _tensor_to_numpy(normalized[key])[0]
+        for key in ("robot0_ft_left", "robot0_ft_right")
+        if key in normalized
+    }
+
+
+def _write_ft_input_history(
+    writer,
+    *,
+    iter_idx: int,
+    wall_time: float,
+    obs: dict,
+    obs_dict_np: dict,
+    normalized_ft: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Save every causal 6-D F/T sample used by one policy decision."""
+    histories = []
+    for side in ("left", "right"):
+        key = f"robot0_ft_{side}"
+        values = np.asarray(obs_dict_np.get(key), dtype=np.float64)
+        if values.ndim != 2 or values.shape[-1] != 6:
+            return None
+        normalized = np.asarray(normalized_ft.get(key), dtype=np.float64)
+        if normalized.shape != values.shape:
+            normalized = np.full_like(values, np.nan, dtype=np.float64)
+        timestamps = np.asarray(
+            obs.get(f"robot0_ft_{side}_timestamps", np.full(len(values), np.nan)),
+            dtype=np.float64,
+        ).reshape(-1)
+        if len(timestamps) != len(values):
+            timestamps = np.full(len(values), np.nan, dtype=np.float64)
+        for sample_idx, (timestamp, raw_row, normalized_row) in enumerate(
+            zip(timestamps, values, normalized)
+        ):
+            writer.writerow(
+                [iter_idx, wall_time, side, sample_idx, int(sample_idx == len(values) - 1), timestamp]
+                + raw_row.tolist()
+                + normalized_row.tolist()
+            )
+        histories.append(values)
+    return tuple(histories)
+
+
+def _render_ft_input_timeline(path: pathlib.Path, rows: list[dict]) -> bool:
+    """Render latest causal F/T sample per policy iteration without matplotlib."""
+    if not rows:
+        return False
+    left = np.asarray([row["left"] for row in rows], dtype=np.float64)
+    right = np.asarray([row["right"] for row in rows], dtype=np.float64)
+    if left.ndim != 2 or left.shape[1] != 6 or right.shape != left.shape:
+        return False
+
+    width, height = 1440, 900
+    canvas = np.full((height, width, 3), 250, dtype=np.uint8)
+    cv2.putText(
+        canvas,
+        "Policy F/T input timeline (latest causal sample per inference)",
+        (28, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.78,
+        (20, 20, 20),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "blue: left finger   red: right finger   values before checkpoint normalization",
+        (28, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (60, 60, 60),
+        1,
+        cv2.LINE_AA,
+    )
+    n_rows = len(rows)
+    pad_x, top, gap_x, gap_y = 52, 90, 34, 55
+    panel_w = (width - 2 * pad_x - 2 * gap_x) // 3
+    panel_h = (height - top - 52 - gap_y) // 2
+    for channel_idx, (label, unit) in enumerate(zip(_FT_CHANNEL_LABELS, _FT_CHANNEL_UNITS)):
+        col, row = channel_idx % 3, channel_idx // 3
+        x0 = pad_x + col * (panel_w + gap_x)
+        y0 = top + row * (panel_h + gap_y)
+        x1, y1 = x0 + panel_w, y0 + panel_h
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (160, 160, 160), 1)
+        values = np.concatenate([left[:, channel_idx], right[:, channel_idx]])
+        finite = values[np.isfinite(values)]
+        if len(finite) == 0:
+            lo, hi = -1.0, 1.0
+        else:
+            lo, hi = float(finite.min()), float(finite.max())
+            margin = max(1e-6, 0.08 * max(hi - lo, 1e-3))
+            lo, hi = lo - margin, hi + margin
+        cv2.putText(
+            canvas, f"{label} [{unit}]  {lo:.3g} .. {hi:.3g}",
+            (x0 + 6, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+            (30, 30, 30), 1, cv2.LINE_AA,
+        )
+        for frac in (0.25, 0.5, 0.75):
+            y = int(y0 + frac * panel_h)
+            cv2.line(canvas, (x0, y), (x1, y), (225, 225, 225), 1)
+        def point(i, value):
+            x = x0 if n_rows <= 1 else int(x0 + i * panel_w / (n_rows - 1))
+            y = int(y1 - (float(value) - lo) * panel_h / (hi - lo))
+            return x, int(np.clip(y, y0, y1))
+        for series, color in ((left[:, channel_idx], (210, 80, 30)), (right[:, channel_idx], (35, 35, 210))):
+            valid_idx = np.flatnonzero(np.isfinite(series))
+            for i0, i1 in zip(valid_idx[:-1], valid_idx[1:]):
+                if i1 == i0 + 1:
+                    cv2.line(canvas, point(i0, series[i0]), point(i1, series[i1]), color, 2)
+    return bool(cv2.imwrite(str(path), canvas))
+
+
+def _render_fusion_attention_heatmap(
+    path: pathlib.Path, token_names: list[str], attention: np.ndarray
+) -> bool:
+    """Render mean query-to-key fusion attention; rows=query, columns=key."""
+    matrix = np.asarray(attention, dtype=np.float64)
+    n_tokens = len(token_names)
+    if matrix.shape != (n_tokens, n_tokens) or not np.all(np.isfinite(matrix)):
+        return False
+    cell, left, top = 145, 220, 125
+    canvas = np.full((top + cell * n_tokens + 90, left + cell * n_tokens + 45, 3), 255, dtype=np.uint8)
+    cv2.putText(canvas, "Mean fusion self-attention (query row -> key column)", (20, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.66, (20, 20, 20), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "descriptive attention only; not causal feature attribution", (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (80, 80, 80), 1, cv2.LINE_AA)
+    for idx, name in enumerate(token_names):
+        cv2.putText(canvas, name, (left + idx * cell + 4, top - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (30, 30, 30), 1, cv2.LINE_AA)
+        cv2.putText(canvas, name, (8, top + idx * cell + 78),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (30, 30, 30), 1, cv2.LINE_AA)
+    for q_idx in range(n_tokens):
+        for k_idx in range(n_tokens):
+            value = float(np.clip(matrix[q_idx, k_idx], 0.0, 1.0))
+            color = cv2.applyColorMap(
+                np.array([[int(round(value * 255.0))]], dtype=np.uint8),
+                cv2.COLORMAP_VIRIDIS,
+            )[0, 0].tolist()
+            x0, y0 = left + k_idx * cell, top + q_idx * cell
+            cv2.rectangle(canvas, (x0, y0), (x0 + cell, y0 + cell), color, -1)
+            cv2.rectangle(canvas, (x0, y0), (x0 + cell, y0 + cell), (210, 210, 210), 1)
+            text_color = (0, 0, 0) if value > 0.55 else (255, 255, 255)
+            cv2.putText(canvas, f"{value:.3f}", (x0 + 35, y0 + 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2, cv2.LINE_AA)
+    return bool(cv2.imwrite(str(path), canvas))
 
 
 def _render_text_panel(lines, width=_PANEL_W, height=_PANEL_H, bg_color=(30, 30, 30)):
@@ -1775,9 +2684,307 @@ def _load_match_episode_debug_data(zarr_path: str | None, episode_idx: int | Non
         return None
 
 
-def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp6,
-        live_tcp6, *, source_idx: int | None, match_episode_id: int | None):
-    """3-panel eval video: original zarr frame | current image | original coordinate."""
+def _render_policy_output_video_panel(
+    raw_action_h0,
+    decoded_action_h0,
+    scheduled_action_h0,
+    *,
+    predicted_force_n: float | None,
+    measured_force_n: float | None,
+    width_correction_m: float | None,
+    valve_context_record=None,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Compact first-waypoint output readout for the comparison video."""
+    lines = ["4. policy output, horizon 0 (pre-safety)"]
+    raw = None if raw_action_h0 is None else np.asarray(raw_action_h0, dtype=np.float64).ravel()
+    decoded = (
+        None if decoded_action_h0 is None
+        else np.asarray(decoded_action_h0, dtype=np.float64).ravel()
+    )
+    scheduled = (
+        None if scheduled_action_h0 is None
+        else np.asarray(scheduled_action_h0, dtype=np.float64).ravel()
+    )
+    if raw is None or raw.size < 11:
+        lines.append("model output: waiting for first inference")
+    else:
+        lines.extend([
+            f"raw xyz: {raw[0]:+.4f} {raw[1]:+.4f} {raw[2]:+.4f}",
+            "raw R6D: " + " ".join(f"{x:+.3f}" for x in raw[3:9]),
+            f"raw grip={raw[9]:+.4f}  grasp_N={raw[10]:+.3f}",
+        ])
+    if decoded is not None and decoded.size >= 7:
+        lines.extend([
+            "decoded TCP (before scale/F/T):",
+            f" xyz: {decoded[0]:+.4f} {decoded[1]:+.4f} {decoded[2]:+.4f} m",
+            " rotvec: " + " ".join(f"{x:+.3f}" for x in decoded[3:6]),
+            f" width: {decoded[6]:+.4f} m",
+        ])
+    if scheduled is not None and scheduled.size >= 7:
+        lines.extend([
+            "candidate after scale/F/T:",
+            f" xyz: {scheduled[0]:+.4f} {scheduled[1]:+.4f} {scheduled[2]:+.4f} m",
+            " rotvec: " + " ".join(f"{x:+.3f}" for x in scheduled[3:6]),
+            f" width: {scheduled[6]:+.4f} m",
+        ])
+    if predicted_force_n is not None or measured_force_n is not None:
+        force_text = "F/T grasp N: "
+        force_text += "pred=" + (
+            "n/a" if predicted_force_n is None else f"{predicted_force_n:+.3f}"
+        )
+        force_text += " meas=" + (
+            "n/a" if measured_force_n is None else f"{measured_force_n:+.3f}"
+        )
+        lines.append(force_text)
+    if width_correction_m is not None:
+        lines.append(f"F/T width correction: {width_correction_m * 1000.0:+.3f} mm")
+    if valve_context_record is not None:
+        context = np.asarray(valve_context_record.values, dtype=np.float64)
+        lines.extend([
+            "valve context (frozen classifier v4):",
+            f" phase={valve_context_record.phase_name} "
+            f"reason={valve_context_record.error_reason_name} "
+            f"warm={int(valve_context_record.warmed_up)}",
+            " p=" + " ".join(f"{value:.2f}" for value in context[:5]),
+        ])
+    return _render_text_panel(lines, width=width, height=height)
+
+
+def _render_fusion_attention_video_panel(
+    attention,
+    token_names: list[str],
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Small live query-to-key attention heatmap for comparison.mp4."""
+    panel = np.full((height, width, 3), (30, 30, 30), dtype=np.uint8)
+    cv2.putText(
+        panel, "5. live fusion attention (heads mean)", (6, 16),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel, "row=query, column=key; descriptive, not causal", (6, 32),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 200, 200), 1, cv2.LINE_AA,
+    )
+    names = [str(name).replace("camera0_", "").replace("robot0_", "") for name in token_names]
+    matrix = None if attention is None else np.asarray(attention, dtype=np.float64)
+    n_tokens = len(names)
+    if (
+        n_tokens == 0
+        or matrix is None
+        or matrix.shape != (n_tokens, n_tokens)
+        or not np.all(np.isfinite(matrix))
+    ):
+        cv2.putText(
+            panel, "attention: waiting / capture disabled", (10, 64),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 180, 255), 1, cv2.LINE_AA,
+        )
+        return panel
+
+    left, top = 96, 57
+    cell = min(72, max(38, (width - left - 8) // n_tokens), max(32, (height - top - 50) // n_tokens))
+    for idx, name in enumerate(names):
+        short_name = name.replace("_", " ")[:11]
+        cv2.putText(
+            panel, short_name, (left + idx * cell + 2, top - 7),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (230, 230, 230), 1, cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel, short_name, (4, top + idx * cell + cell // 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (230, 230, 230), 1, cv2.LINE_AA,
+        )
+    for query_idx in range(n_tokens):
+        for key_idx in range(n_tokens):
+            value = float(np.clip(matrix[query_idx, key_idx], 0.0, 1.0))
+            color = cv2.applyColorMap(
+                np.array([[int(round(value * 255.0))]], dtype=np.uint8),
+                cv2.COLORMAP_VIRIDIS,
+            )[0, 0].tolist()
+            x0, y0 = left + key_idx * cell, top + query_idx * cell
+            cv2.rectangle(panel, (x0, y0), (x0 + cell, y0 + cell), color, -1)
+            cv2.rectangle(panel, (x0, y0), (x0 + cell, y0 + cell), (235, 235, 235), 1)
+            cv2.putText(
+                panel, f"{value:.2f}", (x0 + 4, y0 + cell // 2 + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                (20, 20, 20) if value > 0.55 else (255, 255, 255),
+                1, cv2.LINE_AA,
+            )
+    key_mean = matrix.mean(axis=0)
+    cv2.putText(
+        panel,
+        "key mean: " + " ".join(
+            f"{name[:6]}={value:.2f}" for name, value in zip(names, key_mean)
+        ),
+        (6, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+        (200, 255, 200), 1, cv2.LINE_AA,
+    )
+    return panel
+
+
+def _render_valve_context_video_panel(
+    valve_context_record,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Render the exact frozen-classifier context supplied to the policy."""
+    panel = np.full((height, width, 3), (30, 30, 30), dtype=np.uint8)
+    cv2.putText(
+        panel, "6. valve context fed to policy", (6, 17),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    if valve_context_record is None:
+        cv2.putText(
+            panel, "context: waiting for classifier", (8, 47),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 180, 255), 1, cv2.LINE_AA,
+        )
+        return panel
+
+    values = np.asarray(valve_context_record.values, dtype=np.float64).reshape(-1)
+    if values.shape != (10,) or not np.all(np.isfinite(values)):
+        cv2.putText(
+            panel, "context: invalid diagnostic value", (8, 47),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 255), 1, cv2.LINE_AA,
+        )
+        return panel
+    cv2.putText(
+        panel,
+        f"phase={valve_context_record.phase_name}  "
+        f"reason={valve_context_record.error_reason_name}  "
+        f"warm={int(valve_context_record.warmed_up)}",
+        (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (200, 255, 200), 1, cv2.LINE_AA,
+    )
+    phases = ("approach", "turning", "endpoint", "complete", "error")
+    reasons = ("none", "no-contact", "drop", "other")
+    bar_x, bar_w, bar_h = 92, max(40, width - 106), 11
+    y = 61
+    for label, value in zip(phases, values[:5]):
+        cv2.putText(panel, label, (7, y + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.32,
+                    (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.rectangle(panel, (bar_x, y), (bar_x + bar_w, y + bar_h), (65, 65, 65), -1)
+        cv2.rectangle(
+            panel, (bar_x, y),
+            (bar_x + int(round(bar_w * float(np.clip(value, 0.0, 1.0)))), y + bar_h),
+            (70, 185, 255), -1,
+        )
+        cv2.putText(panel, f"{value:.3f}", (bar_x + 4, y + 9),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.31, (0, 0, 0), 1, cv2.LINE_AA)
+        y += 14
+    cv2.putText(panel, "error reason probabilities", (7, y + 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 220, 150), 1, cv2.LINE_AA)
+    y += 16
+    for label, value in zip(reasons, values[5:9]):
+        cv2.putText(panel, label, (7, y + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.32,
+                    (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.rectangle(panel, (bar_x, y), (bar_x + bar_w, y + bar_h), (65, 65, 65), -1)
+        cv2.rectangle(
+            panel, (bar_x, y),
+            (bar_x + int(round(bar_w * float(np.clip(value, 0.0, 1.0)))), y + bar_h),
+            (120, 120, 255), -1,
+        )
+        cv2.putText(panel, f"{value:.3f}", (bar_x + 4, y + 9),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.31, (0, 0, 0), 1, cv2.LINE_AA)
+        y += 14
+    return panel
+
+
+def _draw_ft_force_history(
+    panel: np.ndarray,
+    values: np.ndarray,
+    *,
+    title: str,
+    y0: int,
+    height: int,
+) -> None:
+    """Draw physical Fx/Fy/Fz traces from the exact 32-sample policy input."""
+    values = np.asarray(values, dtype=np.float64)
+    panel_h, panel_w = panel.shape[:2]
+    x0, x1 = 40, panel_w - 7
+    y1 = min(panel_h - 5, y0 + height)
+    if values.ndim != 2 or values.shape[0] < 1 or values.shape[1] != 6:
+        cv2.putText(panel, f"{title}: unavailable", (7, y0 + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (100, 180, 255), 1, cv2.LINE_AA)
+        return
+    force = values[:, :3]
+    if not np.all(np.isfinite(force)):
+        cv2.putText(panel, f"{title}: non-finite", (7, y0 + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (80, 80, 255), 1, cv2.LINE_AA)
+        return
+    low, high = float(force.min()), float(force.max())
+    pad = max(0.25, (high - low) * 0.10)
+    low, high = low - pad, high + pad
+    if high - low < 1e-9:
+        low, high = low - 0.25, high + 0.25
+    cv2.putText(panel, f"{title} force N   oldest -> latest", (7, y0 + 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (240, 240, 240), 1, cv2.LINE_AA)
+    graph_top, graph_bottom = y0 + 18, y1 - 23
+    cv2.rectangle(panel, (x0, graph_top), (x1, graph_bottom), (105, 105, 105), 1)
+    zero_y = int(round(graph_bottom - (0.0 - low) / (high - low) * (graph_bottom - graph_top)))
+    if graph_top <= zero_y <= graph_bottom:
+        cv2.line(panel, (x0, zero_y), (x1, zero_y), (85, 85, 85), 1)
+    colors = ((80, 80, 255), (80, 255, 80), (255, 180, 50))  # Fx, Fy, Fz (BGR)
+    for channel_idx, (label, color) in enumerate(zip(("Fx", "Fy", "Fz"), colors)):
+        points = []
+        for index, value in enumerate(force[:, channel_idx]):
+            x = x0 + int(round((x1 - x0) * index / max(len(force) - 1, 1)))
+            y = graph_bottom - int(round((value - low) / (high - low) * (graph_bottom - graph_top)))
+            points.append((x, y))
+        if len(points) > 1:
+            cv2.polylines(panel, [np.asarray(points, dtype=np.int32)], False, color, 1, cv2.LINE_AA)
+        elif points:
+            cv2.circle(panel, points[0], 2, color, -1)
+        cv2.putText(panel, f"{label}={force[-1, channel_idx]:+.2f}",
+                    (x0 + channel_idx * max(58, (x1 - x0) // 3), y1 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.31, color, 1, cv2.LINE_AA)
+    cv2.putText(panel, f"{high:+.1f}", (2, graph_top + 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.27, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(panel, f"{low:+.1f}", (2, graph_bottom),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.27, (180, 180, 180), 1, cv2.LINE_AA)
+
+
+def _render_ft_input_video_panel(obs, *, width: int, height: int) -> np.ndarray:
+    """Render physical, startup-bias-corrected F/T values fed to the policy."""
+    panel = np.full((height, width, 3), (30, 30, 30), dtype=np.uint8)
+    cv2.putText(
+        panel, "7. policy F/T input (physical, corrected)", (6, 16),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    if obs is None:
+        return panel
+    left = np.asarray(obs.get("robot0_ft_left", []), dtype=np.float64)
+    right = np.asarray(obs.get("robot0_ft_right", []), dtype=np.float64)
+    graph_height = max(52, (height - 27) // 2)
+    _draw_ft_force_history(panel, left, title="left", y0=23, height=graph_height)
+    _draw_ft_force_history(
+        panel, right, title="right", y0=23 + graph_height, height=graph_height
+    )
+    return panel
+
+
+def _render_eval_video_frame(
+    original_rgb,
+    current_bgr,
+    original_tcp6,
+    robot_tcp6,
+    live_tcp6,
+    *,
+    source_idx: int | None,
+    match_episode_id: int | None,
+    raw_action_h0=None,
+    decoded_action_h0=None,
+    scheduled_action_h0=None,
+    predicted_force_n: float | None = None,
+    measured_force_n: float | None = None,
+    width_correction_m: float | None = None,
+    valve_context_record=None,
+    ft_observation=None,
+    fusion_attention=None,
+    fusion_attention_tokens: list[str] | None = None,
+):
+    """Video with matching images, coordinates, live output, and attention."""
     if original_rgb is None:
         left = np.full((_PANEL_H, _PANEL_W, 3), (20, 20, 20), dtype=np.uint8)
         left = _overlay_episode_text(left, "1. original video unavailable")
@@ -1812,7 +3019,116 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
     right = _render_text_panel(coord_lines)
 
     sep = np.full((_PANEL_H, 4, 3), (255, 255, 255), dtype=np.uint8)
-    return np.concatenate([left, sep, middle, sep, right], axis=1)
+    top_row = np.concatenate([left, sep, middle, sep, right], axis=1)
+
+    bottom_h = 250
+    output_w = top_row.shape[1] // 2 - 2
+    attention_w = top_row.shape[1] - output_w - 4
+    output_panel = _render_policy_output_video_panel(
+        raw_action_h0,
+        decoded_action_h0,
+        scheduled_action_h0,
+        predicted_force_n=predicted_force_n,
+        measured_force_n=measured_force_n,
+        width_correction_m=width_correction_m,
+        valve_context_record=valve_context_record,
+        width=output_w,
+        height=bottom_h,
+    )
+    attention_panel = _render_fusion_attention_video_panel(
+        fusion_attention,
+        [] if fusion_attention_tokens is None else fusion_attention_tokens,
+        width=attention_w,
+        height=bottom_h,
+    )
+    horizontal_sep = np.full((4, top_row.shape[1], 3), (255, 255, 255), dtype=np.uint8)
+    bottom_sep = np.full((bottom_h, 4, 3), (255, 255, 255), dtype=np.uint8)
+    bottom_row = np.concatenate([output_panel, bottom_sep, attention_panel], axis=1)
+
+    # Keep output/attention intact, then add the actual context and physical
+    # F/T histories below so one comparison frame is sufficient for diagnosis.
+    diagnostic_h = 190
+    context_w = top_row.shape[1] // 2 - 2
+    ft_w = top_row.shape[1] - context_w - 4
+    context_panel = _render_valve_context_video_panel(
+        valve_context_record, width=context_w, height=diagnostic_h
+    )
+    ft_panel = _render_ft_input_video_panel(
+        ft_observation, width=ft_w, height=diagnostic_h
+    )
+    diagnostic_sep = np.full((diagnostic_h, 4, 3), (255, 255, 255), dtype=np.uint8)
+    diagnostic_row = np.concatenate([context_panel, diagnostic_sep, ft_panel], axis=1)
+    second_horizontal_sep = np.full(
+        (4, top_row.shape[1], 3), (255, 255, 255), dtype=np.uint8
+    )
+    return np.concatenate(
+        [top_row, horizontal_sep, bottom_row, second_horizontal_sep, diagnostic_row],
+        axis=0,
+    )
+
+
+def _make_eval_comparison_frame(
+    obs,
+    match_debug_data,
+    source_idx: int | None,
+    *,
+    env: UmiEnv | None = None,
+    camera_idx: int = 0,
+    raw_action_h0=None,
+    decoded_action_h0=None,
+    scheduled_action_h0=None,
+    predicted_force_n: float | None = None,
+    measured_force_n: float | None = None,
+    width_correction_m: float | None = None,
+    valve_context_record=None,
+    fusion_attention=None,
+    fusion_attention_tokens: list[str] | None = None,
+):
+    """Build one fixed-size comparison-video frame from a live observation."""
+    original_rgb = None
+    original_tcp6 = None
+    robot_tcp6 = None
+    match_episode_id = None
+    if match_debug_data is not None:
+        n_src = len(match_debug_data["raw_pose6"])
+        if n_src > 0:
+            source_idx = int(np.clip(
+                0 if source_idx is None else source_idx, 0, n_src - 1
+            ))
+            original_tcp6 = match_debug_data["raw_pose6"][source_idx]
+            robot_tcp6 = match_debug_data["robot_pose6"][source_idx]
+            if match_debug_data.get("rgb") is not None:
+                original_rgb = match_debug_data["rgb"][source_idx]
+            match_episode_id = match_debug_data["episode"]
+        else:
+            source_idx = None
+    else:
+        source_idx = None
+    current_bgr = _policy_input_bgr_from_obs(obs)
+    if current_bgr is None and env is not None:
+        try:
+            current_bgr = _get_live_display_bgr(env, camera_idx=camera_idx)
+        except Exception as exc:
+            print(f"[eval_log] could not obtain live fallback video frame: {exc}")
+    return _render_eval_video_frame(
+        original_rgb,
+        current_bgr,
+        original_tcp6,
+        robot_tcp6,
+        _tcp6_from_obs(obs),
+        source_idx=source_idx,
+        match_episode_id=match_episode_id,
+        raw_action_h0=raw_action_h0,
+        decoded_action_h0=decoded_action_h0,
+        scheduled_action_h0=scheduled_action_h0,
+        predicted_force_n=predicted_force_n,
+        measured_force_n=measured_force_n,
+        width_correction_m=width_correction_m,
+        valve_context_record=valve_context_record,
+        ft_observation=obs,
+        fusion_attention=fusion_attention,
+        fusion_attention_tokens=fusion_attention_tokens,
+    )
 
 
 @click.command()
@@ -1861,6 +3177,21 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
     default='auto',
     show_default=True,
     help="Inference device: auto, cpu, cuda, or cuda:N.",
+)
+@click.option(
+    "--valve_classifier_checkpoint",
+    default=_DEFAULT_VALVE_CLASSIFIER_CHECKPOINT,
+    show_default=True,
+    help=(
+        "Frozen valve-state classifier v4 final.pt. Required only by a "
+        "dual-F/T context checkpoint."
+    ),
+)
+@click.option(
+    "--valve_classifier_device",
+    default="auto",
+    show_default=True,
+    help="Classifier device: auto (same as policy), cpu, cuda, or cuda:N.",
 )
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
 @click.option('--no_spacemouse', is_flag=True, default=True, help="Disable SpaceMouse and use keyboard teleop only.")
@@ -2000,12 +3331,57 @@ def _render_eval_video_frame(original_rgb, current_bgr, original_tcp6, robot_tcp
     ),
 )
 @click.option(
+    "--save_fusion_attention/--no_save_fusion_attention",
+    default=False,
+    show_default=True,
+    help=(
+        "Save the Dual-F/T fusion layer's per-head 4x4 self-attention to the "
+        "eval log. This is descriptive attention, not causal attribution."
+    ),
+)
+@click.option(
+    "--save_context_inputs/--no_save_context_inputs",
+    default=True,
+    show_default=True,
+    help=(
+        "For a valve-context checkpoint, save every exact classifier RGB frame "
+        "(lossless PNG), corrected F/T sample, TCP lowdim input, and classifier "
+        "output under eval_logs/ep*/context_inputs/."
+    ),
+)
+@click.option(
     "--coord_transform_audit",
     is_flag=True,
     default=False,
     help=(
         "Print dataset<->robot TCP transform roundtrip checks for obs/actions "
         "and the selected zarr match episode."
+    ),
+)
+@click.option(
+    "--zero_ft_on_start/--no_zero_ft_on_start",
+    default=True,
+    show_default=True,
+    help=(
+        "Software-tare both RG2-FT finger sensors at startup from recent raw "
+        "samples. Keep the unloaded gripper still while the program starts."
+    ),
+)
+@click.option(
+    "--ft_zero_samples",
+    default=25,
+    type=click.IntRange(min=1),
+    show_default=True,
+    help="Number of recent 100 Hz RG2-FT samples averaged for startup tare.",
+)
+@click.option(
+    "--ft_max_age_sec",
+    default=0.020,
+    type=float,
+    show_default=True,
+    help=(
+        "Maximum age of the latest causal RG2-FT sample at an RGB anchor. "
+        "20 ms permits normal 100 Hz transport jitter; values must be positive."
     ),
 )
 @click.option(
@@ -2064,13 +3440,16 @@ def main(input, output, robot_config,
     camera_reorder,
     vis_camera_idx, init_joints,
     steps_per_inference, max_duration,
-    frequency, device, command_latency, no_spacemouse, no_gripper,
+    frequency, device, valve_classifier_checkpoint, valve_classifier_device,
+    command_latency, no_spacemouse, no_gripper,
     direct_dynamixel_gripper, dynamixel_gripper_config, gripper_calib_zarr,
     no_mirror, sim_fov, camera_intrinsics, eval_image_mask, policy_image_crop_ratio,
     inpaint_aruco_tags, aruco_config, disable_eval_image_aug,
     mirror_swap, print_policy_output,
     pose_eval_audit, dataset_zarr, dataset_z_stride, print_model_input,
-    show_policy_image, policy_input_audit, coord_transform_audit,
+    show_policy_image, policy_input_audit, save_fusion_attention, save_context_inputs,
+    coord_transform_audit,
+    zero_ft_on_start, ft_zero_samples, ft_max_age_sec,
     print_motion_debug, vis_pose, max_policy_iters, plan_only,
     tcp_delta_scales, action_scale, freeze_rotation, match_g_move_robot,
     auto_start_policy):
@@ -2206,6 +3585,23 @@ def main(input, output, robot_config,
     payload = torch.load(open(ckpt_path, 'rb'), map_location='cpu', pickle_module=dill)
     checkpoint_contract = inspect_dual_ft_checkpoint_payload(payload)
     cfg = checkpoint_contract["cfg"]
+    valve_context_enabled = bool(checkpoint_contract.get("valve_context_enabled", False))
+    expected_valve_classifier_sha256 = None
+    if valve_context_enabled:
+        expected_valve_classifier_sha256 = str(
+            OmegaConf.select(
+                cfg, "task.valve_context.checkpoint_sha256", default=""
+            )
+        ).lower()
+        if len(expected_valve_classifier_sha256) != 64:
+            raise click.ClickException(
+                "context checkpoint is missing task.valve_context.checkpoint_sha256"
+            )
+        if no_gripper:
+            raise click.ClickException(
+                "the valve-context checkpoint requires live RG2-FT, so --no_gripper "
+                "is not permitted"
+            )
     print(
         "dual-F/T checkpoint contract: "
         f"condition=[1,{checkpoint_contract['condition_dim']}], "
@@ -2215,6 +3611,13 @@ def main(input, output, robot_config,
         f"{checkpoint_contract['ft_dim']}], normalizer="
         f"{checkpoint_contract['normalizer_owner']}"
     )
+    if valve_context_enabled:
+        print(
+            "valve context contract: "
+            f"key={checkpoint_contract['valve_context_key']} "
+            f"dim={checkpoint_contract['valve_context_dim']} classifier=v4 "
+            f"expected_sha256={expected_valve_classifier_sha256}"
+        )
     # The checkpoint payload restores all trained weights immediately after
     # workspace construction. Avoid an unnecessary online pretrained-weight
     # download when this self-contained folder is moved to the robot PC.
@@ -2339,9 +3742,13 @@ def main(input, output, robot_config,
             OmegaConf.select(
                 cfg,
                 "execution.allowed_n_action_steps",
-                default=[1, 2, 4, 8],
+                default=[1, 2, 4, 6, 8],
             )
         )
+        # Existing dual-F/T checkpoints predate the validated 6-step runtime
+        # option and therefore serialize [1, 2, 4, 8]. The prediction horizon
+        # is 16, so executing six predicted rows is supported without retraining.
+        allowed_steps = sorted(set(map(int, allowed_steps)) | {6})
         if int(steps_per_inference) not in set(map(int, allowed_steps)):
             raise click.ClickException(
                 f"dual-F/T steps_per_inference must be one of {allowed_steps}"
@@ -2365,17 +3772,16 @@ def main(input, output, robot_config,
     # The August checkpoint predates the explicit config field. Its 0814
     # alignment audit measured 11.182 ms max age at 100 Hz, which is 1.118
     # samples; 1.2 sample periods preserves that evidence-based limit.
-    ft_max_age = (
-        float(configured_ft_max_age)
-        if configured_ft_max_age is not None
-        else 1.2 / ft_sample_frequency
-    )
+    if not np.isfinite(ft_max_age_sec) or ft_max_age_sec <= 0:
+        raise click.ClickException("--ft_max_age_sec must be a finite positive value")
+    ft_max_age = float(ft_max_age_sec)
     if dual_ft_enabled:
         print(
             "dual-F/T freshness limit: "
-            f"{ft_max_age * 1000.0:.3f} ms "
-            + ("(checkpoint config)" if configured_ft_max_age is not None
-               else "(legacy checkpoint fallback: 1.2 F/T sample periods)")
+            f"{ft_max_age * 1000.0:.3f} ms (runtime override; checkpoint "
+            f"metadata={float(configured_ft_max_age) * 1000.0:.3f} ms)"
+            if configured_ft_max_age is not None
+            else f"{ft_max_age * 1000.0:.3f} ms (runtime override)"
         )
     if dual_ft_enabled and no_gripper:
         raise click.ClickException(
@@ -2471,12 +3877,9 @@ def main(input, output, robot_config,
     )
     tcp_delta_scale_vec = _parse_tcp_delta_scales(tcp_delta_scales)
     if plan_only:
-        if max_policy_iters is None:
-            max_policy_iters = 1
         print(
             "plan_only: this script will not submit waypoints, but the robot "
-            "controller is still connected; running "
-            f"{max_policy_iters} inference cycle(s)."
+            "controller is still connected; running until stopped."
         )
     if max_policy_iters is not None:
         print("max_policy_iters:", max_policy_iters)
@@ -2513,6 +3916,8 @@ def main(input, output, robot_config,
                 ),
                 rg2ft_move_max_speed=gc.get('rg2ft_move_max_speed', 0.2),
                 rg2ft_open_tolerance=gc.get('rg2ft_open_tolerance', 0.005),
+                rg2ft_zero_on_start=zero_ft_on_start,
+                rg2ft_zero_samples=ft_zero_samples,
                 gripper_commands_enabled=(not plan_only),
                 gripper_serial_port=gc.get('gripper_serial_port'),
                 dynamixel_id=gc.get('dynamixel_id', 1),
@@ -2536,10 +3941,19 @@ def main(input, output, robot_config,
                 tcp_offset=rc['tcp_offset'],
                 frequency=frequency,
                 obs_image_resolution=obs_res,
+                # A context classifier consumes every camera frame rather
+                # than only the diffusion policy's two image observations.
+                # Keep two seconds at its intended 60 Hz rate so a slower
+                # policy replan cannot discard the unseen frames.
+                max_obs_buffer_size=(120 if valve_context_enabled else 60),
+                context_camera_history_frames=(120 if valve_context_enabled else 60),
                 obs_float32=True,
                 camera_reorder=[int(x) for x in camera_reorder],
                 init_joints=(False if plan_only else init_joints),
-                enable_multi_cam_vis=True,
+                # The raw "Multi Cam Vis" window bypasses the match overlay and
+                # is easily mistaken for the evaluation view.  The main window
+                # below is the single full-resolution camera view.
+                enable_multi_cam_vis=False,
                 camera_obs_latency=float(cfg.task.get("camera_obs_latency", 0.125)),
                 robot_obs_latency=rc['robot_obs_latency'],
                 gripper_obs_latency=gc.get('gripper_obs_latency', 0.01),
@@ -2630,11 +4044,30 @@ def main(input, output, robot_config,
                 startup_bias_12d = np.asarray(
                     startup_bias_result["bias_12d"], dtype=np.float64
                 )
-                env.set_ft_startup_bias(startup_bias_12d)
+                software_tare_offset_12d = np.asarray(
+                    env.rg2ft_ft_offset, dtype=np.float64
+                ).copy()
+                startup_residual_bias_12d = startup_residual_after_software_tare(
+                    startup_bias_12d, software_tare_offset_12d
+                )
+                # Training applies software tare first and removes only the
+                # remaining stationary episode bias.  The sampler above reads
+                # native raw wrenches, so convert it to that tared frame before
+                # giving it to UmiEnv.
+                env.set_ft_startup_bias(startup_residual_bias_12d)
                 calibration_record = {
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "coordinate_frame": "native left[6] + native right[6]",
+                    "calibration_order": (
+                        "raw native -> subtract software_tare_offset_12d -> "
+                        "subtract startup_residual_after_software_tare_12d"
+                    ),
                     "used_for": "this process only; never an offline episode bias",
+                    "software_tare_offset_12d": software_tare_offset_12d.tolist(),
+                    "raw_startup_bias_12d": startup_bias_12d.tolist(),
+                    "startup_residual_after_software_tare_12d": (
+                        startup_residual_bias_12d.tolist()
+                    ),
                     "config": vars(startup_bias_cfg),
                     **{
                         key: (value.tolist() if isinstance(value, np.ndarray) else value)
@@ -2648,8 +4081,12 @@ def main(input, output, robot_config,
                     json.dumps(calibration_record, indent=2), encoding="utf-8"
                 )
                 print(
-                    "F/T startup bias accepted:",
+                    "F/T raw startup baseline accepted:",
                     np.array2string(startup_bias_12d, precision=5),
+                )
+                print(
+                    "F/T residual after software tare applied to policy/feedback:",
+                    np.array2string(startup_residual_bias_12d, precision=5),
                 )
                 print("F/T calibration provenance:", calibration_path)
 
@@ -2761,8 +4198,87 @@ def main(input, output, robot_config,
                     f"{requested_device!r}"
                 )
 
+            valve_context_runtime = None
+            if valve_context_enabled:
+                requested_classifier_device = str(
+                    valve_classifier_device
+                ).strip().lower()
+                if requested_classifier_device == "auto":
+                    classifier_device = str(device)
+                elif requested_classifier_device in ("", "cpu"):
+                    classifier_device = "cpu"
+                elif requested_classifier_device.startswith("cuda"):
+                    if not torch.cuda.is_available():
+                        raise click.ClickException(
+                            "--valve_classifier_device requests CUDA, but CUDA is unavailable"
+                        )
+                    classifier_device = requested_classifier_device
+                else:
+                    raise click.ClickException(
+                        "--valve_classifier_device must be auto, cpu, cuda, or cuda:N; "
+                        f"got {valve_classifier_device!r}"
+                    )
+                classifier_path = pathlib.Path(
+                    valve_classifier_checkpoint
+                ).expanduser().resolve()
+                if not classifier_path.is_file():
+                    raise click.ClickException(
+                        "frozen valve classifier checkpoint is missing: "
+                        f"{classifier_path}"
+                    )
+                actual_classifier_sha256 = _sha256_file(classifier_path)
+                if actual_classifier_sha256.lower() != expected_valve_classifier_sha256:
+                    raise click.ClickException(
+                        "valve classifier SHA-256 mismatch; context checkpoint requires "
+                        f"{expected_valve_classifier_sha256}, got {actual_classifier_sha256}"
+                    )
+                try:
+                    valve_context_runtime = ValveStateContextRuntime(
+                        classifier_path, device=classifier_device
+                    )
+                except Exception as exc:
+                    raise click.ClickException(
+                        f"failed to load frozen valve classifier v4: {exc}"
+                    ) from exc
+                print(
+                    "valve classifier: "
+                    f"{classifier_path} sha256={actual_classifier_sha256} "
+                    f"device={classifier_device}"
+                )
+                if save_context_inputs:
+                    print(
+                        "[eval_log] context input capture enabled: lossless 224x224 "
+                        "RGB + 100 Hz corrected F/T + TCP lowdim will be saved per episode."
+                    )
+            elif save_context_inputs:
+                print(
+                    "[eval_log] context input capture skipped: this checkpoint has no "
+                    "valve_context input."
+                )
+
+            fusion_attention_enabled = False
+            fusion_attention_tokens = []
+            if save_fusion_attention:
+                capture_attention = getattr(
+                    policy.obs_encoder, "set_fusion_attention_capture", None
+                )
+                token_names = getattr(policy.obs_encoder, "fusion_token_names", None)
+                if not dual_ft_enabled or not callable(capture_attention) or not callable(token_names):
+                    print(
+                        "[eval_log] fusion-attention capture unavailable for this "
+                        "checkpoint; F/T/output diagnostics remain enabled."
+                    )
+                else:
+                    capture_attention(True)
+                    fusion_attention_tokens = list(token_names())
+                    fusion_attention_enabled = True
+                    print(
+                        "[eval_log] fusion-attention capture enabled: "
+                        + ", ".join(fusion_attention_tokens)
+                    )
+
             print("Warming up policy inference")
-            obs = env.get_obs()
+            obs = env.get_obs(include_valve_context_stream=False)
             if no_gripper:
                 obs = _with_synthetic_gripper_width(
                     obs,
@@ -2777,8 +4293,22 @@ def main(input, output, robot_config,
             ]
             with torch.inference_mode():
                 policy.reset()
+                valve_context_record = None
+                obs_with_context = obs
+                if valve_context_runtime is not None:
+                    obs_with_context, valve_context_record = (
+                        _add_valve_context_to_policy_observation(
+                            obs, runtime=valve_context_runtime
+                        )
+                    )
+                    print(
+                        "[valve_context warmup] "
+                        f"phase={valve_context_record.phase_name} "
+                        f"reason={valve_context_record.error_reason_name} "
+                        f"warmed_up={int(valve_context_record.warmed_up)}"
+                    )
                 obs_for_model = prepare_rg2ft_policy_obs(
-                    obs, cfg.task.shape_meta
+                    obs_with_context, cfg.task.shape_meta
                 )
                 episode_start_pose_for_model = episode_start_pose
                 if not dual_ft_enabled:
@@ -2942,7 +4472,7 @@ def main(input, output, robot_config,
                 print("Human in control!")
                 # Baseline from get_obs (same ActualTCPPose pipeline as policy), not a
                 # single ring-buffer sample, so the first waypoint matches what we see.
-                obs_human = env.get_obs()
+                obs_human = env.get_obs(include_valve_context_stream=False)
                 target_pose = np.asarray(
                     [
                         np.concatenate(
@@ -2995,7 +4525,7 @@ def main(input, output, robot_config,
                         t_command_target = t_cycle_end + dt
     
                         # pump obs
-                        obs = env.get_obs()
+                        obs = env.get_obs(include_valve_context_stream=False)
                         if iter_idx == 0:
                             target_pose[0] = np.concatenate(
                                 [
@@ -3031,19 +4561,10 @@ def main(input, output, robot_config,
 
                         match_has_first_frame = match_episode_id in episode_first_frame_map
                         if match_episode_id in episode_first_frame_map:
-                            match_img = episode_first_frame_map[match_episode_id]
-                            ih, iw, _ = match_img.shape
-                            oh, ow, _ = vis_img.shape
-                            tf = get_image_transform(
-                                input_res=(iw, ih),
-                                output_res=(ow, oh),
-                                bgr_to_rgb=False,
+                            vis_img = _blend_match_rgb_on_live_bgr(
+                                vis_img,
+                                episode_first_frame_map[match_episode_id],
                             )
-                            match_bgr = cv2.cvtColor(tf(match_img), cv2.COLOR_RGB2BGR)
-                            vis_img = (
-                                (vis_img.astype(np.float32) + match_bgr.astype(np.float32))
-                                / 2.0
-                            ).astype(np.uint8)
 
                         header = (
                             f"Eval ep: {episode_id} | Match ep: "
@@ -3295,7 +4816,7 @@ def main(input, output, robot_config,
                                         time.sleep(min(0.01, next_capture_t - now))
                                         continue
                                     next_capture_t += capture_dt
-                                    obs_video = env.get_obs()
+                                    obs_video = env.get_obs(include_valve_context_stream=False)
                                     live_tcp6 = np.concatenate([
                                         obs_video["robot0_eef_pos"][-1],
                                         obs_video["robot0_eef_rot_axis_angle"][-1],
@@ -3603,6 +5124,21 @@ def main(input, output, robot_config,
                 eval_csv_header_written = False
                 eval_video_writer = None
                 eval_log_dir = None
+                ft_input_csv_file = None
+                ft_input_csv_writer = None
+                policy_output_csv_file = None
+                policy_output_csv_writer = None
+                scheduled_action_csv_file = None
+                scheduled_action_csv_writer = None
+                valve_context_csv_file = None
+                valve_context_csv_writer = None
+                context_input_capture = None
+                context_worker = None
+                fusion_attention_csv_file = None
+                fusion_attention_csv_writer = None
+                ft_timeline_rows = []
+                fusion_attention_sum = None
+                fusion_attention_count = 0
                 try:
                     # start episode
                     policy.reset()
@@ -3610,6 +5146,20 @@ def main(input, output, robot_config,
                     eval_t_start = time.time() + start_delay
                     t_start = time.monotonic() + start_delay
                     env.start_episode(eval_t_start)
+                    # ``get_obs`` uses camera-latency-compensated timestamps,
+                    # so its first policy image may be slightly earlier than
+                    # eval_t_start.  Keep a bounded live-camera preroll in the
+                    # classifier only; episode recording still begins exactly
+                    # at eval_t_start below.
+                    context_preroll_s = 0.50
+                    context_history_start_s = eval_t_start - context_preroll_s
+                    if valve_context_runtime is not None:
+                        # The classifier's recurrent/image history is episode
+                        # local, just as it was when the context sidecar was
+                        # generated for training.
+                        valve_context_runtime.reset(
+                            episode_start_timestamp_s=context_history_start_s
+                        )
 
                     # per-run CSV + comparison-video logging (policy input / model
                     # output / actually-transmitted action), one folder per episode
@@ -3619,6 +5169,156 @@ def main(input, output, robot_config,
                     eval_log_dir.mkdir(parents=True, exist_ok=True)
                     eval_csv_file = open(eval_log_dir.joinpath('log.csv'), 'w', newline='')
                     eval_csv_writer = csv.writer(eval_csv_file)
+                    policy_output_csv_file = open(
+                        eval_log_dir.joinpath('policy_outputs.csv'), 'w', newline=''
+                    )
+                    policy_output_csv_writer = csv.writer(policy_output_csv_file)
+                    policy_output_csv_writer.writerow(
+                        ['iter_idx', 'wall_time', 'horizon_idx']
+                        + [f'raw_{name}' for name in _POSE10D_LABELS]
+                        + [
+                            'decoded_tcp_x_m', 'decoded_tcp_y_m', 'decoded_tcp_z_m',
+                            'decoded_tcp_rx_rad', 'decoded_tcp_ry_rad', 'decoded_tcp_rz_rad',
+                            'decoded_gripper_width_m',
+                        ]
+                    )
+                    scheduled_action_csv_file = open(
+                        eval_log_dir.joinpath('scheduled_actions.csv'), 'w', newline=''
+                    )
+                    scheduled_action_csv_writer = csv.writer(scheduled_action_csv_file)
+                    scheduled_action_csv_writer.writerow(
+                        [
+                            'iter_idx', 'wall_time', 'source_horizon_idx',
+                            'target_timestamp', 'will_send_to_robot',
+                            'sent_tcp_x_m', 'sent_tcp_y_m', 'sent_tcp_z_m',
+                            'sent_tcp_rx_rad', 'sent_tcp_ry_rad', 'sent_tcp_rz_rad',
+                            'sent_gripper_width_m', 'predicted_grasp_force_n',
+                        ]
+                    )
+                    if valve_context_runtime is not None:
+                        valve_context_csv_file = open(
+                            eval_log_dir.joinpath('valve_context.csv'), 'w', newline=''
+                        )
+                        valve_context_csv_writer = csv.writer(valve_context_csv_file)
+                        valve_context_csv_writer.writerow(
+                            [
+                                'iter_idx', 'wall_time', 'classifier_timestamp_s',
+                                'phase', 'error_reason', 'warmed_up',
+                                'phase_approach', 'phase_turning',
+                                'phase_endpoint_reached', 'phase_task_complete',
+                                'phase_error', 'reason_none',
+                                'reason_turn_no_contact',
+                                'reason_post_contact_drop', 'reason_other',
+                            ]
+                        )
+                        if save_context_inputs:
+                            context_input_capture = _ValveContextInputCapture(
+                                eval_log_dir.joinpath('context_inputs'),
+                                episode_start_timestamp_s=eval_t_start,
+                            )
+                        context_worker = _ValveContextWorker(
+                            valve_context_runtime,
+                            env.get_valve_context_stream,
+                            input_capture=context_input_capture,
+                            poll_hz=60.0,
+                            max_cached_records=256,
+                            history_frames=120,
+                            initial_history_frames=16,
+                            anchor_recovery_history_frames=32,
+                        )
+                        context_worker.start(
+                            episode_start_timestamp_s=context_history_start_s
+                        )
+                    if dual_ft_enabled:
+                        ft_input_csv_file = open(
+                            eval_log_dir.joinpath('input_ft_history.csv'), 'w', newline=''
+                        )
+                        ft_input_csv_writer = csv.writer(ft_input_csv_file)
+                        ft_input_csv_writer.writerow(
+                            [
+                                'iter_idx', 'wall_time', 'finger', 'sample_idx_oldest_to_latest',
+                                'is_latest_causal_sample', 'source_timestamp',
+                            ]
+                            + [f'physical_{name}_{unit}' for name, unit in zip(_FT_CHANNEL_LABELS, _FT_CHANNEL_UNITS)]
+                            + [f'normalized_{name}' for name in _FT_CHANNEL_LABELS]
+                        )
+                    if fusion_attention_enabled:
+                        fusion_attention_csv_file = open(
+                            eval_log_dir.joinpath('fusion_attention.csv'), 'w', newline=''
+                        )
+                        fusion_attention_csv_writer = csv.writer(fusion_attention_csv_file)
+                        fusion_attention_csv_writer.writerow(
+                            ['iter_idx', 'wall_time', 'head', 'query_token', 'key_token', 'weight']
+                        )
+                    diagnostic_manifest = {
+                        'format_version': 2,
+                        'video': 'comparison.mp4',
+                        'ft_input_history': 'input_ft_history.csv' if dual_ft_enabled else None,
+                        'ft_input_plot': 'input_ft_timeline.png' if dual_ft_enabled else None,
+                        'policy_outputs': 'policy_outputs.csv',
+                        'scheduled_actions': 'scheduled_actions.csv',
+                        'valve_context': (
+                            'valve_context.csv' if valve_context_runtime is not None else None
+                        ),
+                        'fusion_attention': (
+                            'fusion_attention.csv' if fusion_attention_enabled else None
+                        ),
+                        'fusion_attention_note': (
+                            'query-to-key self-attention, descriptive only; not causal attribution'
+                            if fusion_attention_enabled else None
+                        ),
+                        'checkpoint': str(input),
+                        'robot_config': str(robot_config),
+                        'plan_only': bool(plan_only),
+                        'action_scale': float(action_scale),
+                        'valve_context_enabled': bool(valve_context_enabled),
+                        'context_inputs': (
+                            {
+                                'directory': 'context_inputs',
+                                'frames': 'context_inputs/context_frames.csv',
+                                'wrenches': 'context_inputs/context_wrenches.csv',
+                                'imu': 'context_inputs/context_imu.csv',
+                                'images': 'context_inputs/images/frame_*.png',
+                                'physical_imu_available': False,
+                                'note': (
+                                    'TCP position/axis-angle and gripper width are the '
+                                    'classifier low-dimensional inputs; HDMI/Elgato has no '
+                                    'physical IMU stream.'
+                                ),
+                            }
+                            if context_input_capture is not None else None
+                        ),
+                        'context_worker': (
+                            {
+                                'poll_hz': 60.0,
+                                'camera_history_frames': 120,
+                                'initial_history_frames': 16,
+                                'anchor_recovery_history_frames': 32,
+                                'preroll_s': context_preroll_s,
+                                'max_cached_records': 256,
+                                'policy_anchor_rule': (
+                                    'exact RGB timestamp and SHA-256 fingerprint must '
+                                    'match the worker record'
+                                ),
+                            }
+                            if context_worker is not None else None
+                        ),
+                        'valve_classifier_checkpoint': (
+                            str(valve_context_runtime.checkpoint_path)
+                            if valve_context_runtime is not None else None
+                        ),
+                        'valve_classifier_sha256': (
+                            valve_context_runtime.checkpoint_sha256
+                            if valve_context_runtime is not None else None
+                        ),
+                        'valve_classifier_device': (
+                            valve_context_runtime.device
+                            if valve_context_runtime is not None else None
+                        ),
+                    }
+                    eval_log_dir.joinpath('diagnostic_manifest.json').write_text(
+                        json.dumps(diagnostic_manifest, indent=2), encoding='utf-8'
+                    )
                     print(f"[eval_log] logging to {eval_log_dir}")
                     match_debug_data = _load_match_episode_debug_data(
                         match_zarr_path,
@@ -3636,7 +5336,7 @@ def main(input, output, robot_config,
                         )
 
                     # get current pose
-                    obs = env.get_obs()
+                    obs = env.get_obs(include_valve_context_stream=False)
                     if no_gripper:
                         obs = _with_synthetic_gripper_width(
                             obs,
@@ -3654,6 +5354,31 @@ def main(input, output, robot_config,
                         episode_start_pose_for_model = _apply_slam_frame_fix_to_start_pose(
                             episode_start_pose
                         )
+
+                    # Persist a frame before the first inference.  This makes
+                    # comparison.mp4 available even when waypoint safety rejects
+                    # the first model output before the regular end-of-loop video
+                    # logging is reached.
+                    initial_eval_frame = _make_eval_comparison_frame(
+                        obs,
+                        match_debug_data,
+                        source_idx=0,
+                        env=env,
+                        camera_idx=match_camera,
+                    )
+                    fh, fw = initial_eval_frame.shape[:2]
+                    eval_video_writer = cv2.VideoWriter(
+                        str(eval_log_dir.joinpath('comparison.mp4')),
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        max(1.0, 1.0 / dt),
+                        (fw, fh),
+                    )
+                    if eval_video_writer.isOpened():
+                        eval_video_writer.write(initial_eval_frame)
+                    else:
+                        print("[eval_log] could not open comparison.mp4 for writing")
+                        eval_video_writer.release()
+                        eval_video_writer = None
 
                     # wait for 1/30 sec to get the closest frame actually
                     # reduces overall latency
@@ -3680,7 +5405,7 @@ def main(input, output, robot_config,
 
                         # get obs
                         t_loop_start = time.perf_counter()
-                        obs = env.get_obs()
+                        obs = env.get_obs(include_valve_context_stream=False)
                         if no_gripper:
                             obs = _with_synthetic_gripper_width(
                                 obs,
@@ -3712,8 +5437,43 @@ def main(input, output, robot_config,
                         # run inference
                         with torch.inference_mode():
                             s = time.time()
+                            valve_context_record = None
+                            obs_with_context = obs
+                            if valve_context_runtime is not None:
+                                try:
+                                    if context_worker is None:
+                                        raise RuntimeError(
+                                            "context checkpoint started without its camera-rate worker"
+                                        )
+                                    policy_rgb = _policy_input_rgb_from_obs(obs)
+                                    if policy_rgb is None:
+                                        raise RuntimeError(
+                                            "policy observation has no final camera0_rgb frame"
+                                        )
+                                    valve_context_record = (
+                                        context_worker.record_for_policy_anchor(
+                                            timestamp_s=float(obs_timestamps[-1]),
+                                            rgb=policy_rgb,
+                                            # The classifier is stateful and
+                                            # runs on the same GPU as policy
+                                            # inference.  A bounded wait keeps
+                                            # its exact-RGB contract without
+                                            # falsely stopping during a short
+                                            # CUDA/disk-capture backlog.
+                                            timeout_s=0.40,
+                                        )
+                                    )
+                                    obs_with_context = dict(obs)
+                                    obs_with_context['valve_context'] = (
+                                        valve_context_record.values.reshape(1, -1)
+                                    )
+                                except Exception as exc:
+                                    raise PolicySafetyError(
+                                        "valve-context worker input/prediction failed: "
+                                        f"{exc}"
+                                    ) from exc
                             obs_for_model = prepare_rg2ft_policy_obs(
-                                obs, cfg.task.shape_meta
+                                obs_with_context, cfg.task.shape_meta
                             )
                             if not dual_ft_enabled:
                                 obs_for_model = _apply_slam_frame_fix_to_obs(
@@ -3755,6 +5515,7 @@ def main(input, output, robot_config,
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
                             raw_action = result["action_pred"][0].detach().to("cpu").numpy()
+                            raw_model_action = raw_action.copy()
                             expected_action_shape = (
                                 int(checkpoint_contract["action_horizon"]),
                                 int(checkpoint_contract["action_dim"]) * n_robots,
@@ -3801,6 +5562,103 @@ def main(input, output, robot_config,
                                 euler_extrinsic=policy_rot_ext,
                                 n_robots=n_robots,
                             )
+                            # These diagnostics are intentionally written before
+                            # motion safety validation. A rejected first waypoint
+                            # is exactly the case where its policy output and F/T
+                            # input are needed for debugging.
+                            fusion_attention_for_video = None
+                            try:
+                                diagnostic_wall_time = time.time()
+                                if ft_input_csv_writer is not None:
+                                    normalized_ft = _normalized_ft_policy_inputs(
+                                        policy, obs_dict
+                                    )
+                                    ft_histories = _write_ft_input_history(
+                                        ft_input_csv_writer,
+                                        iter_idx=iter_idx,
+                                        wall_time=diagnostic_wall_time,
+                                        obs=obs,
+                                        obs_dict_np=obs_dict_np,
+                                        normalized_ft=normalized_ft,
+                                    )
+                                    if ft_histories is not None:
+                                        ft_timeline_rows.append(
+                                            {
+                                                'iter_idx': int(iter_idx),
+                                                'wall_time': diagnostic_wall_time,
+                                                'left': ft_histories[0][-1].copy(),
+                                                'right': ft_histories[1][-1].copy(),
+                                            }
+                                        )
+                                    ft_input_csv_file.flush()
+                                if policy_output_csv_writer is not None:
+                                    for horizon_idx, (raw_row_full, decoded_row) in enumerate(
+                                        zip(raw_model_action, action)
+                                    ):
+                                        policy_output_csv_writer.writerow(
+                                            [iter_idx, diagnostic_wall_time, horizon_idx]
+                                            + np.asarray(raw_row_full, dtype=np.float64).ravel().tolist()
+                                            + np.asarray(decoded_row, dtype=np.float64).ravel().tolist()
+                                        )
+                                    policy_output_csv_file.flush()
+                                if (
+                                    valve_context_csv_writer is not None
+                                    and valve_context_record is not None
+                                ):
+                                    valve_context_csv_writer.writerow(
+                                        [
+                                            iter_idx, diagnostic_wall_time,
+                                            valve_context_record.timestamp_s,
+                                            valve_context_record.phase_name,
+                                            valve_context_record.error_reason_name,
+                                            int(valve_context_record.warmed_up),
+                                        ]
+                                        + np.asarray(
+                                            valve_context_record.values,
+                                            dtype=np.float64,
+                                        ).tolist()
+                                    )
+                                    valve_context_csv_file.flush()
+                                if fusion_attention_csv_writer is not None:
+                                    attention = getattr(
+                                        policy.obs_encoder, 'last_fusion_attention', None
+                                    )
+                                    attention = _tensor_to_numpy(attention)
+                                    if attention.ndim != 4 or attention.shape[0] < 1:
+                                        raise ValueError(
+                                            'captured fusion attention must be [B,heads,query,key], '
+                                            f'got {attention.shape}'
+                                        )
+                                    attention = np.asarray(attention[0], dtype=np.float64)
+                                    if attention.shape[1:] != (
+                                        len(fusion_attention_tokens),
+                                        len(fusion_attention_tokens),
+                                    ):
+                                        raise ValueError(
+                                            'captured fusion-attention token shape does not match '
+                                            f'{fusion_attention_tokens}: {attention.shape}'
+                                        )
+                                    for head_idx in range(attention.shape[0]):
+                                        for query_idx, query_name in enumerate(fusion_attention_tokens):
+                                            for key_idx, key_name in enumerate(fusion_attention_tokens):
+                                                fusion_attention_csv_writer.writerow(
+                                                    [
+                                                        iter_idx, diagnostic_wall_time, head_idx,
+                                                        query_name, key_name,
+                                                        float(attention[head_idx, query_idx, key_idx]),
+                                                    ]
+                                                )
+                                    batch_attention_sum = attention.sum(axis=0)
+                                    fusion_attention_for_video = attention.mean(axis=0)
+                                    fusion_attention_sum = (
+                                        batch_attention_sum
+                                        if fusion_attention_sum is None
+                                        else fusion_attention_sum + batch_attention_sum
+                                    )
+                                    fusion_attention_count += int(attention.shape[0])
+                                    fusion_attention_csv_file.flush()
+                            except Exception as exc:
+                                print(f"[eval_log] diagnostic capture failed at iter={iter_idx}: {exc}")
                             if (
                                 coord_transform_audit_enabled
                                 and not coord_transform_audit_printed
@@ -3845,6 +5703,7 @@ def main(input, output, robot_config,
                         # causes jumpy biased motion.
                         n_exec = min(int(steps_per_inference), len(action))
                         this_target_poses = action[:n_exec].copy()
+                        source_horizon_indices = np.arange(n_exec, dtype=np.int64)
                         this_force_reference = None
                         if predicted_force_reference is not None:
                             this_force_reference = predicted_force_reference[:n_exec].copy()
@@ -3872,6 +5731,7 @@ def main(input, output, robot_config,
                             this_target_poses = this_target_poses[[-1]]
                             if this_force_reference is not None:
                                 this_force_reference = this_force_reference[[-1]]
+                            source_horizon_indices = source_horizon_indices[[-1]]
                             action_timestamp = curr_time + action_exec_latency
                             print('Over budget', action_timestamp - curr_time)
                             action_timestamps = np.array([action_timestamp])
@@ -3879,6 +5739,7 @@ def main(input, output, robot_config,
                             this_target_poses = this_target_poses[is_new]
                             if this_force_reference is not None:
                                 this_force_reference = this_force_reference[is_new]
+                            source_horizon_indices = source_horizon_indices[is_new]
                             action_timestamps = action_timestamps[is_new]
 
                         if (
@@ -3910,15 +5771,6 @@ def main(input, output, robot_config,
                             )
                             corrected_left = latest_ft["left"]
                             corrected_right = latest_ft["right"]
-                            validate_ft_load(
-                                corrected_left,
-                                corrected_right,
-                                force_feedback_result["measured_force_n"],
-                                ft_safety_cfg,
-                                latest_sample_age_s=(
-                                    time.time() - latest_ft["timestamp"]
-                                ),
-                            )
                             this_target_poses[:, 6] = force_feedback_result[
                                 "corrected_width_m"
                             ]
@@ -3929,6 +5781,75 @@ def main(input, output, robot_config,
                                 f"{float(this_force_reference[0]):.3f} N "
                                 "width_correction="
                                 f"{float(force_feedback_result['width_correction_m'][0]) * 1000.0:.3f} mm"
+                            )
+
+                        # Record this iteration before either F/T or waypoint
+                        # safety validation.  A stopped run therefore contains
+                        # the exact candidate output and attention that caused it.
+                        eval_frame = None
+                        try:
+                            video_source_idx = None
+                            if match_debug_data is not None:
+                                elapsed_s = max(0.0, time.monotonic() - t_start)
+                                video_source_idx = int(round(
+                                    elapsed_s * float(match_debug_data["fps"])
+                                ))
+                            video_predicted_force = (
+                                None if this_force_reference is None
+                                else float(this_force_reference[0])
+                            )
+                            video_measured_force = (
+                                None if force_feedback_result is None
+                                else float(force_feedback_result["measured_force_n"])
+                            )
+                            video_width_correction = (
+                                None if force_feedback_result is None
+                                else float(force_feedback_result["width_correction_m"][0])
+                            )
+                            eval_frame = _make_eval_comparison_frame(
+                                obs,
+                                match_debug_data,
+                                source_idx=video_source_idx,
+                                env=env,
+                                camera_idx=match_camera,
+                                raw_action_h0=raw_model_action[0],
+                                decoded_action_h0=action[0],
+                                scheduled_action_h0=(
+                                    this_target_poses[0]
+                                    if len(this_target_poses) > 0 else None
+                                ),
+                                predicted_force_n=video_predicted_force,
+                                measured_force_n=video_measured_force,
+                                width_correction_m=video_width_correction,
+                                valve_context_record=valve_context_record,
+                                fusion_attention=fusion_attention_for_video,
+                                fusion_attention_tokens=fusion_attention_tokens,
+                            )
+                            if eval_video_writer is None:
+                                fh, fw = eval_frame.shape[:2]
+                                eval_video_writer = cv2.VideoWriter(
+                                    str(eval_log_dir.joinpath('comparison.mp4')),
+                                    cv2.VideoWriter_fourcc(*'mp4v'),
+                                    max(1.0, 1.0 / dt), (fw, fh),
+                                )
+                            if eval_video_writer.isOpened():
+                                eval_video_writer.write(eval_frame)
+                            else:
+                                print("[eval_log] could not open comparison.mp4 for writing")
+                                eval_video_writer.release()
+                                eval_video_writer = None
+                        except Exception as exc:
+                            print(f"[eval_log] failed to add output/attention video frame: {exc}")
+
+                        if force_feedback_result is not None:
+                            validate_ft_load(
+                                corrected_left,
+                                corrected_right,
+                                force_feedback_result["measured_force_n"],
+                                ft_safety_cfg,
+                                latest_sample_age_s=(
+                                    time.time() - latest_ft["timestamp"]
+                                ),
                             )
 
                         current_tcp6 = np.concatenate(
@@ -3984,6 +5905,25 @@ def main(input, output, robot_config,
                                 direct_gripper.width_min_m,
                                 direct_gripper.width_max_m,
                             )
+
+                        if scheduled_action_csv_writer is not None:
+                            scheduled_wall_time = time.time()
+                            for scheduled_idx, target_row in enumerate(this_target_poses):
+                                force_reference = float('nan')
+                                if this_force_reference is not None:
+                                    force_reference = float(this_force_reference[scheduled_idx])
+                                scheduled_action_csv_writer.writerow(
+                                    [
+                                        iter_idx,
+                                        scheduled_wall_time,
+                                        int(source_horizon_indices[scheduled_idx]),
+                                        float(action_timestamps[scheduled_idx]),
+                                        int(not plan_only),
+                                    ]
+                                    + np.asarray(target_row, dtype=np.float64).ravel().tolist()
+                                    + [force_reference]
+                                )
+                            scheduled_action_csv_file.flush()
 
                         # execute actions
                         if plan_only:
@@ -4056,50 +5996,27 @@ def main(input, output, robot_config,
                         )
                         eval_csv_file.flush()
 
-                        original_rgb = None
-                        original_tcp6 = None
-                        robot_tcp6 = None
-                        source_idx = None
-                        if match_debug_data is not None:
-                            elapsed_s = max(0.0, time.monotonic() - t_start)
-                            source_idx = int(round(elapsed_s * float(match_debug_data["fps"])))
-                            n_src = len(match_debug_data["raw_pose6"])
-                            source_idx = int(np.clip(source_idx, 0, max(0, n_src - 1)))
-                            original_tcp6 = match_debug_data["raw_pose6"][source_idx]
-                            robot_tcp6 = match_debug_data["robot_pose6"][source_idx]
-                            if match_debug_data.get("rgb") is not None:
-                                original_rgb = match_debug_data["rgb"][source_idx]
-                        current_bgr = _policy_input_bgr_from_obs(obs)
-                        if current_bgr is None:
-                            current_bgr = _get_live_display_bgr(
-                                env, camera_idx=match_camera
-                            )
-                        eval_frame = _render_eval_video_frame(
-                            original_rgb,
-                            current_bgr,
-                            original_tcp6,
-                            robot_tcp6,
-                            _tcp6_from_obs(obs),
-                            source_idx=source_idx,
-                            match_episode_id=(
-                                None if match_debug_data is None
-                                else match_debug_data["episode"]
-                            ),
-                        )
-                        if eval_video_writer is None:
-                            fh, fw = eval_frame.shape[:2]
-                            eval_video_writer = cv2.VideoWriter(
-                                str(eval_log_dir.joinpath('comparison.mp4')),
-                                cv2.VideoWriter_fourcc(*'mp4v'),
-                                max(1.0, 1.0 / dt), (fw, fh))
-                        eval_video_writer.write(eval_frame)
-
                         # visualize (full-res camera feed; obs rgb is masked 224x224 for policy)
                         episode_id = env.replay_buffer.n_episodes
                         vis_img = _get_live_display_bgr(env, camera_idx=match_camera)
+                        match_policy_rgb = None
+                        if selected_match_episode_for_eval is not None:
+                            match_policy_rgb = episode_first_policy_frame_map.get(
+                                int(selected_match_episode_for_eval)
+                            )
+                        if match_policy_rgb is not None:
+                            vis_img = _blend_match_rgb_on_live_bgr(
+                                vis_img,
+                                match_policy_rgb,
+                            )
                         header = "Episode: {}, Time: {:.1f}".format(
                             episode_id, time.monotonic() - t_start
                         )
+                        if selected_match_episode_for_eval is not None:
+                            header += (
+                                " | Match ep: "
+                                f"{int(selected_match_episode_for_eval)} | overlap 50/50"
+                            )
                         if vis_pose:
                             next_tcp = (
                                 this_target_poses[0][:6]
@@ -4117,16 +6034,13 @@ def main(input, output, robot_config,
                             vis_img = _overlay_episode_text(vis_img, header)
                         cv2.imshow("default", vis_img)
                         if show_policy_image:
-                            match_policy_rgb = None
-                            if selected_match_episode_for_eval is not None:
-                                match_policy_rgb = episode_first_policy_frame_map.get(
-                                    int(selected_match_episode_for_eval)
-                                )
                             _show_policy_input_window(
                                 obs,
                                 f"policy input | t={time.monotonic() - t_start:.1f}s",
                                 match_rgb=match_policy_rgb,
                             )
+                            if eval_frame is not None:
+                                cv2.imshow("policy output + attention", eval_frame)
                         key = _poll_control_key(terminal_key_poller)
                         stop_episode = False
                         if key == ord("s"):
@@ -4174,17 +6088,115 @@ def main(input, output, robot_config,
                 finally:
                     if eval_csv_file is not None:
                         eval_csv_file.close()
+                    if ft_input_csv_file is not None:
+                        ft_input_csv_file.close()
+                    if policy_output_csv_file is not None:
+                        policy_output_csv_file.close()
+                    if scheduled_action_csv_file is not None:
+                        scheduled_action_csv_file.close()
+                    if valve_context_csv_file is not None:
+                        valve_context_csv_file.close()
+                    context_worker_summary = None
+                    if context_worker is not None:
+                        try:
+                            context_worker.stop()
+                        except Exception as exc:
+                            print(f"[eval_log] failed to stop context worker: {exc}")
+                        context_worker_summary = context_worker.summary()
+                        if eval_log_dir is not None:
+                            eval_log_dir.joinpath('context_worker_summary.json').write_text(
+                                json.dumps(context_worker_summary, indent=2),
+                                encoding='utf-8',
+                            )
+                    if context_input_capture is not None:
+                        context_input_capture.close()
+                    if fusion_attention_csv_file is not None:
+                        fusion_attention_csv_file.close()
                     if eval_video_writer is not None:
                         eval_video_writer.release()
                     if eval_log_dir is not None:
+                        saved_diagnostics = [
+                            'log.csv', 'policy_outputs.csv', 'scheduled_actions.csv'
+                        ]
+                        if valve_context_csv_file is not None:
+                            saved_diagnostics.append('valve_context.csv')
+                        if context_input_capture is not None:
+                            saved_diagnostics.append(
+                                'context_inputs/ (lossless RGB, F/T, TCP, classifier output)'
+                            )
+                        if context_worker_summary is not None:
+                            saved_diagnostics.append('context_worker_summary.json')
+                        if eval_video_writer is not None:
+                            saved_diagnostics.append('comparison.mp4')
+                        if ft_input_csv_file is not None:
+                            saved_diagnostics.append('input_ft_history.csv')
+                            try:
+                                if _render_ft_input_timeline(
+                                    eval_log_dir.joinpath('input_ft_timeline.png'),
+                                    ft_timeline_rows,
+                                ):
+                                    saved_diagnostics.append('input_ft_timeline.png')
+                            except Exception as exc:
+                                print(f"[eval_log] failed to render F/T timeline: {exc}")
+                        if fusion_attention_count > 0 and fusion_attention_sum is not None:
+                            mean_attention = fusion_attention_sum / float(
+                                fusion_attention_count
+                            )
+                            received_attention = mean_attention.mean(axis=0)
+                            emitted_attention = mean_attention.mean(axis=1)
+                            attention_summary = {
+                                'kind': 'Dual-F/T fusion self-attention',
+                                'interpretation': (
+                                    'Rows are query tokens and columns are key tokens. '
+                                    'Attention is descriptive only and must not be treated as '
+                                    'causal action attribution.'
+                                ),
+                                'token_order': fusion_attention_tokens,
+                                'head_matrices_averaged': int(fusion_attention_count),
+                                'mean_query_to_key': mean_attention.tolist(),
+                                'mean_attention_received_by_key': {
+                                    name: float(value)
+                                    for name, value in zip(
+                                        fusion_attention_tokens, received_attention
+                                    )
+                                },
+                                'mean_attention_emitted_by_query': {
+                                    name: float(value)
+                                    for name, value in zip(
+                                        fusion_attention_tokens, emitted_attention
+                                    )
+                                },
+                            }
+                            try:
+                                eval_log_dir.joinpath('fusion_attention_summary.json').write_text(
+                                    json.dumps(attention_summary, indent=2), encoding='utf-8'
+                                )
+                                saved_diagnostics.extend(
+                                    ['fusion_attention.csv', 'fusion_attention_summary.json']
+                                )
+                                if _render_fusion_attention_heatmap(
+                                    eval_log_dir.joinpath('fusion_attention_mean.png'),
+                                    fusion_attention_tokens,
+                                    mean_attention,
+                                ):
+                                    saved_diagnostics.append('fusion_attention_mean.png')
+                            except Exception as exc:
+                                print(f"[eval_log] failed to render fusion attention: {exc}")
                         # chown to host user (uid/gid 1000), container runs as root
                         try:
-                            for p in eval_log_dir.glob('*'):
+                            for p in sorted(
+                                eval_log_dir.rglob('*'),
+                                key=lambda path: len(path.parts),
+                                reverse=True,
+                            ):
                                 os.chown(p, 1000, 1000)
                             os.chown(eval_log_dir, 1000, 1000)
                         except Exception:
                             pass
-                        print(f"[eval_log] saved log.csv + comparison.mp4 to {eval_log_dir}")
+                        print(
+                            "[eval_log] saved " + ", ".join(saved_diagnostics)
+                            + f" to {eval_log_dir}"
+                        )
                     if 'runtime_metrics' in locals():
                         print("[dual-F/T runtime summary]")
                         print(

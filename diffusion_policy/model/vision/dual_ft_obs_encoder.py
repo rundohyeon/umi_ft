@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 from diffusion_policy.model.vision.timm_obs_encoder import TimmObsEncoder
+from diffusion_policy.model.vision.valve_stage_conditioner import ValveStageConditioner
 
 
 logger = logging.getLogger(__name__)
@@ -118,17 +119,22 @@ class DualFTObsEncoder(ModuleAttrMixin):
         fusion_position_encoding: str = "learnable",
         ft_channel_dims=(16, 32, 64, 128),
         share_ft_encoder: bool = False,
+        valve_context_key: str | None = None,
+        valve_context_dim: int = 10,
+        valve_context_hidden_dim: int = 128,
+        valve_expert_bottleneck_dim: int = 128,
     ):
         super().__init__()
         self.register_buffer(
             "architecture_contract_version",
-            torch.tensor(2, dtype=torch.int64),
+            torch.tensor(3 if valve_context_key is not None else 2, dtype=torch.int64),
             persistent=True,
         )
         self.shape_meta = shape_meta
         self.left_ft_key = left_ft_key
         self.right_ft_key = right_ft_key
         self.fusion_dim = int(fusion_dim)
+        self.valve_context_key = valve_context_key
 
         obs_meta = shape_meta["obs"]
         for key in (left_ft_key, right_ft_key):
@@ -136,6 +142,22 @@ class DualFTObsEncoder(ModuleAttrMixin):
                 raise ValueError(f"shape_meta is missing required F/T key {key!r}")
             if tuple(obs_meta[key]["shape"]) != (6,):
                 raise ValueError(f"{key} must have six independent channels")
+        if valve_context_key is not None:
+            context_meta = obs_meta.get(valve_context_key)
+            if context_meta is None:
+                raise ValueError(
+                    f"shape_meta is missing required valve context key {valve_context_key!r}"
+                )
+            if tuple(context_meta.get("shape", ())) != (int(valve_context_dim),):
+                raise ValueError(
+                    f"{valve_context_key} must have shape [{int(valve_context_dim)}]"
+                )
+            if int(context_meta.get("horizon", -1)) != 1:
+                raise ValueError(f"{valve_context_key} horizon must be one")
+            if not bool(context_meta.get("ignore_by_policy", False)):
+                raise ValueError(
+                    f"{valve_context_key} must be ignored by the legacy low-dim encoder"
+                )
 
         # The legacy encoder sees exactly the original RGB and pose fields.
         # F/T is removed rather than marked as an ordinary low-dimensional
@@ -210,6 +232,21 @@ class DualFTObsEncoder(ModuleAttrMixin):
             self.num_fusion_tokens * self.fusion_dim,
             self.fusion_dim,
         )
+        self.valve_stage_conditioner = (
+            ValveStageConditioner(
+                context_dim=int(valve_context_dim),
+                feature_dim=self.fusion_dim,
+                hidden_dim=int(valve_context_hidden_dim),
+                expert_bottleneck_dim=int(valve_expert_bottleneck_dim),
+            )
+            if valve_context_key is not None
+            else None
+        )
+        # Disabled unless the real-robot evaluator explicitly requests a
+        # diagnostic capture.  Keeping this state out of the checkpoint makes
+        # it impossible for an eval-only switch to alter training behavior.
+        self.capture_fusion_attention = False
+        self.last_fusion_attention = None
 
         self.low_dim_output_dim = sum(
             int(attr["horizon"]) * int(torch.tensor(attr["shape"]).prod())
@@ -262,6 +299,68 @@ class DualFTObsEncoder(ModuleAttrMixin):
             )
         return torch.cat(features, dim=-1)
 
+    def set_fusion_attention_capture(self, enabled: bool) -> None:
+        """Capture per-head fusion self-attention during the next forward pass.
+
+        The returned attention is descriptive only: it is the 4-token fusion
+        layer's query-to-key weight matrix, not a causal action attribution.
+        """
+        self.capture_fusion_attention = bool(enabled)
+        self.last_fusion_attention = None
+
+    def fusion_token_names(self) -> list[str]:
+        """Stable labels for the query/key axes of ``last_fusion_attention``."""
+        names = []
+        for key in self.vision_pose_encoder.rgb_keys:
+            horizon = int(self.shape_meta["obs"][key]["horizon"])
+            names.extend(f"{key}[t={idx}]" for idx in range(horizon))
+        names.extend([self.left_ft_key, self.right_ft_key])
+        if len(names) != self.num_fusion_tokens:
+            raise AssertionError(
+                f"fusion token labels {len(names)} != {self.num_fusion_tokens}"
+            )
+        return names
+
+    def _fuse_tokens(self, tokens):
+        """Run the fusion layer, optionally retaining its exact attention map."""
+        src = tokens + self.position_embedding.unsqueeze(0)
+        if not self.capture_fusion_attention:
+            return self.fusion(src)
+
+        # TransformerEncoderLayer normally calls MultiheadAttention with
+        # need_weights=False. Reproduce that layer's forward exactly while
+        # requesting its [B, heads, query, key] weights for eval diagnostics.
+        # There is no mask/cross-attention in this fixed four-token fusion.
+        fusion = self.fusion
+        if fusion.norm_first:
+            attn_src = fusion.norm1(src)
+            attn_out, attn_weights = fusion.self_attn(
+                attn_src,
+                attn_src,
+                attn_src,
+                need_weights=True,
+                average_attn_weights=False,
+                is_causal=False,
+            )
+            fused = src + fusion.dropout1(attn_out)
+            fused = fused + fusion._ff_block(fusion.norm2(fused))
+        else:
+            attn_out, attn_weights = fusion.self_attn(
+                src,
+                src,
+                src,
+                need_weights=True,
+                average_attn_weights=False,
+                is_causal=False,
+            )
+            fused = fusion.norm1(src + fusion.dropout1(attn_out))
+            fused = fusion.norm2(fused + fusion._ff_block(fused))
+
+        self.last_fusion_attention = attn_weights.detach().to(
+            device="cpu", dtype=torch.float32
+        )
+        return fused
+
     def forward(self, obs_dict):
         visual = self._visual_tokens(obs_dict)
         left = self.left_ft_encoder(obs_dict[self.left_ft_key]).unsqueeze(1)
@@ -273,8 +372,12 @@ class DualFTObsEncoder(ModuleAttrMixin):
                 f"unexpected fusion token count {tokens.shape[1]} != "
                 f"{self.num_fusion_tokens}"
             )
-        fused = self.fusion(tokens + self.position_embedding.unsqueeze(0))
+        fused = self._fuse_tokens(tokens)
         fused_feature = self.fusion_projection(fused.reshape(batch_size, -1))
+        if self.valve_stage_conditioner is not None:
+            fused_feature = self.valve_stage_conditioner(
+                fused_feature, obs_dict[self.valve_context_key]
+            )
         return torch.cat([fused_feature, self._low_dim_features(obs_dict)], dim=-1)
 
     @torch.no_grad()

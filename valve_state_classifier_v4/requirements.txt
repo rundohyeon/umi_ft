@@ -1,0 +1,5 @@
+# Install a PyTorch build appropriate for the target machine's CUDA version.
+# These are the versions used to create and verify the checkpoint.
+torch==2.1.0
+torchvision==0.16.0
+numpy==1.24.4

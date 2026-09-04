@@ -197,6 +197,65 @@ def test_dual_ft_forward_backward_uses_independent_encoders():
     assert next(encoder.right_ft_encoder.parameters()).grad.abs().sum() > 0
 
 
+def test_valve_context_routes_features_without_changing_786d_contract():
+    shape_meta = _shape_meta()
+    shape_meta["obs"]["valve_context"] = {
+        "shape": [10],
+        "horizon": 1,
+        "type": "low_dim",
+        "ignore_by_policy": True,
+    }
+    encoder = DualFTObsEncoder(
+        shape_meta=shape_meta,
+        model_name="resnet18",
+        pretrained=False,
+        frozen=False,
+        global_pool="",
+        transforms=None,
+        feature_aggregation="avg",
+        downsample_ratio=32,
+        vision_feature_dim=512,
+        fusion_dim=64,
+        fusion_heads=8,
+        fusion_feedforward_dim=128,
+        ft_channel_dims=[8, 16, 32, 32],
+        share_ft_encoder=False,
+        valve_context_key="valve_context",
+        valve_context_dim=10,
+        valve_context_hidden_dim=16,
+        valve_expert_bottleneck_dim=16,
+    )
+    obs = _obs(batch_size=2)
+    obs["valve_context"] = torch.tensor(
+        [[[1, 0, 0, 0, 0, 1, 0, 0, 0, 0]],
+         [[0, 1, 0, 0, 0, 1, 0, 0, 0, 1]]],
+        dtype=torch.float32,
+    )
+    assert int(encoder.architecture_contract_version) == 3
+    assert encoder(obs).shape == (2, 82)
+
+
+def test_dual_ft_attention_capture_preserves_fusion_output():
+    """Eval-only attention logging must not change the policy feature."""
+    torch.manual_seed(0)
+    encoder = _dual_encoder(_shape_meta()).eval()
+    obs = _obs(batch_size=2)
+    with torch.no_grad():
+        expected = encoder(obs)
+        encoder.set_fusion_attention_capture(True)
+        actual = encoder(obs)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    attention = encoder.last_fusion_attention
+    assert attention is not None
+    assert attention.shape == (2, 8, 4, 4)
+    torch.testing.assert_close(
+        attention.sum(dim=-1),
+        torch.ones((2, 8, 4), dtype=attention.dtype),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 def test_one_batch_train_step_and_checkpoint_reload():
     torch.manual_seed(0)
     shape_meta = _shape_meta()

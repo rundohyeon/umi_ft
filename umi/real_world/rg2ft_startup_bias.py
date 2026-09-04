@@ -137,3 +137,48 @@ def subtract_startup_bias(left_wrenches, right_wrenches, bias_12d):
     if bias.shape != (12,) or np.any(~np.isfinite(bias)):
         raise ValueError("startup bias must be a finite [12] vector")
     return left - bias[:6], right - bias[6:]
+
+
+def startup_residual_after_software_tare(raw_bias_12d, software_tare_offset_12d):
+    """Convert a raw startup baseline into a residual after software tare.
+
+    Collection-time RG2-FT data uses two distinct calibration stages:
+    software tare of the raw native wrench, followed by removal of a small
+    stationary residual.  The live startup sampler reads native *raw* values,
+    so its result must be expressed in the already-tared coordinate system
+    before it is applied to policy observations.
+    """
+    raw_bias = np.asarray(raw_bias_12d, dtype=np.float64)
+    tare = np.asarray(software_tare_offset_12d, dtype=np.float64)
+    if raw_bias.shape != (12,) or np.any(~np.isfinite(raw_bias)):
+        raise ValueError("raw startup bias must be a finite [12] vector")
+    if tare.shape != (12,) or np.any(~np.isfinite(tare)):
+        raise ValueError("software tare offset must be a finite [12] vector")
+    return raw_bias - tare
+
+
+def correct_native_wrenches(
+    left_wrenches,
+    right_wrenches,
+    *,
+    software_tare_offset_12d,
+    startup_residual_bias_12d,
+):
+    """Apply the exact training-time F/T calibration order to native data.
+
+    ``raw -> subtract software tare -> subtract residual startup bias``.
+    Both the causal policy history and the newest feedback/safety sample must
+    use this same operation.
+    """
+    left = np.asarray(left_wrenches)
+    right = np.asarray(right_wrenches)
+    tare = np.asarray(software_tare_offset_12d, dtype=np.float64)
+    if left.shape[-1:] != (6,) or right.shape[-1:] != (6,) or left.shape != right.shape:
+        raise ValueError("native left/right wrenches must have matching trailing shape [6]")
+    if tare.shape != (12,) or np.any(~np.isfinite(tare)):
+        raise ValueError("software tare offset must be a finite [12] vector")
+    return subtract_startup_bias(
+        left - tare[:6],
+        right - tare[6:],
+        startup_residual_bias_12d,
+    )

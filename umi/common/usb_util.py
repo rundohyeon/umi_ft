@@ -7,8 +7,45 @@ import pathlib
 _CAPTURE_CARD_MARKERS = ("Elgato", "Cam_Link", "HD60", "Game_Capture")
 
 
+def _v4l_sysfs_dir(path: str) -> pathlib.Path | None:
+    """Resolve a /dev/video* (or by-id symlink) to its V4L sysfs node."""
+    try:
+        node_name = pathlib.Path(path).resolve().name
+    except OSError:
+        node_name = pathlib.Path(path).name
+    if not node_name.startswith("video") or not node_name[5:].isdigit():
+        return None
+    return pathlib.Path("/sys/class/video4linux").joinpath(node_name)
+
+
+def get_v4l_device_name(path: str) -> str:
+    """Return the kernel-reported V4L device name when it is available."""
+    sysfs_dir = _v4l_sysfs_dir(path)
+    if sysfs_dir is None:
+        return ""
+    try:
+        return sysfs_dir.joinpath("name").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _v4l_is_index_zero(path: str) -> bool | None:
+    """Return V4L interface index, or None when the kernel does not expose it."""
+    sysfs_dir = _v4l_sysfs_dir(path)
+    if sysfs_dir is None:
+        return None
+    try:
+        return int(sysfs_dir.joinpath("index").read_text().strip()) == 0
+    except (OSError, ValueError):
+        return None
+
+
 def is_capture_card(path: str) -> bool:
-    return any(marker in path for marker in _CAPTURE_CARD_MARKERS)
+    # Docker often exposes only /dev/videoN, without /dev/v4l/by-id.  In that
+    # case the node path has no "Elgato" marker even though the actual device
+    # is an HD60/Cam Link.  Classify using the kernel's V4L device name too.
+    identity = f"{path} {get_v4l_device_name(path)}"
+    return any(marker.lower() in identity.lower() for marker in _CAPTURE_CARD_MARKERS)
 
 
 def create_usb_list():
@@ -152,10 +189,17 @@ def get_sorted_v4l_paths(by_id=True):
         valid_paths = _collect_from_v4l_dir(other_dir)
 
     if len(valid_paths) == 0:
-        valid_paths = [
+        fallback_paths = [
             p for p in sorted(pathlib.Path('/dev').glob('video*'))
             if _path_is_available(str(p))
         ]
+        # A physical UVC device commonly has a usable index-0 capture node and
+        # a metadata/index-1 node.  Choosing only index 0 avoids accidentally
+        # launching a second camera process on Elgato's metadata device.
+        index_zero_paths = [
+            p for p in fallback_paths if _v4l_is_index_zero(str(p)) is True
+        ]
+        valid_paths = index_zero_paths or fallback_paths
 
     result = [str(x.absolute()) for x in valid_paths]
     result.sort(key=lambda p: (0 if is_capture_card(p) else 1, p))

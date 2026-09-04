@@ -177,6 +177,15 @@ class UvcCamera(mp.Process):
             return self.ring_buffer.get(out=out)
         else:
             return self.ring_buffer.get_last_k(k, out=out)
+
+    def get_all(self):
+        """Return every currently retained frame without assuming a full buffer.
+
+        ``get_last_k`` deliberately asserts when a caller asks for more frames
+        than have arrived.  A camera-rate consumer that is starting mid-run
+        instead needs the bounded history that is actually available.
+        """
+        return self.ring_buffer.get_all()
     
     def get_vis(self, out=None):
         return self.vis_ring_buffer.get(out=out)

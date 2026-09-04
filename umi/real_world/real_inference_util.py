@@ -149,6 +149,15 @@ def get_real_umi_obs_dict(
     # generate relative pose with respect to episode start
     if episode_start_pose is not None:
         for robot_id in range(n_robots):        
+            start_rotation_key = (
+                f'robot{robot_id}_eef_rot_axis_angle_wrt_start'
+            )
+            # Only emit derived observations requested by the checkpoint.
+            # ParameterDict normalization rejects extra keys, and current
+            # dual-F/T checkpoints intentionally use pose-only 18-D
+            # proprioception without the legacy start-relative rotation.
+            if start_rotation_key not in obs_shape_meta:
+                continue
             # convert pose to mat
             pose_mat = pose_to_mat(np.concatenate([
                 env_obs[f'robot{robot_id}_eef_pos'],
@@ -166,7 +175,7 @@ def get_real_umi_obs_dict(
             
             rel_obs_pose = mat_to_pose10d(rel_obs_pose_mat)
             # obs_dict_np[f'robot{robot_id}_eef_pos_wrt_start'] = rel_obs_pose[:,:3]
-            obs_dict_np[f'robot{robot_id}_eef_rot_axis_angle_wrt_start'] = rel_obs_pose[:,3:]
+            obs_dict_np[start_rotation_key] = rel_obs_pose[:,3:]
 
     return obs_dict_np
 

@@ -23,10 +23,124 @@ The default hardware configuration is
 - OnRobot Compute Box: `192.168.2.1:502`
 - Modbus device/slave ID: `65`
 - RG2-FT width: `0..0.1 m`
+- Indy flange-to-training-TCP offset: `0.252 m`
 - grip force: `20 N`
 - startup auto-open: disabled
 
 Confirm these addresses on the deployment machine before connecting.
+
+## First-scene camera overlay
+
+The launcher loads `data/dataset_ft.zarr.zip` by default and overlays episode 0's
+first `camera0_rgb` image at 50% opacity on the live camera pop-up.  Select a
+different initial scene with `MATCH_EPISODE=<index>`, or provide another Zarr
+dataset with `MATCH_DATASET=/path/to/dataset.zarr.zip`.
+
+## F/T zero at startup
+
+Evaluation software-tares both RG2-FT finger sensors automatically at startup.
+It averages the latest 25 raw samples (about 0.25 seconds at 100 Hz) and
+subtracts that 12-channel baseline first. The following unloaded startup
+calibration is converted into the small residual *after* that tare, matching
+the training sidecar's `capture software tare -> episode standing bias`
+order. Policy history, force feedback, and F/T safety use this same corrected
+signal. Keep the unloaded gripper still while both stages run. Use
+`--no_zero_ft_on_start` only when raw sensor values are intentionally required;
+change the averaging window with `--ft_zero_samples N`.
+
+The current live RG2-FT transport permits a latest causal F/T age of **20 ms**
+(`RG2_FT_MAX_AGE_SEC=0.020`). This is a runtime freshness guard, not force
+filtering: every sample remains causal and the independent 50 ms F/T overload
+guard remains active. The checkpoint metadata records 12 ms from the training
+rig's alignment audit, but that margin caused false stops from a sub-1 ms
+transport jitter on this deployment computer. Override only with a positive
+seconds value, for example `RG2_FT_MAX_AGE_SEC=0.015`.
+
+## Per-evaluation diagnostics
+
+Each policy run creates `data/eval_indy_rg2/eval_logs/ep*/` containing:
+
+- `comparison.mp4`: training-match frame, exact live policy image, TCP comparison, current horizon-0 output, fusion-attention heatmap, frozen-classifier phase/reason context, and physical startup-bias-corrected left/right F/T input traces (captured before safety rejection as well);
+- `input_ft_history.csv`: all 32 causal left/right F/T samples used at every policy call, in physical and normalized units;
+- `input_ft_timeline.png`: latest causal F/T sample over the evaluation;
+- `policy_outputs.csv`: every raw 11-D output and decoded TCP/gripper target across the full 16-step horizon, including safety-rejected outputs;
+- `scheduled_actions.csv`: final scaled/F/T-corrected rows and timestamps that would be sent (`will_send_to_robot=0` in plan-only);
+- `fusion_attention.csv`, `fusion_attention_summary.json`, and `fusion_attention_mean.png`: the 4-token RGB/F/T fusion self-attention.
+
+The launcher enables fusion-attention capture by default. Disable only that
+capture with `RG2_SAVE_FUSION_ATTENTION=0`. Attention indicates query-to-key
+mixing in the fusion layer; it is not causal proof that an input caused the
+robot action. With `--show_policy_image`, the same output/attention diagnostic
+frame is also shown live in an OpenCV window.
+
+## Valve-context checkpoint (2026-09-04)
+
+`data/latest_rg_tf_context.ckpt` is not interchangeable with the ordinary
+Dual-F/T checkpoint. It requires the frozen v4 classifier at
+`valve_state_classifier_v4/model/final.pt`; the evaluator verifies its SHA-256
+against the value embedded in the context checkpoint before enabling policy
+control.
+
+Run a conservative, command-suppressed check first:
+
+```bash
+cd /ros2_ws/src/indy_umi_rg_ft
+RG2_CHECKPOINT="$PWD/data/latest_rg_tf_context.ckpt" \
+VALVE_CLASSIFIER_CHECKPOINT="$PWD/valve_state_classifier_v4/model/final.pt" \
+MATCH_DATASET="$PWD/data/dataset_ft.zarr.zip" \
+RG2_ENABLE_MOTION=0 \
+./deploy_real_indy_rg2.sh --steps_per_inference 4 --action_scale 1.0
+```
+
+For real motion, change only `RG2_ENABLE_MOTION=1` after validating the
+camera, startup F/T bias prompt, current TCP, classifier SHA, and planned
+outputs. A dedicated 60 Hz context worker now reads the UVC stream separately
+from the roughly 20 Hz diffusion-policy loop. It replays every unseen RGB
+frame through the classifier, uses the same startup-bias-corrected native F/T
+stream as the policy, and never supplies F/T newer than each RGB timestamp.
+The policy waits for the context record whose timestamp **and RGB bytes** match
+its own final camera image, so it cannot accidentally receive a future-frame
+context value. It primes a 0.5-second live-camera preroll because the first
+latency-compensated policy RGB may slightly predate `eval_t_start`. If a worker
+poll misses an actual timestamp gap, it recovers up to the latest 120 retained
+frames; if a requested exact policy anchor is absent, it performs one bounded
+32-frame anchor recovery rather than substituting a newer context value. Each
+policy episode resets classifier history; its first 61 RGB frames have
+`warmed_up=0` until the full temporal context exists.
+
+Context runs add `valve_context.csv` to the evaluation log and show current
+phase/reason/probabilities in `comparison.mp4`. The 10 values are phase
+probabilities (5), error-reason probabilities (4), then the warm-up flag (1);
+they are passed to the context policy without external normalization.
+`context_worker_summary.json` records the processed-frame count, mean/max
+camera-frame period, worker polls, timestamp-gap recovery polls,
+exact-anchor recovery polls, and any worker error. Check
+this file after each run: software can recover buffered frames, but cannot
+invent frames the GoPro/Elgato/UVC source never delivered. The camera should
+therefore be configured and verified at 60 fps where the training setup used
+60 fps.
+
+### Context input capture for retraining/debugging
+
+Context runs now save the exact classifier stream in
+`eval_logs/ep*/context_inputs/` by default (`RG2_SAVE_CONTEXT_INPUTS=1`):
+
+- `images/frame_*.png`: lossless 224×224 RGB frames, exactly the image passed
+  to the frozen classifier (not a display screenshot);
+- `context_frames.csv`: image filename/timestamp, TCP xyz, raw TCP axis-angle
+  rotation, gripper width, and the classifier phase/reason output for every
+  classifier frame;
+- `context_wrenches.csv`: each unique causal startup-bias-corrected native
+  12-D F/T sample at its source timestamp, in N/Nm. `context_frames.csv` links
+  each RGB frame to its latest preceding wrench timestamp;
+- `context_imu.csv`: explicitly records `imu_available=0`. The live
+  GoPro-HDMI → Elgato/UVC path exposes no physical IMU stream. Do **not** treat
+  the empty IMU fields as zeros; the actual low-dimensional classifier input is
+  the TCP position/axis-angle plus gripper width in `context_frames.csv`.
+
+Use `RG2_SAVE_CONTEXT_INPUTS=0` only to avoid the additional lossless-image
+disk usage. The capture is intentionally camera-rate/force-rate rather than
+only one row per slow diffusion-policy replan.
 
 ## Python dependency
 

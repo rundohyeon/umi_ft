@@ -5,6 +5,7 @@ import numpy as np
 import time
 import shutil
 import math
+import threading
 import cv2
 import yaml
 from multiprocessing.managers import SharedMemoryManager
@@ -28,20 +29,28 @@ from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.cv2_util import (
     get_image_transform as get_resize_crop_image_transform,
     optimal_row_cols)
-from umi.common.usb_util import reset_all_elgato_devices, get_sorted_v4l_paths
+from umi.common.usb_util import (
+    get_sorted_v4l_paths,
+    get_v4l_device_name,
+    reset_all_elgato_devices,
+)
 from umi.common.pose_util import pose_to_pos_rot
 from umi.common.interpolation_util import get_interp1d, PoseInterpolator
-from umi.real_world.rg2ft_obs import causal_ft_history_from_streams
-from umi.real_world.rg2ft_startup_bias import subtract_startup_bias
+from umi.real_world.rg2ft_obs import (
+    causal_ft_history_from_streams,
+    compute_ft_tare_offset,
+)
+from umi.real_world.rg2ft_startup_bias import correct_native_wrenches
 
 
 def _camera_capture_profile(dev_path: str):
     """Return ((width, height), fps, cap_buffer, width/height) for a v4l path."""
-    if "HD60" in dev_path or "Game_Capture" in dev_path:
+    identity = f"{dev_path} {get_v4l_device_name(dev_path)}"
+    if "HD60" in identity or "Game_Capture" in identity:
         return (1920, 1080), 60, 3, 16 / 9
-    if "Cam_Link_4K" in dev_path:
+    if "Cam_Link_4K" in identity:
         return (3840, 2160), 30, 3, 16 / 9
-    if "Cam_Link" in dev_path:
+    if "Cam_Link" in identity:
         return (1920, 1080), 60, 3, 16 / 9
     # GoPro USB / other UVC (training default)
     return (4000, 3000), 30, 1, 4 / 3
@@ -81,6 +90,8 @@ class UmiEnv:
             rg2ft_home_to_open=False,
             rg2ft_move_max_speed=0.2,
             rg2ft_open_tolerance=0.005,
+            rg2ft_zero_on_start=False,
+            rg2ft_zero_samples=25,
             gripper_commands_enabled=True,
             gripper_serial_port=None,
             dynamixel_id=1,
@@ -102,6 +113,7 @@ class UmiEnv:
             # obs
             obs_image_resolution=(224,224),
             max_obs_buffer_size=60,
+            context_camera_history_frames=None,
             obs_float32=False,
             camera_reorder=None,
             no_mirror=False,
@@ -263,8 +275,9 @@ class UmiEnv:
         vis_transform = list()
         for idx, path in enumerate(v4l_paths):
             res, fps, buf, _wh_ratio = camera_profiles[idx]
-            is_hd60 = "HD60" in path or "Game_Capture" in path
-            is_cam_link_4k = "Cam_Link_4K" in path
+            camera_identity = f"{path} {get_v4l_device_name(path)}"
+            is_hd60 = "HD60" in camera_identity or "Game_Capture" in camera_identity
+            is_cam_link_4k = "Cam_Link_4K" in camera_identity
             if is_hd60:
                 stack_crop = (idx == 0) and mirror_crop
                 is_mirror = None
@@ -545,9 +558,26 @@ class UmiEnv:
         self.gripper = gripper
         self.use_gripper = use_gripper
         self.gripper_commands_enabled = bool(gripper_commands_enabled)
+        self.rg2ft_zero_on_start = bool(
+            rg2ft_zero_on_start and use_gripper and gripper_type != 'dynamixel'
+        )
+        self.rg2ft_zero_samples = int(rg2ft_zero_samples)
+        if self.rg2ft_zero_samples <= 0:
+            raise ValueError("rg2ft_zero_samples must be positive")
+        self.rg2ft_ft_offset = np.zeros(12, dtype=np.float64)
         self.multi_cam_vis = multi_cam_vis
         self.frequency = frequency
         self.max_obs_buffer_size = max_obs_buffer_size
+        if context_camera_history_frames is None:
+            context_camera_history_frames = max_obs_buffer_size
+        self.context_camera_history_frames = int(context_camera_history_frames)
+        if self.context_camera_history_frames <= 0:
+            raise ValueError("context_camera_history_frames must be positive")
+        if self.context_camera_history_frames > int(max_obs_buffer_size):
+            raise ValueError(
+                "context_camera_history_frames cannot exceed max_obs_buffer_size "
+                f"({self.context_camera_history_frames} > {max_obs_buffer_size})"
+            )
         self.max_pos_speed = max_pos_speed
         self.max_rot_speed = max_rot_speed
         self.mirror_crop = mirror_crop
@@ -579,6 +609,12 @@ class UmiEnv:
         self.replay_buffer = replay_buffer
         # temp memory buffers
         self.last_camera_data = None
+        # A context worker reads a longer, independent camera history than the
+        # two-frame diffusion-policy observation.  Do not reuse
+        # ``last_camera_data``: doing so loses camera-rate frames whenever the
+        # policy loop is slower than the camera.
+        self._context_camera_data_by_k = {}
+        self._camera_read_lock = threading.Lock()
         # recording buffers
         self.obs_accumulator = None
         self.action_accumulator = None
@@ -639,9 +675,43 @@ class UmiEnv:
             camera.video_recorder.start_wait()
         if self.use_gripper and self.gripper is not None:
             self.gripper.start_wait()
+            if self.rg2ft_zero_on_start:
+                self._zero_rg2ft_from_recent_samples()
         self.robot.start_wait()
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.start_wait()
+
+    def _zero_rg2ft_from_recent_samples(self):
+        """Match collection-time software tare using recent raw samples."""
+        deadline = time.monotonic() + max(
+            2.0,
+            2.0 * self.rg2ft_zero_samples / max(self.ft_obs_frequency, 1.0),
+        )
+        samples = None
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                state = self.gripper.get_all_state()
+                samples = np.asarray(state['gripper_ft'], dtype=np.float64)
+                if len(samples) >= self.rg2ft_zero_samples:
+                    break
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.01)
+        if samples is None or len(samples) == 0:
+            detail = "" if last_error is None else f": {last_error}"
+            raise RuntimeError(f"F/T auto-zero received no sensor samples{detail}")
+        self.rg2ft_ft_offset = compute_ft_tare_offset(
+            samples,
+            n_avg=self.rg2ft_zero_samples,
+        )
+        left = np.array2string(self.rg2ft_ft_offset[:6], precision=4)
+        right = np.array2string(self.rg2ft_ft_offset[6:], precision=4)
+        print(
+            "[F/T auto-zero] software tare applied from "
+            f"{min(len(samples), self.rg2ft_zero_samples)} samples; "
+            f"left={left} right={right}"
+        )
     
     def stop_wait(self):
         self.robot.stop_wait()
@@ -662,10 +732,27 @@ class UmiEnv:
 
     # ========= async env API ===========
     def set_ft_startup_bias(self, bias_12d):
+        """Set the small stationary bias measured *after* software tare.
+
+        ``rg2ft_ft_offset`` stores the collection-matching software tare.
+        This value is the residual in that already-tared sensor frame, not a
+        second raw-sensor baseline.
+        """
         bias = np.asarray(bias_12d, dtype=np.float64)
         if bias.shape != (12,) or np.any(~np.isfinite(bias)):
             raise ValueError("live F/T startup bias must be a finite [12] vector")
         self.ft_startup_bias_12d = bias.copy()
+
+    def _correct_native_ft(self, left_wrenches, right_wrenches):
+        """Match training F/T preprocessing for policy, feedback, and safety."""
+        if self.ft_startup_bias_12d is None:
+            raise RuntimeError("native F/T correction requested before startup bias calibration")
+        return correct_native_wrenches(
+            left_wrenches,
+            right_wrenches,
+            software_tare_offset_12d=self.rg2ft_ft_offset,
+            startup_residual_bias_12d=self.ft_startup_bias_12d,
+        )
 
     def hold_robot(self):
         """Cancel pending robot/gripper waypoints and hold measured targets."""
@@ -684,18 +771,129 @@ class UmiEnv:
         state = self.gripper.get_state()
         left_raw = np.asarray(state['gripper_ft_left'], dtype=np.float64).reshape(6)
         right_raw = np.asarray(state['gripper_ft_right'], dtype=np.float64).reshape(6)
-        left, right = subtract_startup_bias(
-            left_raw[None], right_raw[None], self.ft_startup_bias_12d
-        )
+        left, right = self._correct_native_ft(left_raw[None], right_raw[None])
         return {
             'left_raw': left_raw,
             'right_raw': right_raw,
+            'left_after_software_tare': left_raw - self.rg2ft_ft_offset[:6],
+            'right_after_software_tare': right_raw - self.rg2ft_ft_offset[6:],
             'left': left[0],
             'right': right[0],
             'timestamp': float(state['gripper_timestamp']),
         }
 
-    def get_obs(self) -> dict:
+    def get_valve_context_stream(self, *, history_frames=None):
+        """Return a long camera-rate stream for the asynchronous context worker.
+
+        This intentionally does *not* reuse the two-frame policy observation.
+        At a roughly 20 Hz diffusion replanning rate that short buffer loses
+        many 60 Hz camera frames before the next policy call.  The returned
+        RGB frames are already transformed by the same camera pipeline as
+        ``camera0_rgb`` and all F/T values use the exact startup-tare then
+        residual-bias correction passed to the policy.
+        """
+        if not self.is_ready:
+            raise RuntimeError("context stream requested before UmiEnv is ready")
+        if self.gripper is None or not self.use_gripper:
+            raise RuntimeError("context stream requires a live RG2-FT gripper")
+        if self.ft_startup_bias_12d is None:
+            raise RuntimeError(
+                "context stream requested before live startup bias calibration"
+            )
+
+        if history_frames is None:
+            history_frames = self.context_camera_history_frames
+        history_frames = int(history_frames)
+        if history_frames <= 0 or history_frames > self.context_camera_history_frames:
+            raise ValueError(
+                "context history_frames must be in [1, "
+                f"{self.context_camera_history_frames}], got {history_frames}"
+            )
+        with self._camera_read_lock:
+            if history_frames == 1:
+                # This is the normal worker path: one inexpensive newest-frame
+                # read per camera-rate poll.
+                context_camera_data = self.camera.get(
+                    k=1,
+                    out=self._context_camera_data_by_k.get(1),
+                )
+                self._context_camera_data_by_k[1] = context_camera_data
+            else:
+                # Recovery path after the worker observes a step-index jump.
+                # ``get_all`` is essential during startup: requesting a fixed
+                # 120 frames before that many arrived would assert in the
+                # shared-memory ring buffer.
+                all_camera_data = self.camera.get_all()
+                context_camera_data = {
+                    camera_idx: {
+                        key: np.asarray(value)[-history_frames:]
+                        for key, value in camera_data.items()
+                    }
+                    for camera_idx, camera_data in all_camera_data.items()
+                }
+        context_camera = context_camera_data[self.align_camera_idx]
+        timestamps = np.asarray(context_camera['timestamp'], dtype=np.float64)
+        if timestamps.ndim != 1 or len(timestamps) == 0:
+            raise RuntimeError("context camera stream contains no timestamps")
+        if not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) < 0.0):
+            raise RuntimeError("context camera timestamps must be finite and sorted")
+
+        rgb = np.asarray(context_camera['color'])
+        if rgb.shape[0] != len(timestamps):
+            raise RuntimeError("context camera RGB/timestamp lengths do not match")
+        if self.mirror_crop:
+            rgb = rgb[..., :3]
+        if rgb.shape[1:] != (224, 224, 3):
+            raise RuntimeError(
+                "context camera must expose final policy RGB [224,224,3], got "
+                f"{rgb.shape}"
+            )
+
+        robot_data = self.robot.get_all_state()
+        robot_pose_interpolator = PoseInterpolator(
+            t=np.asarray(robot_data['robot_timestamp'], dtype=np.float64),
+            x=np.asarray(robot_data['ActualTCPPose']),
+        )
+        robot_pose = robot_pose_interpolator(timestamps)
+
+        gripper_data = self.gripper.get_all_state()
+        required = ('gripper_timestamp', 'gripper_position', 'gripper_ft_left', 'gripper_ft_right')
+        missing = [key for key in required if key not in gripper_data]
+        if missing:
+            raise RuntimeError(
+                "context stream missing RG2-FT fields: " + ", ".join(missing)
+            )
+        gripper_timestamps = np.asarray(
+            gripper_data['gripper_timestamp'], dtype=np.float64
+        )
+        if (
+            gripper_timestamps.ndim != 1
+            or len(gripper_timestamps) == 0
+            or not np.isfinite(gripper_timestamps).all()
+            or np.any(np.diff(gripper_timestamps) < 0.0)
+        ):
+            raise RuntimeError("context RG2-FT timestamps must be finite and sorted")
+        width_interpolator = get_interp1d(
+            t=gripper_timestamps,
+            x=np.asarray(gripper_data['gripper_position'])[..., None],
+        )
+        left, right = self._correct_native_ft(
+            np.asarray(gripper_data['gripper_ft_left']),
+            np.asarray(gripper_data['gripper_ft_right']),
+        )
+        return {
+            'rgb_timestamp_s': timestamps,
+            'camera_step_idx': np.asarray(context_camera['step_idx'], dtype=np.int64),
+            'camera0_rgb': rgb,
+            'robot0_eef_pos': robot_pose[..., :3],
+            'robot0_eef_rot_axis_angle': robot_pose[..., 3:],
+            'robot0_gripper_width': width_interpolator(timestamps),
+            'ft_timestamp_s': gripper_timestamps,
+            'robot0_ft_left': left.astype(np.float32),
+            'robot0_ft_right': right.astype(np.float32),
+        }
+
+    def get_obs(self, *, include_valve_context_stream=True) -> dict:
         """
         Timestamp alignment policy
         'current' time is the last timestamp of align_camera_idx
@@ -728,9 +926,11 @@ class UmiEnv:
         k = math.ceil(
             self.camera_obs_horizon * self.camera_down_sample_steps \
             * (60 / self.frequency))
-        self.last_camera_data = self.camera.get(
-            k=k, 
-            out=self.last_camera_data)
+        with self._camera_read_lock:
+            self.last_camera_data = self.camera.get(
+                k=k,
+                out=self.last_camera_data,
+            )
 
         # 125/500 hz, robot_receive_timestamp
         last_robot_data = self.robot.get_all_state()
@@ -740,6 +940,14 @@ class UmiEnv:
         last_gripper_data = None
         if self.use_gripper and self.gripper is not None:
             last_gripper_data = self.gripper.get_all_state()
+        tared_gripper_ft = None
+        if last_gripper_data is not None:
+            tared_gripper_ft = (
+                np.asarray(last_gripper_data['gripper_ft'], dtype=np.float64)
+                - self.rg2ft_ft_offset
+            )
+            if self.ft_startup_bias_12d is not None:
+                tared_gripper_ft = tared_gripper_ft - self.ft_startup_bias_12d
 
         last_timestamp = self.last_camera_data[self.align_camera_idx]['timestamp'][-1]
         dt = 1 / self.frequency
@@ -784,7 +992,7 @@ class UmiEnv:
             gripper_width = gripper_interpolator(gripper_obs_timestamps)
             ft_interpolator = get_interp1d(
                 t=last_gripper_data['gripper_timestamp'],
-                x=last_gripper_data['gripper_ft']
+                x=tared_gripper_ft,
             )
             robot0_ft = ft_interpolator(gripper_obs_timestamps)
         else:
@@ -817,27 +1025,27 @@ class UmiEnv:
             # side-specific streams currently share this wall-clock timestamp.
             # The assembler nevertheless samples them independently, matching
             # the training dataset's two causal lookups.
-            causal_raw = causal_ft_history_from_streams(
+            causal_native = causal_ft_history_from_streams(
                 last_gripper_data['gripper_timestamp'],
-                last_gripper_data['gripper_ft_left'],
+                np.asarray(last_gripper_data['gripper_ft_left']),
                 last_gripper_data['gripper_timestamp'],
-                last_gripper_data['gripper_ft_right'],
+                np.asarray(last_gripper_data['gripper_ft_right']),
                 anchor_timestamp=last_timestamp,
                 num_steps=self.ft_obs_horizon,
                 stride=self.ft_obs_stride,
                 frequency=self.ft_obs_frequency,
                 max_age=self.ft_max_age,
             )
-            corrected_left, corrected_right = subtract_startup_bias(
-                causal_raw['robot0_ft_left'],
-                causal_raw['robot0_ft_right'],
-                self.ft_startup_bias_12d,
+            corrected_left, corrected_right = self._correct_native_ft(
+                causal_native['robot0_ft_left'],
+                causal_native['robot0_ft_right'],
             )
-            causal = dict(causal_raw)
+            causal = dict(causal_native)
             causal['robot0_ft_left'] = corrected_left.astype(np.float32)
             causal['robot0_ft_right'] = corrected_right.astype(np.float32)
-            causal['robot0_ft_left_raw'] = causal_raw['robot0_ft_left'].copy()
-            causal['robot0_ft_right_raw'] = causal_raw['robot0_ft_right'].copy()
+            causal['robot0_ft_left_raw'] = causal_native['robot0_ft_left'].copy()
+            causal['robot0_ft_right_raw'] = causal_native['robot0_ft_right'].copy()
+            causal['robot0_ft_software_tare_offset'] = self.rg2ft_ft_offset.copy()
             causal['robot0_ft_startup_bias'] = self.ft_startup_bias_12d.copy()
             latest_left_raw = np.asarray(
                 last_gripper_data['gripper_ft_left'][-1], dtype=np.float64
@@ -845,10 +1053,8 @@ class UmiEnv:
             latest_right_raw = np.asarray(
                 last_gripper_data['gripper_ft_right'][-1], dtype=np.float64
             )
-            latest_left, latest_right = subtract_startup_bias(
-                latest_left_raw[None],
-                latest_right_raw[None],
-                self.ft_startup_bias_12d,
+            latest_left, latest_right = self._correct_native_ft(
+                latest_left_raw[None], latest_right_raw[None]
             )
             causal['robot0_ft_left_latest_raw'] = latest_left_raw
             causal['robot0_ft_right_latest_raw'] = latest_right_raw
@@ -873,7 +1079,7 @@ class UmiEnv:
                 self.obs_accumulator.put(
                     data={
                         'robot0_gripper_width': last_gripper_data['gripper_position'][...,None],
-                        'robot0_ft': last_gripper_data['gripper_ft']
+                        'robot0_ft': tared_gripper_ft,
                     },
                     timestamps=last_gripper_data['gripper_timestamp']
                 )
@@ -882,6 +1088,21 @@ class UmiEnv:
         obs_data = dict(camera_obs)
         obs_data.update(robot_obs)
         obs_data.update(gripper_obs)
+        # The context policy's frozen classifier operates at camera rate, not
+        # merely at the (slower) diffusion replanning rate.  Keep the recent
+        # *already policy-preprocessed* camera frames plus time-aligned raw
+        # physical signals so the evaluator can replay every unseen frame
+        # causally.  This field is diagnostic/runtime-only and is never fed to
+        # the diffusion policy as an observation key.
+        if (
+            include_valve_context_stream
+            and self.ft_obs_horizon > 0
+            and last_gripper_data is not None
+            and self.ft_startup_bias_12d is not None
+            and 'gripper_ft_left' in last_gripper_data
+            and 'gripper_ft_right' in last_gripper_data
+        ):
+            obs_data['valve_context_stream'] = self.get_valve_context_stream()
         obs_data['timestamp'] = camera_obs_timestamps
 
         return obs_data

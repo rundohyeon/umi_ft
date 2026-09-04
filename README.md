@@ -286,6 +286,73 @@ See [the evaluation guide](docs/run_dual_ft_inference.md) and
 [the implementation/safety audit](docs/dual_ft_inference_audit.md) for the
 complete contracts and remaining commissioning limits.
 
+<details>
+<summary><strong>2026-09-04 — RG2-FT Dual F/T v3: verified Indy real-robot deployment</strong></summary>
+
+This is the current, verified deployment recipe for the Indy + RG2-FT
+dual-force/torque policy. It uses the deployment contract
+`dual_ft_786_action11_xyzw_v3`; do not substitute an older image-only or
+18-D-proprioception checkpoint.
+
+| Item | Verified value |
+| --- | --- |
+| Checkpoint | `data/latest_rg_ft.ckpt` |
+| Match dataset / episode | `data/dataset_ft.zarr.zip`, episode `0` |
+| Prediction horizon | 16 actions (serialized in the checkpoint) |
+| Executed before replanning | 4 actions (`--steps_per_inference 4`) |
+| Action scale | `1.0` (TCP translation and rotation; not gripper width) |
+| Iteration limit | Unlimited unless `--max_policy_iters` is supplied |
+| Output logs | `data/eval_indy_rg2/eval_logs/ep*_YYYYMMDD_HHMMSS/` |
+
+The 4-action setting has a nominal 200 ms replanning interval at the policy's
+19.98 Hz action frequency. The checkpoint still predicts 16 actions; this
+option only changes how many predicted rows are sent before the next policy
+call.
+
+Enter the already-running deployment container from the host:
+
+```bash
+docker exec -it indy_umi_ft bash
+```
+
+Then, inside the container, start with a non-motion validation run. It
+connects and records live observations but does not submit robot/gripper
+waypoints:
+
+```bash
+cd /ros2_ws/src/indy_umi_rg_ft
+
+RG2_ENABLE_MOTION=0 \
+RG2_CHECKPOINT=/ros2_ws/src/indy_umi_rg_ft/data/latest_rg_ft.ckpt \
+MATCH_DATASET=/ros2_ws/src/indy_umi_rg_ft/data/dataset_ft.zarr.zip \
+MATCH_EPISODE=0 \
+ACTION_SCALE=1.0 \
+./deploy_real_indy_rg2.sh --steps_per_inference 4
+```
+
+After confirming the live policy image, pose, F/T zeroing, and emergency-stop
+condition, enable actual motion with the same checkpoint and dataset:
+
+```bash
+cd /ros2_ws/src/indy_umi_rg_ft
+
+RG2_ENABLE_MOTION=1 \
+RG2_CHECKPOINT=/ros2_ws/src/indy_umi_rg_ft/data/latest_rg_ft.ckpt \
+MATCH_DATASET=/ros2_ws/src/indy_umi_rg_ft/data/dataset_ft.zarr.zip \
+MATCH_EPISODE=0 \
+ACTION_SCALE=1.0 \
+./deploy_real_indy_rg2.sh --steps_per_inference 4
+```
+
+Use `--steps_per_inference 1` for the most conservative per-action debugging;
+the accepted values are `1`, `2`, `4`, `6`, and `8`. To impose a finite test
+run, append `--max_policy_iters N`. The current motion guard limits each
+consecutive waypoint to 15 mm translation, 0.1 rad rotation, and 15 mm gripper
+width change. Evaluation logs include the comparison video, full 16-step model
+outputs, scheduled commands, F/T histories, and fusion-attention diagnostics.
+
+</details>
+
 ## Valve-state context classifier
 
 <details>

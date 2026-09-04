@@ -423,6 +423,31 @@ class IndyInterpolationController(mp.Process):
                 pose_try_list = [pose_si_rotvec, mm_deg_legacy]
 
         last_exc = None
+
+        def _check_command_response(response):
+            """Raise on a controller-side rejection returned by IndyDCP3.
+
+            The Neuromeka ``movetelel_abs`` API returns a mapping such as
+            ``{"code": 0, "msg": "..."}`` instead of raising on a rejected
+            motion request.  Treat a non-zero response as a failed command;
+            otherwise evaluation can log a submitted waypoint while the robot
+            remains stationary.  Other command adapters may return ``None``;
+            retain their existing success behaviour.
+            """
+            if not isinstance(response, dict) or "code" not in response:
+                return
+            try:
+                code = int(response["code"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Indy {cmd_name} returned an invalid response: {response!r}"
+                ) from exc
+            if code != 0:
+                raise RuntimeError(
+                    f"Indy {cmd_name} rejected task waypoint: "
+                    f"code={code}, msg={response.get('msg', '')!r}"
+                )
+
         for pose_list in pose_try_list:
             kwargs_candidates = [
                 {"tpos": pose_list, "vel_ratio": self.vel_ratio, "acc_ratio": self.acc_ratio},
@@ -433,7 +458,7 @@ class IndyInterpolationController(mp.Process):
 
             for kwargs in kwargs_candidates:
                 try:
-                    cmd_fn(**kwargs)
+                    _check_command_response(cmd_fn(**kwargs))
                     return
                 except TypeError:
                     continue
@@ -442,7 +467,7 @@ class IndyInterpolationController(mp.Process):
                     break
 
             try:
-                cmd_fn(pose_list)
+                _check_command_response(cmd_fn(pose_list))
                 return
             except Exception as exc:
                 last_exc = exc

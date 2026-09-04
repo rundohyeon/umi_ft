@@ -21,6 +21,16 @@ EXPECTED_ACTION_CHANNELS = [
     "grasp_force_N",
 ]
 
+_VALVE_CONTEXT_KEY = "valve_context"
+_VALVE_PHASE_NAMES = [
+    "approach",
+    "turning",
+    "endpoint_reached",
+    "task_complete",
+    "error",
+]
+_VALVE_REASON_NAMES = ["none", "turn_no_contact", "post_contact_drop", "other"]
+
 
 def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
     """Fail closed unless ``payload`` implements the corrected 786/11 contract.
@@ -37,6 +47,7 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
     if obs_meta is None or action_meta is None:
         raise ValueError("checkpoint cfg is missing task.shape_meta")
 
+    is_valve_context_policy = _VALVE_CONTEXT_KEY in obs_meta
     expected_obs_shapes = {
         "camera0_rgb": (2, (3, 224, 224)),
         "robot0_eef_pos": (2, (3,)),
@@ -44,6 +55,8 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "robot0_ft_left": (32, (6,)),
         "robot0_ft_right": (32, (6,)),
     }
+    if is_valve_context_policy:
+        expected_obs_shapes[_VALVE_CONTEXT_KEY] = (1, (10,))
     required_modalities = {"camera0_rgb", "robot0_ft_left", "robot0_ft_right"}
     missing_modalities = sorted(required_modalities - set(obs_meta.keys()))
     if missing_modalities:
@@ -74,6 +87,10 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "robot0_ft_left": ("low_dim", False, 1),
         "robot0_ft_right": ("low_dim", False, 1),
     }
+    if is_valve_context_policy:
+        # Context is consumed by ValveStageConditioner, not flattened by the
+        # inherited Timm low-dimensional encoder.
+        expected_obs_attributes[_VALVE_CONTEXT_KEY] = ("low_dim", True, 1)
     for key, (expected_type, expected_ignored, expected_stride) in (
         expected_obs_attributes.items()
     ):
@@ -121,7 +138,9 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
 
     contract_requirements = {
         "task.model_contract.version": (
-            "dual_ft_786_action11_base_sidecar_bias_only_width_feedback_v6"
+            "dual_ft_context_786_action11_v1"
+            if is_valve_context_policy
+            else "dual_ft_786_action11_base_sidecar_bias_only_width_feedback_v6"
         ),
         "task.model_contract.condition_dim": 786,
         "task.model_contract.pose_quaternion_order": "xyzw",
@@ -244,6 +263,28 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "policy.obs_encoder.share_ft_encoder": False,
         "policy.obs_encoder.vision_feature_dim": 768,
     }
+    if is_valve_context_policy:
+        contract_requirements.update(
+            {
+                "task.model_contract.valve_context_schema": (
+                    "umi_valve_context_sidecar_v1"
+                ),
+                "task.model_contract.valve_context_dim": 10,
+                "task.model_contract.valve_context_key": _VALVE_CONTEXT_KEY,
+                "task.model_contract.valve_context_classifier_version": "v4",
+                "task.model_contract.valve_context_classifier_frozen": True,
+                "task.model_contract.valve_context_routing": (
+                    "soft_phase_moe_residual_v1"
+                ),
+                "task.model_contract.valve_context_input_wrench_key": (
+                    "wrench_12d_capture"
+                ),
+                "policy.obs_encoder.valve_context_key": _VALVE_CONTEXT_KEY,
+                "policy.obs_encoder.valve_context_dim": 10,
+                "policy.obs_encoder.valve_context_hidden_dim": 128,
+                "policy.obs_encoder.valve_expert_bottleneck_dim": 128,
+            }
+        )
     for path, expected in contract_requirements.items():
         actual = OmegaConf.select(cfg, path, default=None)
         if actual != expected:
@@ -289,6 +330,33 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
             "checkpoint action channel schema mismatch: "
             f"expected={EXPECTED_ACTION_CHANNELS} got={action_channels}"
         )
+    if is_valve_context_policy:
+        for path, expected in {
+            "task.model_contract.valve_context_phase_names": _VALVE_PHASE_NAMES,
+            "task.model_contract.valve_context_error_reason_names": _VALVE_REASON_NAMES,
+            "task.valve_context.schema": "umi_valve_context_sidecar_v1",
+            "task.valve_context.context_key": _VALVE_CONTEXT_KEY,
+            "task.valve_context.timestamp_key": "valve_context_timestamp_s",
+            "task.valve_context.episode_ends_key": "rgb_episode_ends",
+            "task.valve_context.input_wrench_key": "wrench_12d_capture",
+            "task.valve_context.classifier_frozen": True,
+        }.items():
+            actual = OmegaConf.select(cfg, path, default=None)
+            if isinstance(expected, list):
+                actual = list(actual) if actual is not None else []
+            if actual != expected:
+                raise ValueError(
+                    f"checkpoint context marker {path} must be {expected!r}, got {actual!r}"
+                )
+        classifier_sha256 = str(
+            OmegaConf.select(cfg, "task.valve_context.checkpoint_sha256", default="")
+        ).lower()
+        if len(classifier_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in classifier_sha256
+        ):
+            raise ValueError(
+                "checkpoint task.valve_context.checkpoint_sha256 must be a 64-char hex digest"
+            )
 
     fusion_requirements = {
         "policy.obs_encoder.fusion_dim": 768,
@@ -344,13 +412,21 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "normalizer.params_dict.robot0_ft_right.",
         "normalizer.params_dict.action.",
     )
+    if is_valve_context_policy:
+        required_state_fragments = required_state_fragments + (
+            "obs_encoder.valve_stage_conditioner.stage_encoder.",
+            "obs_encoder.valve_stage_conditioner.experts.",
+            "normalizer.params_dict.valve_context.",
+        )
     deprecated_fusion_state = (
         "obs_encoder.cls_token",
         "obs_encoder.token_embedding",
         "obs_encoder.fusion_norm.",
     )
     exact_state_contract = {
-        "obs_encoder.architecture_contract_version": ((), 2),
+        "obs_encoder.architecture_contract_version": (
+            (), 3 if is_valve_context_policy else 2
+        ),
         "obs_encoder.left_ft_encoder.temporal_contract_version": ((), 1),
         "obs_encoder.right_ft_encoder.temporal_contract_version": ((), 1),
         "obs_encoder.position_embedding": ((4, 768), None),
@@ -363,6 +439,25 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "normalizer.params_dict.action.scale": ((11,), None),
         "normalizer.params_dict.action.offset": ((11,), None),
     }
+    if is_valve_context_policy:
+        exact_state_contract.update(
+            {
+                "obs_encoder.valve_stage_conditioner.stage_encoder.0.weight": (
+                    (128, 10), None
+                ),
+                "obs_encoder.valve_stage_conditioner.stage_encoder.0.bias": (
+                    (128,), None
+                ),
+                "obs_encoder.valve_stage_conditioner.stage_encoder.2.weight": (
+                    (768, 128), None
+                ),
+                "obs_encoder.valve_stage_conditioner.stage_encoder.2.bias": (
+                    (768,), None
+                ),
+                "normalizer.params_dict.valve_context.scale": ((1,), None),
+                "normalizer.params_dict.valve_context.offset": ((1,), None),
+            }
+        )
     for state_name, state in policy_states.items():
         absent = [
             fragment
@@ -401,6 +496,37 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
                         f"checkpoint {state_name} state {key} must equal "
                         f"{expected_scalar}, got {scalar}"
                     )
+        if is_valve_context_policy:
+            for expert_idx in range(5):
+                expert_shapes = {
+                    f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network.0.weight": (768,),
+                    f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network.0.bias": (768,),
+                    f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network.1.weight": (128, 768),
+                    f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network.1.bias": (128,),
+                    f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network.3.weight": (768, 128),
+                    f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network.3.bias": (768,),
+                }
+                for key, expected_shape in expert_shapes.items():
+                    if key not in state or tuple(getattr(state[key], "shape", ())) != expected_shape:
+                        actual_shape = tuple(getattr(state.get(key), "shape", ()))
+                        raise ValueError(
+                            f"checkpoint {state_name} context expert state {key} "
+                            f"must have shape {expected_shape}, got {actual_shape}"
+                        )
+            context_scale = torch.as_tensor(
+                state["normalizer.params_dict.valve_context.scale"]
+            ).detach().cpu()
+            context_offset = torch.as_tensor(
+                state["normalizer.params_dict.valve_context.offset"]
+            ).detach().cpu()
+            if not bool(torch.allclose(context_scale, torch.ones_like(context_scale))):
+                raise ValueError(
+                    f"checkpoint {state_name} valve_context normalizer must be identity scale"
+                )
+            if not bool(torch.allclose(context_offset, torch.zeros_like(context_offset))):
+                raise ValueError(
+                    f"checkpoint {state_name} valve_context normalizer must be identity offset"
+                )
         for key, value in state.items():
             if not str(key).startswith("normalizer.params_dict."):
                 continue
@@ -441,4 +567,7 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "ft_dim": int(obs_meta.robot0_ft_left.shape[0]),
         "normalizer_owner": "policy.predict_action",
         "validated_state_names": sorted(policy_states),
+        "valve_context_enabled": is_valve_context_policy,
+        "valve_context_key": _VALVE_CONTEXT_KEY if is_valve_context_policy else None,
+        "valve_context_dim": 10 if is_valve_context_policy else 0,
     }
