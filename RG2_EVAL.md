@@ -122,7 +122,7 @@ therefore be configured and verified at 60 fps where the training setup used
 
 ### Context input capture for retraining/debugging
 
-Context runs now save the exact classifier stream in
+Context runs now save the complete frozen-classifier input contract in
 `eval_logs/ep*/context_inputs/` by default (`RG2_SAVE_CONTEXT_INPUTS=1`):
 
 - `images/frame_*.png`: lossless 224×224 RGB frames, exactly the image passed
@@ -133,14 +133,65 @@ Context runs now save the exact classifier stream in
 - `context_wrenches.csv`: each unique causal startup-bias-corrected native
   12-D F/T sample at its source timestamp, in N/Nm. `context_frames.csv` links
   each RGB frame to its latest preceding wrench timestamp;
-- `context_imu.csv`: explicitly records `imu_available=0`. The live
-  GoPro-HDMI → Elgato/UVC path exposes no physical IMU stream. Do **not** treat
-  the empty IMU fields as zeros; the actual low-dimensional classifier input is
-  the TCP position/axis-angle plus gripper width in `context_frames.csv`.
+- `classifier_windows/window_*.npz`: one archive for every classifier
+  prediction. This is authoritative for the 16-step temporal input actually
+  selected at that instant: RGB timestamps and source image-file references,
+  TCP-derived `lowdim` `[x,y,z,rot6d,width]`, physical F/T histories, the
+  exact model-scaled F/T histories, and the causal F/T masks;
+- `classifier_windows/index.csv`: classifier timestamp, archive name, temporal
+  step count, and F/T history length.
+
+The classifier directly consumes no physical IMU feature, so neither a
+`context_imu.csv` file nor a fabricated zero IMU vector is emitted. Its direct
+low-dimensional input is TCP position, rotation-6D, and gripper width; the raw
+axis-angle needed to reproduce rotation-6D is retained in `context_frames.csv`.
+The RGB PNG is lossless, so the exact pre-normalizer classifier tensor is
+reconstructed without approximation as `moveaxis(rgb, -1, 1).astype(float32) /
+255.0`; its window ordering comes from `rgb_image_file`. The ImageNet
+mean/std constants are in `capture_manifest.json`. This avoids copying the
+same 16 RGB tensors into every camera-rate archive and prevents logging from
+stalling real-time context inference.
 
 Use `RG2_SAVE_CONTEXT_INPUTS=0` only to avoid the additional lossless-image
 disk usage. The capture is intentionally camera-rate/force-rate rather than
 only one row per slow diffusion-policy replan.
+
+### Exact diffusion-policy input capture
+
+For a second algorithm or offline reproduction, the evaluator also writes
+`eval_logs/ep*/policy_inputs/` by default (`RG2_SAVE_POLICY_INPUTS=1`). This is
+separate from `context_inputs/`: it is one sample per diffusion-policy call and
+captures the exact NumPy observation dictionary after live preprocessing and
+immediately before `policy.predict_action` (before its internal normalizer).
+
+- `samples/sample_*.npz`: authoritative arrays passed to the policy: two
+  `camera0_rgb` frames in `TCHW` float32, relative TCP position, rotation-6D,
+  causal left/right F/T histories, and `valve_context` for the context
+  checkpoint;
+- `images/`: lossless PNG views of those two exact policy RGB frames;
+- `ft_history.csv`: the same 32-step-per-finger policy F/T tensors with their
+  causal source timestamps;
+- `index.csv`: policy iteration, RGB anchor timestamp, archive, and image
+  filenames.
+
+Use `RG2_SAVE_POLICY_INPUTS=0` only when this per-inference capture is not
+needed. The archive contains every and only `shape_meta.obs` input key; this
+checkpoint defines no IMU key, so no IMU placeholder file is emitted.
+
+### Optional TCP momentum experiment
+
+The default is disabled (`RG2_MOTION_MOMENTUM_PREVIOUS_WEIGHT=0`). To blend
+the last actually submitted TCP increment with the new policy increment at the
+requested 1:2 previous:current ratio, set:
+
+```bash
+RG2_MOTION_MOMENTUM_PREVIOUS_WEIGHT=0.3333333333
+```
+
+Only TCP position and orientation are blended; F/T width feedback remains
+unchanged. The state is updated only after waypoint submission, persists
+through F/T contact and watchdog holds, and the normal position/rotation/
+gripper safety gate still validates the blended waypoint afterward.
 
 ## Python dependency
 

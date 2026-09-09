@@ -87,6 +87,49 @@ def test_context_worker_replays_all_unseen_camera_frames_and_matches_policy_anch
         worker.stop()
 
 
+def test_context_worker_recovers_from_a_transient_camera_stream_timeout():
+    timestamp_s = 10.0
+    stream = {
+        "rgb_timestamp_s": np.asarray([timestamp_s], dtype=np.float64),
+        "camera_step_idx": np.asarray([100], dtype=np.int64),
+        "camera0_rgb": np.zeros((1, 224, 224, 3), dtype=np.uint8),
+        "robot0_eef_pos": np.zeros((1, 3), dtype=np.float32),
+        "robot0_eef_rot_axis_angle": np.zeros((1, 3), dtype=np.float32),
+        "robot0_gripper_width": np.full((1, 1), 0.055, dtype=np.float32),
+        "ft_timestamp_s": np.asarray([9.99], dtype=np.float64),
+        "robot0_ft_left": np.zeros((1, 6), dtype=np.float32),
+        "robot0_ft_right": np.zeros((1, 6), dtype=np.float32),
+    }
+    read_count = 0
+
+    def stream_provider(*, history_frames):
+        nonlocal read_count
+        read_count += 1
+        if read_count == 1:
+            raise TimeoutError("temporary camera stream timeout")
+        return stream
+
+    worker = _ValveContextWorker(
+        _FakeContextRuntime(), stream_provider, poll_hz=200.0
+    )
+    worker.start(episode_start_timestamp_s=timestamp_s)
+    try:
+        record = worker.record_for_policy_anchor(
+            timestamp_s=timestamp_s,
+            rgb=stream["camera0_rgb"][0],
+            timeout_s=1.0,
+        )
+        assert record.timestamp_s == timestamp_s
+        summary = worker.summary()
+        assert summary["transient_stream_timeouts"] == 1
+        assert "temporary camera stream timeout" in summary[
+            "last_transient_stream_timeout"
+        ]
+        assert summary["error"] is None
+    finally:
+        worker.stop()
+
+
 def test_context_worker_does_not_recover_for_normal_lower_camera_fps_step_jumps():
     """A 40 Hz source requested as 60 Hz often advances step_idx by two."""
     timestamps = np.asarray([10.000, 10.025, 10.050, 10.075], dtype=np.float64)

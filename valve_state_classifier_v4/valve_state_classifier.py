@@ -321,6 +321,10 @@ class ValveStateRuntime:
         self.force_values: Deque[np.ndarray] = deque(maxlen=max_force_buffer)
         self._last_rgb_timestamp: Optional[float] = None
         self._last_force_timestamp: Optional[float] = None
+        # Inspection-only snapshot of the most recent causal temporal window.
+        # This is never consumed by the model and therefore cannot alter
+        # classifier predictions.
+        self.last_model_inputs: Optional[Dict[str, np.ndarray]] = None
 
     def reset(self) -> None:
         """Start a new episode; histories must never cross episode boundaries."""
@@ -329,6 +333,7 @@ class ValveStateRuntime:
         self.force_values.clear()
         self._last_rgb_timestamp = None
         self._last_force_timestamp = None
+        self.last_model_inputs = None
 
     def append_wrench(self, timestamp_s: float, wrench_12d: Sequence[float]) -> None:
         timestamp_s = float(timestamp_s)
@@ -401,13 +406,33 @@ class ValveStateRuntime:
         indices = np.maximum(indices, 0)
         observations = list(self.observations)
         chosen = [observations[int(index)] for index in indices]
+        images = np.stack([item.image for item in chosen])
+        lowdim_window = np.stack([item.lowdim for item in chosen])
+        wrench_history = np.stack([item.force for item in chosen])
+        wrench_mask = np.stack([item.force_mask for item in chosen])
+        self.last_model_inputs = {
+            # ``rgb_timestamp_s`` names lossless uint8 source images held by
+            # the evaluator's capture. ``predict_window`` deterministically
+            # converts them to TCHW float/255, so copying a 16-image float
+            # tensor for every 60 Hz prediction is unnecessary and would
+            # starve the real-time context worker of CPU and disk bandwidth.
+            "rgb_timestamp_s": np.asarray(
+                [item.timestamp_s for item in chosen], dtype=np.float64
+            ),
+            "lowdim": lowdim_window.copy(),
+            "wrench_history_physical": wrench_history.copy(),
+            "wrench_history_model_scaled": (
+                wrench_history / WRENCH_SCALE[None, None]
+            ).astype(np.float32),
+            "wrench_mask": wrench_mask.copy(),
+        }
         phase_probability, reason_probability = predict_window(
             self.model,
             self.device,
-            images=np.stack([item.image for item in chosen]),
-            lowdim=np.stack([item.lowdim for item in chosen]),
-            wrench_history=np.stack([item.force for item in chosen]),
-            wrench_mask=np.stack([item.force_mask for item in chosen]),
+            images=images,
+            lowdim=lowdim_window,
+            wrench_history=wrench_history,
+            wrench_mask=wrench_mask,
         )
         phase_id = int(phase_probability.argmax())
         reason_id = int(reason_probability.argmax())

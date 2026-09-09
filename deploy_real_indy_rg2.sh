@@ -21,8 +21,10 @@ ROBOT_CONFIG="${RG2_ROBOT_CONFIG:-$ROOT/example/eval_robots_config_indy_rg2.yaml
 MATCH_DATASET="${MATCH_DATASET:-$ROOT/data/dataset_ft.zarr.zip}"
 MATCH_EPISODE="${MATCH_EPISODE:-0}"
 ACTION_SCALE="${ACTION_SCALE:-0.2}"
+RG2_MOTION_MOMENTUM_PREVIOUS_WEIGHT="${RG2_MOTION_MOMENTUM_PREVIOUS_WEIGHT:-0}"
 RG2_SAVE_FUSION_ATTENTION="${RG2_SAVE_FUSION_ATTENTION:-1}"
 RG2_SAVE_CONTEXT_INPUTS="${RG2_SAVE_CONTEXT_INPUTS:-1}"
+RG2_SAVE_POLICY_INPUTS="${RG2_SAVE_POLICY_INPUTS:-1}"
 RG2_FT_MAX_AGE_SEC="${RG2_FT_MAX_AGE_SEC:-0.020}"
 VALVE_CLASSIFIER_CHECKPOINT="${VALVE_CLASSIFIER_CHECKPOINT:-$ROOT/valve_state_classifier_v4/model/final.pt}"
 VALVE_CLASSIFIER_DEVICE="${VALVE_CLASSIFIER_DEVICE:-auto}"
@@ -81,7 +83,7 @@ CONTEXT_CAPTURE_ARGS=()
 case "${RG2_SAVE_CONTEXT_INPUTS,,}" in
   1|true|yes|on)
     CONTEXT_CAPTURE_ARGS+=(--save_context_inputs)
-    echo "Context diagnostics: exact classifier RGB PNGs, corrected F/T, TCP inputs, and outputs will be logged."
+    echo "Context diagnostics: every classifier RGB/TCP/F-T temporal window and output will be logged."
     ;;
   0|false|no|off)
     CONTEXT_CAPTURE_ARGS+=(--no_save_context_inputs)
@@ -89,6 +91,22 @@ case "${RG2_SAVE_CONTEXT_INPUTS,,}" in
     ;;
   *)
     echo "RG2_SAVE_CONTEXT_INPUTS must be 0/1 or true/false, got: $RG2_SAVE_CONTEXT_INPUTS" >&2
+    exit 2
+    ;;
+esac
+
+POLICY_CAPTURE_ARGS=()
+case "${RG2_SAVE_POLICY_INPUTS,,}" in
+  1|true|yes|on)
+    POLICY_CAPTURE_ARGS+=(--save_policy_inputs)
+    echo "Policy input capture: exact pre-normalizer RGB, TCP/rotation-6D, causal F/T, and context will be logged."
+    ;;
+  0|false|no|off)
+    POLICY_CAPTURE_ARGS+=(--no_save_policy_inputs)
+    echo "Policy input capture disabled."
+    ;;
+  *)
+    echo "RG2_SAVE_POLICY_INPUTS must be 0/1 or true/false, got: $RG2_SAVE_POLICY_INPUTS" >&2
     exit 2
     ;;
 esac
@@ -115,10 +133,12 @@ exec "$PYTHON_BIN" "$ROOT/eval_real_indy_rg2.py" \
   --match_episode "$MATCH_EPISODE" \
   --allow_rotation \
   --action_scale "$ACTION_SCALE" \
+  --motion_momentum_previous_weight "$RG2_MOTION_MOMENTUM_PREVIOUS_WEIGHT" \
   --ft_max_age_sec "$RG2_FT_MAX_AGE_SEC" \
   --vis_pose \
   "${DIAGNOSTIC_ARGS[@]}" \
   "${CONTEXT_CAPTURE_ARGS[@]}" \
+  "${POLICY_CAPTURE_ARGS[@]}" \
   "${VALVE_CONTEXT_ARGS[@]}" \
   "${SAFETY_ARGS[@]}" \
   "$@"

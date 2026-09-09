@@ -76,6 +76,32 @@ class ValveStateContextRuntime:
     def last_prediction_timestamp(self) -> float:
         return float(self._last_prediction_timestamp)
 
+    def get_last_classifier_model_inputs(self) -> dict[str, np.ndarray]:
+        """Return the frozen classifier's exact most recent causal window.
+
+        RGB source frames are captured losslessly by the evaluator and are
+        referenced by their timestamps. The remaining entries are the exact
+        precomputed temporal low-dimensional/F-T tensors. This is an
+        observation-only debug API; it does not mutate classifier state.
+        """
+        values = getattr(self._runtime, "last_model_inputs", None)
+        if not isinstance(values, dict):
+            raise RuntimeError("classifier did not expose its latest model inputs")
+        required = {
+            "rgb_timestamp_s",
+            "lowdim",
+            "wrench_history_physical",
+            "wrench_history_model_scaled",
+            "wrench_mask",
+        }
+        missing = required - set(values)
+        if missing:
+            raise RuntimeError(
+                "classifier latest-model-input snapshot is incomplete: "
+                + ", ".join(sorted(missing))
+            )
+        return {key: np.asarray(values[key]).copy() for key in required}
+
     def append_causal_wrench_history(
         self,
         timestamps,
