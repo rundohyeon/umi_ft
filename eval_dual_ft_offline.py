@@ -46,11 +46,15 @@ EXPECTED_ACTION_DIM = 11
 IMPLEMENTATION_FILES = (
     "eval_dual_ft_offline.py",
     "diffusion_policy/common/dual_ft_contract.py",
+    "diffusion_policy/common/valve_context_contract.py",
     "diffusion_policy/config/task/umi_dual_ft.yaml",
     "diffusion_policy/config/task/umi_dual_ft_260827_bias_only.yaml",
+    "diffusion_policy/config/task/umi_dual_ft_context_v2_260827.yaml",
     "diffusion_policy/config/train_diffusion_unet_timm_umi_dual_ft_workspace.yaml",
+    "diffusion_policy/config/train_diffusion_unet_timm_umi_dual_ft_context_v2_workspace.yaml",
     "diffusion_policy/dataset/umi_dual_ft_dataset.py",
     "diffusion_policy/model/vision/dual_ft_obs_encoder.py",
+    "diffusion_policy/model/vision/valve_stage_conditioner.py",
     "diffusion_policy/policy/diffusion_unet_timm_policy.py",
 )
 
@@ -259,6 +263,10 @@ def _normalizer_summary(policy) -> dict[str, Any]:
         "robot0_ft_right": 6,
         "action": EXPECTED_ACTION_DIM,
     }
+    if "valve_context" in params:
+        # The context normalizer is a scalar identity mapping broadcast across
+        # all probabilities/flags.
+        expected_dimensions["valve_context"] = 1
     missing = [key for key in expected_dimensions if key not in params]
     if missing:
         raise ValueError(f"checkpoint normalizer is missing keys: {missing}")
@@ -329,6 +337,7 @@ def load_policy(
     *,
     dataset_path: Path,
     force_sidecar_path: Path,
+    context_sidecar_path: Path | None,
     device_spec: str,
     weights: str,
     num_inference_steps: int | None,
@@ -359,6 +368,11 @@ def load_policy(
     cfg.task.dataset.dataset_path = str(dataset_path)
     cfg.task.force_sidecar_path = str(force_sidecar_path)
     cfg.task.dataset.force_sidecar_path = str(force_sidecar_path)
+    if contract["valve_context_enabled"]:
+        if context_sidecar_path is None:
+            raise ValueError("context policy evaluation requires a context sidecar")
+        cfg.task.valve_context_sidecar_path = str(context_sidecar_path)
+        cfg.task.dataset.valve_context_sidecar_path = str(context_sidecar_path)
     if OmegaConf.select(cfg, "policy.obs_encoder.pretrained", default=None) is not None:
         cfg.policy.obs_encoder.pretrained = False
     if OmegaConf.select(cfg, "policy.obs_encoder.transforms", default=None) is not None:
@@ -1065,6 +1079,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if dataset_path == force_sidecar_path:
         raise ValueError("base dataset and force sidecar paths must differ")
+    obs_meta = OmegaConf.select(payload["cfg"], "task.shape_meta.obs", default={})
+    context_enabled = "valve_context" in obs_meta
+    context_sidecar_path = None
+    if context_enabled:
+        embedded_context_sidecar = str(
+            OmegaConf.select(
+                payload["cfg"],
+                "task.dataset.valve_context_sidecar_path",
+                default="",
+            )
+        )
+        context_sidecar_path = _resolve_dataset(
+            args.context_sidecar,
+            embedded_context_sidecar,
+            checkpoint,
+            option_name="--context-sidecar",
+        )
+        if context_sidecar_path in (dataset_path, force_sidecar_path):
+            raise ValueError("context sidecar must differ from base/force inputs")
+    elif args.context_sidecar is not None:
+        raise ValueError("--context-sidecar was supplied for a non-context checkpoint")
     output = Path(args.output).expanduser().resolve()
     if output == checkpoint:
         raise ValueError("--output must not overwrite the checkpoint")
@@ -1076,12 +1111,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         force_sidecar_path.is_dir() and _is_within(output, force_sidecar_path)
     ):
         raise ValueError("--output must not overwrite or modify the force sidecar")
+    if context_sidecar_path is not None and (
+        output == context_sidecar_path
+        or (context_sidecar_path.is_dir() and _is_within(output, context_sidecar_path))
+    ):
+        raise ValueError("--output must not overwrite or modify the context sidecar")
     if output.exists() and output.is_dir():
         raise ValueError(f"--output must be a file path, got directory: {output}")
     loaded = load_policy(
         payload,
         dataset_path=dataset_path,
         force_sidecar_path=force_sidecar_path,
+        context_sidecar_path=context_sidecar_path,
         device_spec=args.device,
         weights=args.weights,
         num_inference_steps=args.num_inference_steps,
@@ -1120,6 +1161,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         multiprocessing_context="spawn" if worker_count > 0 else None,
     )
     try:
+        context_sidecar_manifest = (
+            None
+            if context_sidecar_path is None
+            else _filesystem_manifest(context_sidecar_path)
+        )
         dataset_provenance = _dataset_provenance(
             dataset,
             split_dataset,
@@ -1161,6 +1207,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "force sidecar files changed during evaluation; rerun on an "
                 "immutable copy"
             )
+        if (
+            context_sidecar_path is not None
+            and _filesystem_manifest(context_sidecar_path)
+            != context_sidecar_manifest
+        ):
+            raise RuntimeError(
+                "context sidecar files changed during evaluation; rerun on an "
+                "immutable copy"
+            )
         report = {
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": checkpoint_sha256,
@@ -1169,6 +1224,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "weights": loaded.state_name,
             "dataset": str(dataset_path),
             "force_sidecar": str(force_sidecar_path),
+            "context_sidecar": (
+                None if context_sidecar_path is None else str(context_sidecar_path)
+            ),
+            "context_sidecar_filesystem_manifest": context_sidecar_manifest,
             "split": args.split,
             "split_samples": len(split_dataset),
             "selected_samples": len(selected_dataset),
@@ -1231,6 +1290,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--force-sidecar",
         default=None,
         help="Override checkpoint force_sidecar_path (bias-only native F/T zarr).",
+    )
+    parser.add_argument(
+        "--context-sidecar",
+        default=None,
+        help="Override the checkpoint's frozen-observer 5-D context sidecar.",
     )
     parser.add_argument(
         "--split",

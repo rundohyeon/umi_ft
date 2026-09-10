@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import os
 from typing import Dict
@@ -22,6 +23,12 @@ from diffusion_policy.common.normalize_util import (
     get_range_normalizer_from_stat,
 )
 from diffusion_policy.common.pose_repr_util import convert_pose_mat_rep
+from diffusion_policy.common.valve_context_contract import (
+    VALVE_CONTEXT_KEY,
+    VALVE_CONTEXT_V2_DIM,
+    VALVE_CONTEXT_V2_PHASE_NAMES,
+    VALVE_CONTEXT_V2_SCHEMA,
+)
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.sampler import get_val_mask
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
@@ -46,6 +53,7 @@ ALLOWED_OBS_KEYS = REQUIRED_OBS_KEYS | {
     # official-parity task config uses pose-only (18-D) proprioception.
     "robot0_gripper_width",
     "robot0_eef_rot_axis_angle_wrt_start",
+    VALVE_CONTEXT_KEY,
 }
 
 DISALLOWED_KEY_FRAGMENTS = (
@@ -164,6 +172,8 @@ class UmiDualFTDataset(BaseImageDataset):
         pose_quaternion_order: str,
         ft: dict,
         force_sidecar_path: str | None = None,
+        valve_context_sidecar_path: str | None = None,
+        valve_context_checkpoint_sha256: str | None = None,
         pose_repr: dict = {},
         action_padding: bool = False,
         seed: int = 42,
@@ -174,6 +184,16 @@ class UmiDualFTDataset(BaseImageDataset):
         self.dataset_path = str(dataset_path)
         self.force_sidecar_path = (
             None if force_sidecar_path is None else str(force_sidecar_path)
+        )
+        self.valve_context_sidecar_path = (
+            None
+            if valve_context_sidecar_path is None
+            else str(valve_context_sidecar_path)
+        )
+        self.valve_context_checkpoint_sha256 = (
+            None
+            if valve_context_checkpoint_sha256 is None
+            else str(valve_context_checkpoint_sha256).lower()
         )
         self.source_mode = (
             "multirate" if self.force_sidecar_path is None
@@ -192,6 +212,29 @@ class UmiDualFTDataset(BaseImageDataset):
             start_pose_noise_scale, dtype=np.float64
         )
         self.threadpool_limits_is_applied = False
+
+        context_in_shape_meta = VALVE_CONTEXT_KEY in self.shape_meta["obs"]
+        context_path_configured = self.valve_context_sidecar_path is not None
+        if context_in_shape_meta != context_path_configured:
+            raise ValueError(
+                "valve_context observation and valve_context_sidecar_path must "
+                "either both be configured or both be absent"
+            )
+        if context_in_shape_meta:
+            context_meta = self.shape_meta["obs"][VALVE_CONTEXT_KEY]
+            if (
+                tuple(context_meta.get("shape", ())) != (VALVE_CONTEXT_V2_DIM,)
+                or int(context_meta.get("horizon", -1)) != 1
+                or not bool(context_meta.get("ignore_by_policy", False))
+            ):
+                raise ValueError(
+                    "v2 valve_context must be ignored-by-legacy [1,5] observation"
+                )
+            digest = self.valve_context_checkpoint_sha256 or ""
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError(
+                    "valve_context_checkpoint_sha256 must be a 64-character hex digest"
+                )
 
         self._validate_allowlist()
         self._prefix = detect_zarr_prefix(self.dataset_path).prefix
@@ -241,6 +284,11 @@ class UmiDualFTDataset(BaseImageDataset):
             self._convert_pose_axis_angle(raw_pose)
         else:
             raise AssertionError(f"unsupported raw pose format {raw_pose_format!r}")
+
+        self.valve_context = None
+        self.valve_context_timestamps = None
+        if context_in_shape_meta:
+            self._load_valve_context_sidecar()
 
         self.n_episodes = len(self.rgb_episode_ends)
         self.val_mask = get_val_mask(
@@ -482,6 +530,69 @@ class UmiDualFTDataset(BaseImageDataset):
         ).reshape(-1)
         self._validate_sidecar_causal_mapping()
         return raw_pose, "axis_angle_pose6"
+
+    def _load_valve_context_sidecar(self):
+        store, root, _ = open_nested_zip_group(self.valve_context_sidecar_path)
+        try:
+            attrs = dict(root.attrs)
+            if str(attrs.get("schema", "")) != VALVE_CONTEXT_V2_SCHEMA:
+                raise ValueError(
+                    "valve context sidecar schema must be "
+                    f"{VALVE_CONTEXT_V2_SCHEMA!r}"
+                )
+            if int(attrs.get("context_dim", -1)) != VALVE_CONTEXT_V2_DIM:
+                raise ValueError("valve context sidecar dimension must be five")
+            if tuple(attrs.get("phase_names", ())) != VALVE_CONTEXT_V2_PHASE_NAMES:
+                raise ValueError("valve context sidecar phase order is invalid")
+            actual_checkpoint_sha = str(
+                attrs.get("observer_checkpoint_sha256", "")
+            ).lower()
+            if actual_checkpoint_sha != self.valve_context_checkpoint_sha256:
+                raise ValueError(
+                    "valve context sidecar was generated by a different observer: "
+                    f"expected={self.valve_context_checkpoint_sha256} "
+                    f"actual={actual_checkpoint_sha}"
+                )
+            expected_episode_digest = hashlib.sha256(
+                np.asarray(self.rgb_episode_ends, dtype=np.int64).tobytes()
+            ).hexdigest()
+            if str(attrs.get("base_episode_ends_sha256", "")) != expected_episode_digest:
+                raise ValueError(
+                    "valve context sidecar is bound to a different base dataset"
+                )
+            data = root["data"]
+            meta = root["meta"]
+            context = np.asarray(data["valve_context_5d"][:], dtype=np.float32)
+            timestamps = np.asarray(
+                data["valve_context_timestamp_s"][:], dtype=np.float64
+            ).reshape(-1)
+            episode_ends = np.asarray(
+                meta["rgb_episode_ends"][:], dtype=np.int64
+            ).reshape(-1)
+        finally:
+            store.close()
+        if context.shape != (len(self.rgb_timestamps), VALVE_CONTEXT_V2_DIM):
+            raise ValueError(
+                f"valve context array has invalid shape {context.shape}"
+            )
+        if timestamps.shape != self.rgb_timestamps.shape or not np.allclose(
+            timestamps, self.rgb_timestamps, rtol=0.0, atol=1e-6
+        ):
+            raise ValueError("valve context timestamps differ from RGB anchors")
+        if not np.array_equal(episode_ends, self.rgb_episode_ends):
+            raise ValueError("valve context episode ends differ from base dataset")
+        if not np.isfinite(context).all() or np.any(context < -1e-6) or np.any(
+            context > 1.0 + 1e-6
+        ):
+            raise ValueError("valve context contains invalid probabilities")
+        if not np.allclose(context[:, :4].sum(axis=1), 1.0, rtol=0.0, atol=1e-4):
+            raise ValueError("valve context phase probabilities do not sum to one")
+        valid = context[:, 4]
+        if not np.all(np.isclose(valid, 0.0) | np.isclose(valid, 1.0)):
+            raise ValueError("valve context validity flag must be binary")
+        self.valve_context = context
+        self.valve_context_timestamps = timestamps
+        self.valve_context_sidecar_attrs = attrs
 
     @property
     def detected_prefix(self):
@@ -1032,6 +1143,10 @@ class UmiDualFTDataset(BaseImageDataset):
         )
         obs["robot0_ft_left"] = left
         obs["robot0_ft_right"] = right
+        if self.valve_context is not None:
+            obs[VALVE_CONTEXT_KEY] = self.valve_context[current][None].astype(
+                np.float32
+            )
 
         if load_rgb:
             rgb_array = self._get_rgb_array()
@@ -1155,6 +1270,10 @@ class UmiDualFTDataset(BaseImageDataset):
             )
         normalizer["robot0_ft_left"] = get_range_normalizer_from_stat(left_stat)
         normalizer["robot0_ft_right"] = get_range_normalizer_from_stat(right_stat)
+        if self.valve_context is not None:
+            # Probabilities and the binary validity flag are already in their
+            # policy representation and must not be rescaled.
+            normalizer[VALVE_CONTEXT_KEY] = get_image_identity_normalizer()
         normalizer["action"] = concatenate_normalizer(
             [
                 get_range_normalizer_from_stat(action_pos.result()),
@@ -1196,6 +1315,17 @@ class UmiDualFTDataset(BaseImageDataset):
                 "start_timestamp": float(info["action_timestamps"][0]),
                 "end_timestamp": float(info["action_timestamps"][-1]),
             },
+            "valve_context": (
+                None
+                if self.valve_context is None
+                else {
+                    "shape": tuple(obs[VALVE_CONTEXT_KEY].shape),
+                    "values": obs[VALVE_CONTEXT_KEY][0].tolist(),
+                    "timestamp": float(self.valve_context_timestamps[
+                        self.indices[idx][1]
+                    ]),
+                }
+            ),
             "anchor_timestamp": float(info["anchor_timestamp"]),
         }
 

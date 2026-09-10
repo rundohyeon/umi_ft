@@ -123,11 +123,23 @@ class DualFTObsEncoder(ModuleAttrMixin):
         valve_context_dim: int = 10,
         valve_context_hidden_dim: int = 128,
         valve_expert_bottleneck_dim: int = 128,
+        valve_context_num_phase_experts: int = 5,
     ):
         super().__init__()
+        if valve_context_key is None:
+            architecture_contract_version = 2
+        elif (int(valve_context_dim), int(valve_context_num_phase_experts)) == (10, 5):
+            architecture_contract_version = 3
+        elif (int(valve_context_dim), int(valve_context_num_phase_experts)) == (5, 4):
+            architecture_contract_version = 4
+        else:
+            raise ValueError(
+                "unsupported valve context encoder contract: "
+                f"dim={valve_context_dim}, experts={valve_context_num_phase_experts}"
+            )
         self.register_buffer(
             "architecture_contract_version",
-            torch.tensor(3 if valve_context_key is not None else 2, dtype=torch.int64),
+            torch.tensor(architecture_contract_version, dtype=torch.int64),
             persistent=True,
         )
         self.shape_meta = shape_meta
@@ -238,6 +250,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
                 feature_dim=self.fusion_dim,
                 hidden_dim=int(valve_context_hidden_dim),
                 expert_bottleneck_dim=int(valve_expert_bottleneck_dim),
+                num_phase_experts=int(valve_context_num_phase_experts),
             )
             if valve_context_key is not None
             else None

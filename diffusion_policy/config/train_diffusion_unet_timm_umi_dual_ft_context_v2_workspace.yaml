@@ -1,0 +1,25 @@
+defaults:
+  - train_diffusion_unet_timm_umi_dual_ft_workspace
+  - override task: umi_dual_ft_context_v2_260827
+  - _self_
+
+name: train_diffusion_unet_timm_umi_dual_ft_context_v2
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+
+policy:
+  obs_encoder:
+    valve_context_key: valve_context
+    valve_context_dim: 5
+    valve_context_num_phase_experts: 4
+    valve_context_hidden_dim: 128
+    valve_expert_bottleneck_dim: 128
+
+training:
+  # Warm-start shared action-policy weights without restoring optimizer/epoch.
+  # Supply this on the command line; resume and init_from_checkpoint are
+  # mutually exclusive.
+  init_from_checkpoint: null
+  init_weights: auto
+  resume: false
+

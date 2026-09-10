@@ -1,0 +1,54 @@
+defaults:
+  - umi_dual_ft_260827_bias_only
+  - _self_
+
+name: umi_dual_ft_context_v2_260827
+
+model_contract:
+  version: dual_ft_context_v2_4state_786_action11_v1
+  valve_context_schema: umi_valve_context_sidecar_v2_4state
+  valve_context_dim: 5
+  valve_context_key: valve_context
+  valve_context_phase_names: [approach, turning, recovery, error]
+  valve_context_error_reason_names: []
+  valve_context_classifier_version: observer_v2_4state
+  valve_context_classifier_frozen: true
+  valve_context_routing: soft_phase_moe_residual_v2
+  valve_context_input_wrench_key: wrench_12d
+
+shape_meta:
+  obs:
+    valve_context:
+      shape: [5]
+      horizon: 1
+      latency_steps: 0
+      down_sample_steps: 1
+      type: low_dim
+      # ValveStageConditioner consumes this field. The inherited timm
+      # low-dimensional encoder must not flatten it into proprioception.
+      ignore_by_policy: true
+
+valve_context_sidecar_path: session_260827/dataset_valve_context_v2_4state.zarr
+valve_context:
+  schema: umi_valve_context_sidecar_v2_4state
+  policy_key: valve_context
+  context_key: valve_context_5d
+  timestamp_key: valve_context_timestamp_s
+  episode_ends_key: rgb_episode_ends
+  phase_names: [approach, turning, recovery, error]
+  context_dim: 5
+  context_valid_index: 4
+  classifier_frozen: true
+  observer_version: observer_v2_4state
+  observer_schema: umi_causal_context_observer_v2_4state
+  checkpoint_path: answer/best_context.pt
+  checkpoint_sha256: b759155d33bd0c00fb5a673f072d38737bedc95e455540beaf74dce0b700c281
+  input_wrench_key: wrench_12d
+  rgb_horizon: 2
+  rgb_stride: 3
+  force_history_samples: 50
+
+dataset:
+  shape_meta: ${task.shape_meta}
+  valve_context_sidecar_path: ${task.valve_context_sidecar_path}
+  valve_context_checkpoint_sha256: ${task.valve_context.checkpoint_sha256}

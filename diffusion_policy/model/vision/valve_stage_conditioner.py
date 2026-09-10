@@ -1,9 +1,8 @@
 """Context-conditioned residual feature routing for the valve policy.
 
-This module intentionally mirrors the architecture serialized in
-``latest_rg_tf_context.ckpt``.  The five phase probabilities select a soft
-mixture of residual experts; the four reason probabilities and warm-up flag
-are still available to the learned stage embedding.
+The legacy 10-D/v1 contract uses five phase experts.  The v2 contract uses
+four A/T/R/E experts and a fifth ``context_valid`` input.  In both versions,
+phase probabilities select a soft mixture of residual experts.
 """
 
 from __future__ import annotations
@@ -45,10 +44,13 @@ class ValveStageConditioner(nn.Module):
         self.context_dim = int(context_dim)
         self.feature_dim = int(feature_dim)
         self.num_phase_experts = int(num_phase_experts)
-        if self.context_dim != 10:
-            raise ValueError("valve context contract requires exactly 10 values")
-        if self.num_phase_experts != 5:
-            raise ValueError("valve context contract requires five phase experts")
+        supported = {(10, 5), (5, 4)}
+        if (self.context_dim, self.num_phase_experts) not in supported:
+            raise ValueError(
+                "supported valve context contracts are (dim=10, experts=5) "
+                "and (dim=5, experts=4), got "
+                f"(dim={self.context_dim}, experts={self.num_phase_experts})"
+            )
         # Do not wrap this in another named module: the trained checkpoint has
         # ``stage_encoder.0`` and ``stage_encoder.2`` keys.
         self.stage_encoder = nn.Sequential(

@@ -60,7 +60,7 @@ seconds value, for example `RG2_FT_MAX_AGE_SEC=0.015`.
 
 Each policy run creates `data/eval_indy_rg2/eval_logs/ep*/` containing:
 
-- `comparison.mp4`: training-match frame, exact live policy image, TCP comparison, current horizon-0 output, fusion-attention heatmap, frozen-classifier phase/reason context, and physical startup-bias-corrected left/right F/T input traces (captured before safety rejection as well);
+- `comparison.mp4`: training-match frame, exact live policy image, TCP comparison, current horizon-0 output, fusion-attention heatmap, frozen-observer context, and physical startup-bias-corrected left/right F/T input traces (captured before safety rejection as well);
 - `input_ft_history.csv`: all 32 causal left/right F/T samples used at every policy call, in physical and normalized units;
 - `input_ft_timeline.png`: latest causal F/T sample over the evaluation;
 - `policy_outputs.csv`: every raw 11-D output and decoded TCP/gripper target across the full 16-step horizon, including safety-rejected outputs;
@@ -73,7 +73,37 @@ mixing in the fusion layer; it is not causal proof that an input caused the
 robot action. With `--show_policy_image`, the same output/attention diagnostic
 frame is also shown live in an OpenCV window.
 
-## Valve-context checkpoint (2026-09-04)
+## Four-state valve-context checkpoint
+
+The current contract is `umi_valve_context_sidecar_v2_4state`. The frozen
+observer is `answer/best_context.pt` with SHA-256
+`b759155d33bd0c00fb5a673f072d38737bedc95e455540beaf74dce0b700c281`.
+It outputs `[P(approach), P(turning), P(recovery), P(error), context_valid]`.
+The observer is a separate required artifact, not a submodule embedded in the
+action-policy checkpoint.
+
+The evaluator reconstructs the observer's two-frame, stride-three causal
+window online. Each frame uses the latest 50 native 12-D F/T samples at or
+before that RGB timestamp. TCP pose is expressed relative to the latest of the
+two frames. Context is routed through the trainable four-expert policy
+conditioner and therefore directly influences the predicted action.
+
+Start with command submission disabled:
+
+```bash
+cd /ros2_ws/src/indy_umi_rg_ft
+RG2_ENABLE_MOTION=0 \
+RG2_CHECKPOINT="$PWD/data/context_v2_latest.ckpt" \
+VALVE_CLASSIFIER_CHECKPOINT="$PWD/answer/best_context.pt" \
+MATCH_DATASET="$PWD/data/dataset_ft.zarr.zip" \
+./deploy_real_indy_rg2.sh --steps_per_inference 1 --max_policy_iters 1
+```
+
+The evaluator validates the context schema, 5-D input, four-state order, and
+observer SHA before policy execution. Enable `RG2_ENABLE_MOTION=1` only after
+checking the planned output and all startup/safety diagnostics.
+
+## Legacy 5-phase valve-context checkpoint (2026-09-04)
 
 `data/latest_rg_tf_context.ckpt` is not interchangeable with the ordinary
 Dual-F/T checkpoint. It requires the frozen v4 classifier at

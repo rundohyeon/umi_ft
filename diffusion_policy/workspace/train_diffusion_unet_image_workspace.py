@@ -17,6 +17,7 @@ import copy
 import random
 import wandb
 import pickle
+import dill
 import tqdm
 import numpy as np
 import shutil
@@ -173,6 +174,104 @@ def _build_optimizer_param_groups(model, cfg):
     return param_groups
 
 
+def _select_initial_policy_state(payload, requested: str):
+    states = payload.get("state_dicts", {})
+    if not isinstance(states, dict):
+        raise ValueError("initial checkpoint has no state_dicts")
+    requested = str(requested)
+    if requested == "auto":
+        source_uses_ema = bool(
+            OmegaConf.select(payload.get("cfg"), "training.use_ema", default=False)
+        )
+        candidates = ("ema_model", "model") if source_uses_ema else ("model", "ema_model")
+    elif requested in ("model", "ema_model"):
+        candidates = (requested,)
+    else:
+        raise ValueError("training.init_weights must be auto, model, or ema_model")
+    for name in candidates:
+        state = states.get(name)
+        if isinstance(state, dict) and state:
+            return name, state
+    raise ValueError(
+        f"initial checkpoint has none of the requested states {candidates}; "
+        f"available={sorted(states)}"
+    )
+
+
+def _load_shared_policy_weights(target, source_state: dict) -> dict:
+    """Warm-start matching action weights while keeping v2 context new.
+
+    Dataset normalizers are recomputed for the new run. The architecture marker
+    and all context-conditioner parameters must also remain target-initialized.
+    """
+
+    target_state = target.state_dict()
+    excluded_prefixes = (
+        "normalizer.",
+        "obs_encoder.valve_stage_conditioner.",
+        "obs_encoder.architecture_contract_version",
+    )
+    loaded = []
+    skipped_missing = []
+    skipped_shape = []
+    skipped_excluded = []
+    merged = dict(target_state)
+    for key, value in source_state.items():
+        if any(key.startswith(prefix) for prefix in excluded_prefixes):
+            skipped_excluded.append(key)
+            continue
+        if key not in target_state:
+            skipped_missing.append(key)
+            continue
+        if tuple(value.shape) != tuple(target_state[key].shape):
+            skipped_shape.append(key)
+            continue
+        merged[key] = value
+        loaded.append(key)
+    required_fragments = (
+        "model.",
+        "obs_encoder.vision_pose_encoder.",
+        "obs_encoder.left_ft_encoder.",
+        "obs_encoder.right_ft_encoder.",
+        "obs_encoder.fusion.",
+        "obs_encoder.fusion_projection.",
+    )
+    missing_fragments = [
+        prefix for prefix in required_fragments
+        if not any(key.startswith(prefix) for key in loaded)
+    ]
+    if missing_fragments:
+        raise ValueError(
+            "initial checkpoint is not a compatible dual-F/T action policy; "
+            "missing shared weights: " + ", ".join(missing_fragments)
+        )
+    target.load_state_dict(merged, strict=True)
+    return {
+        "loaded": len(loaded),
+        "skipped_excluded": len(skipped_excluded),
+        "skipped_missing": len(skipped_missing),
+        "skipped_shape": len(skipped_shape),
+    }
+
+
+def _initialize_from_policy_checkpoint(model, ema_model, path, weights: str) -> dict:
+    checkpoint_path = pathlib.Path(str(path)).expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"training.init_from_checkpoint does not exist: {checkpoint_path}"
+        )
+    with checkpoint_path.open("rb") as stream:
+        payload = torch.load(stream, map_location="cpu", pickle_module=dill)
+    state_name, source_state = _select_initial_policy_state(payload, weights)
+    report = _load_shared_policy_weights(model, source_state)
+    if ema_model is not None:
+        ema_report = _load_shared_policy_weights(ema_model, source_state)
+        if ema_report != report:
+            raise AssertionError("model and EMA warm-start reports differ")
+    report.update({"path": str(checkpoint_path), "state": state_name})
+    return report
+
+
 class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
     exclude_keys = tuple()
@@ -223,6 +322,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+
+        init_checkpoint = OmegaConf.select(
+            cfg, "training.init_from_checkpoint", default=None
+        )
+        if bool(cfg.training.resume) and init_checkpoint not in (None, ""):
+            raise ValueError(
+                "training.resume and training.init_from_checkpoint are mutually exclusive"
+            )
 
         accelerator = Accelerator(log_with='wandb')
         # Hydra resolves ${now:...} independently in every launched process.
@@ -314,6 +421,17 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
+        if init_checkpoint not in (None, ""):
+            init_report = _initialize_from_policy_checkpoint(
+                self.model,
+                self.ema_model,
+                init_checkpoint,
+                str(OmegaConf.select(cfg, "training.init_weights", default="auto")),
+            )
+            accelerator.print(
+                "initialized shared action-policy weights: "
+                + " ".join(f"{key}={value}" for key, value in init_report.items())
+            )
 
         # configure lr scheduler
         # With Accelerate's default split_batches=False, each distributed

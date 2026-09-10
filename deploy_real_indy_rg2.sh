@@ -26,7 +26,7 @@ RG2_SAVE_FUSION_ATTENTION="${RG2_SAVE_FUSION_ATTENTION:-1}"
 RG2_SAVE_CONTEXT_INPUTS="${RG2_SAVE_CONTEXT_INPUTS:-1}"
 RG2_SAVE_POLICY_INPUTS="${RG2_SAVE_POLICY_INPUTS:-1}"
 RG2_FT_MAX_AGE_SEC="${RG2_FT_MAX_AGE_SEC:-0.020}"
-VALVE_CLASSIFIER_CHECKPOINT="${VALVE_CLASSIFIER_CHECKPOINT:-$ROOT/valve_state_classifier_v4/model/final.pt}"
+VALVE_CLASSIFIER_CHECKPOINT="${VALVE_CLASSIFIER_CHECKPOINT:-}"
 VALVE_CLASSIFIER_DEVICE="${VALVE_CLASSIFIER_DEVICE:-auto}"
 
 if [[ "$PYTHON_BIN" == */* ]]; then
@@ -55,7 +55,7 @@ if ! [[ "$RG2_FT_MAX_AGE_SEC" =~ ^[0-9]*\.?[0-9]+$ ]] || ! awk "BEGIN { exit !($
 fi
 echo "RG2-FT causal freshness limit: ${RG2_FT_MAX_AGE_SEC}s"
 
-RG2_ENABLE_MOTION="${RG2_ENABLE_MOTION:-1}"
+RG2_ENABLE_MOTION="${RG2_ENABLE_MOTION:-0}"
 SAFETY_ARGS=(--plan_only --print_motion_debug)
 if [[ "$RG2_ENABLE_MOTION" == "1" ]]; then
   SAFETY_ARGS=()
@@ -112,15 +112,16 @@ case "${RG2_SAVE_POLICY_INPUTS,,}" in
 esac
 
 # The evaluator ignores these options for the ordinary dual-F/T checkpoint.
-# For a context checkpoint it validates final.pt against the SHA stored in the
-# policy checkpoint before any robot waypoint can be submitted.
+# For a context checkpoint the evaluator normally resolves the observer path
+# from the serialized policy config and validates its SHA before motion. Set
+# VALVE_CLASSIFIER_CHECKPOINT only to override that path.
 VALVE_CONTEXT_ARGS=()
-if [[ -f "$VALVE_CLASSIFIER_CHECKPOINT" ]]; then
+if [[ -n "$VALVE_CLASSIFIER_CHECKPOINT" && -f "$VALVE_CLASSIFIER_CHECKPOINT" ]]; then
   VALVE_CONTEXT_ARGS=(
     --valve_classifier_checkpoint "$VALVE_CLASSIFIER_CHECKPOINT"
     --valve_classifier_device "$VALVE_CLASSIFIER_DEVICE"
   )
-else
+elif [[ -n "$VALVE_CLASSIFIER_CHECKPOINT" ]]; then
   echo "[warn] valve classifier not found at $VALVE_CLASSIFIER_CHECKPOINT" >&2
   echo "[warn] this is fatal only when RG2_CHECKPOINT is a valve-context policy." >&2
 fi

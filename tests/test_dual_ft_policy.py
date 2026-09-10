@@ -235,6 +235,43 @@ def test_valve_context_routes_features_without_changing_786d_contract():
     assert encoder(obs).shape == (2, 82)
 
 
+def test_four_state_valve_context_routes_four_experts():
+    shape_meta = _shape_meta()
+    shape_meta["obs"]["valve_context"] = {
+        "shape": [5],
+        "horizon": 1,
+        "type": "low_dim",
+        "ignore_by_policy": True,
+    }
+    encoder = DualFTObsEncoder(
+        shape_meta=shape_meta,
+        model_name="resnet18",
+        pretrained=False,
+        frozen=False,
+        global_pool="",
+        transforms=None,
+        feature_aggregation="avg",
+        downsample_ratio=32,
+        vision_feature_dim=512,
+        fusion_dim=64,
+        fusion_heads=8,
+        fusion_feedforward_dim=128,
+        ft_channel_dims=[8, 16, 32, 32],
+        valve_context_key="valve_context",
+        valve_context_dim=5,
+        valve_context_num_phase_experts=4,
+        valve_context_hidden_dim=16,
+        valve_expert_bottleneck_dim=16,
+    )
+    obs = _obs(batch_size=2)
+    obs["valve_context"] = torch.tensor(
+        [[[1, 0, 0, 0, 0]], [[0, 0, 1, 0, 1]]], dtype=torch.float32
+    )
+    assert int(encoder.architecture_contract_version) == 4
+    assert len(encoder.valve_stage_conditioner.experts) == 4
+    assert encoder(obs).shape == (2, 82)
+
+
 def test_dual_ft_attention_capture_preserves_fusion_output():
     """Eval-only attention logging must not change the policy feature."""
     torch.manual_seed(0)

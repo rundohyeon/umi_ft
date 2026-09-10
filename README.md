@@ -353,10 +353,112 @@ outputs, scheduled commands, F/T histories, and fusion-attention diagnostics.
 
 </details>
 
-## Valve-state context classifier
+## Four-state valve context observer and policy
+
+<details open>
+<summary><strong>v2 (current) — frozen causal 4-state observer + trainable action policy</strong></summary>
+
+The current observer checkpoint is copied separately from Git because of its
+size:
+
+```text
+answer/best_context.pt
+SHA-256: b759155d33bd0c00fb5a673f072d38737bedc95e455540beaf74dce0b700c281
+```
+
+It predicts four soft probabilities in the fixed order `approach`, `turning`,
+`recovery`, `error`. The diffusion policy receives exactly five values:
+
+```text
+[P(approach), P(turning), P(recovery), P(error), context_valid]
+```
+
+The observer is always loaded with `requires_grad=False` and is not serialized
+inside the action-policy checkpoint. The trainable action policy uses the four
+probabilities as soft gates for four residual experts; `context_valid` lets the
+conditioner distinguish a complete causal window from startup padding. Never
+replace the probabilities with the hard argmax class.
+
+Generate the timestamp-aligned training sidecar once. This uses two RGB/TCP
+observations separated by three camera frames and the preceding 50 native
+12-D F/T samples for each observation. It never uses a future F/T sample and
+does not apply an F/T coordinate transform.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/generate_valve_context_v2_sidecar.py \
+  --dataset session_260827/dataset.zarr.zip \
+  --force-sidecar session_260827/dataset_force_sidecar.zarr \
+  --checkpoint answer/best_context.pt \
+  --output session_260827/dataset_valve_context_v2_4state.zarr \
+  --device cuda \
+  --batch-size 64
+```
+
+Warm-start the shared image/F-T/fusion/diffusion weights from the proven
+Dual-F/T checkpoint. This is intentionally not `resume`: optimizer, epoch,
+normalizer, and the new conditioner are initialized for a new run. The frozen
+observer is not run inside the training process; its causal outputs come from
+the sidecar.
+
+```bash
+accelerate launch \
+  --multi_gpu \
+  --num_processes 4 \
+  --gpu_ids 0,1,2,3 \
+  --mixed_precision no \
+  --main_process_port 29511 \
+  train.py \
+  --config-name=train_diffusion_unet_timm_umi_dual_ft_context_v2_workspace \
+  policy.obs_encoder.pretrained=true \
+  training.init_from_checkpoint=data/outputs/260827_dual_ft_4gpu_b32_run1/checkpoints/latest.ckpt \
+  training.init_weights=auto \
+  training.resume=false \
+  dataloader.batch_size=8 \
+  val_dataloader.batch_size=8 \
+  dataloader.num_workers=4 \
+  val_dataloader.num_workers=2 \
+  hydra.run.dir=data/outputs/260827_dual_ft_context_v2_4gpu_b32_run1
+```
+
+Run a hardware-free validation on a new checkpoint:
+
+```bash
+conda run -n umi python eval_dual_ft_offline.py \
+  --checkpoint data/outputs/260827_dual_ft_context_v2_4gpu_b32_run1/checkpoints/latest.ckpt \
+  --dataset session_260827/dataset.zarr.zip \
+  --force-sidecar session_260827/dataset_force_sidecar.zarr \
+  --context-sidecar session_260827/dataset_valve_context_v2_4state.zarr \
+  --split validation \
+  --weights auto \
+  --device cuda:0 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --max-samples 256 \
+  --output data/eval_dual_ft/context_v2_validation.json
+```
+
+For robot evaluation, first suppress all submitted waypoints:
+
+```bash
+RG2_ENABLE_MOTION=0 \
+RG2_CHECKPOINT=/path/to/context_v2_latest.ckpt \
+VALVE_CLASSIFIER_CHECKPOINT=/path/to/answer/best_context.pt \
+MATCH_DATASET=/path/to/dataset.zarr.zip \
+./deploy_real_indy_rg2.sh --steps_per_inference 1 --max_policy_iters 1
+```
+
+Only after checking the observer SHA, live RGB, startup F/T bias, predicted
+context/actions, and safety logs should the same command be repeated with
+`RG2_ENABLE_MOTION=1`. The evaluator selects the 4-state streaming runtime from
+the action checkpoint contract and refuses schema, dimension, phase-order, or
+observer-SHA mismatches.
+
+</details>
+
+## Legacy valve-state context classifier
 
 <details>
-<summary><strong>v4 (current) — causal 5-phase / 4-error classifier</strong></summary>
+<summary><strong>v1 (legacy) — causal 5-phase / 4-error classifier</strong></summary>
 
 The v4 bundle estimates the current valve-manipulation phase and error reason
 from RGB, TCP state, gripper width, and native dual F/T histories. The

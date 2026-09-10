@@ -219,6 +219,77 @@ def _payload(*, include_right=True, include_normalizer=True):
     }
 
 
+def _v2_context_payload():
+    payload = _payload()
+    cfg = payload["cfg"]
+    cfg.task.shape_meta.obs.valve_context = {
+        "shape": [5],
+        "horizon": 1,
+        "type": "low_dim",
+        "ignore_by_policy": True,
+        "down_sample_steps": 1,
+    }
+    cfg.task.model_contract.update(
+        {
+            "version": "dual_ft_context_v2_4state_786_action11_v1",
+            "valve_context_schema": "umi_valve_context_sidecar_v2_4state",
+            "valve_context_dim": 5,
+            "valve_context_key": "valve_context",
+            "valve_context_phase_names": [
+                "approach", "turning", "recovery", "error"
+            ],
+            "valve_context_error_reason_names": [],
+            "valve_context_classifier_version": "observer_v2_4state",
+            "valve_context_classifier_frozen": True,
+            "valve_context_routing": "soft_phase_moe_residual_v2",
+            "valve_context_input_wrench_key": "wrench_12d",
+        }
+    )
+    cfg.task.valve_context = {
+        "schema": "umi_valve_context_sidecar_v2_4state",
+        "context_key": "valve_context_5d",
+        "timestamp_key": "valve_context_timestamp_s",
+        "episode_ends_key": "rgb_episode_ends",
+        "input_wrench_key": "wrench_12d",
+        "classifier_frozen": True,
+        "checkpoint_sha256": "a" * 64,
+    }
+    cfg.policy.obs_encoder.update(
+        {
+            "valve_context_key": "valve_context",
+            "valve_context_dim": 5,
+            "valve_context_hidden_dim": 128,
+            "valve_expert_bottleneck_dim": 128,
+            "valve_context_num_phase_experts": 4,
+        }
+    )
+    state = payload["state_dicts"]["model"]
+    state["obs_encoder.architecture_contract_version"] = torch.tensor(4)
+    state.update(
+        {
+            "obs_encoder.valve_stage_conditioner.stage_encoder.0.weight": torch.empty(128, 5),
+            "obs_encoder.valve_stage_conditioner.stage_encoder.0.bias": torch.empty(128),
+            "obs_encoder.valve_stage_conditioner.stage_encoder.2.weight": torch.empty(768, 128),
+            "obs_encoder.valve_stage_conditioner.stage_encoder.2.bias": torch.empty(768),
+            "normalizer.params_dict.valve_context.scale": torch.ones(1),
+            "normalizer.params_dict.valve_context.offset": torch.zeros(1),
+        }
+    )
+    for expert_idx in range(4):
+        prefix = f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network"
+        state.update(
+            {
+                f"{prefix}.0.weight": torch.empty(768),
+                f"{prefix}.0.bias": torch.empty(768),
+                f"{prefix}.1.weight": torch.empty(128, 768),
+                f"{prefix}.1.bias": torch.empty(128),
+                f"{prefix}.3.weight": torch.empty(768, 128),
+                f"{prefix}.3.bias": torch.empty(768),
+            }
+        )
+    return payload
+
+
 class DualFTInferenceContractTest(unittest.TestCase):
     def test_checkpoint_contract_requires_dual_encoders_and_normalizers(self):
         contract = inspect_dual_ft_checkpoint_payload(_payload())
@@ -226,6 +297,16 @@ class DualFTInferenceContractTest(unittest.TestCase):
         self.assertEqual(contract["action_horizon"], 16)
         self.assertEqual(contract["action_dim"], 11)
         self.assertEqual(contract["normalizer_owner"], "policy.predict_action")
+
+    def test_four_state_context_checkpoint_contract(self):
+        contract = inspect_dual_ft_checkpoint_payload(_v2_context_payload())
+        self.assertTrue(contract["valve_context_enabled"])
+        self.assertEqual(contract["valve_context_dim"], 5)
+        self.assertEqual(
+            contract["valve_context_schema"],
+            "umi_valve_context_sidecar_v2_4state",
+        )
+        self.assertEqual(contract["valve_context_num_phase_experts"], 4)
 
     def test_rgb_only_checkpoint_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "RGB-only/non-dual"):

@@ -6,6 +6,12 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from diffusion_policy.common.valve_context_contract import (
+    VALVE_CONTEXT_V1_SCHEMA,
+    VALVE_CONTEXT_V2_SCHEMA,
+    valve_context_spec,
+)
+
 
 EXPECTED_ACTION_CHANNELS = [
     "x",
@@ -22,14 +28,6 @@ EXPECTED_ACTION_CHANNELS = [
 ]
 
 _VALVE_CONTEXT_KEY = "valve_context"
-_VALVE_PHASE_NAMES = [
-    "approach",
-    "turning",
-    "endpoint_reached",
-    "task_complete",
-    "error",
-]
-_VALVE_REASON_NAMES = ["none", "turn_no_contact", "post_contact_drop", "other"]
 
 
 def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
@@ -48,6 +46,26 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         raise ValueError("checkpoint cfg is missing task.shape_meta")
 
     is_valve_context_policy = _VALVE_CONTEXT_KEY in obs_meta
+    if is_valve_context_policy:
+        context_schema = str(
+            OmegaConf.select(
+                cfg,
+                "task.model_contract.valve_context_schema",
+                default=VALVE_CONTEXT_V1_SCHEMA,
+            )
+        )
+        context_spec = valve_context_spec(context_schema)
+        context_dim = int(context_spec["dim"])
+        context_phase_names = list(context_spec["phase_names"])
+        context_reason_names = list(context_spec["reason_names"])
+        context_num_experts = int(context_spec["num_phase_experts"])
+    else:
+        context_schema = None
+        context_spec = None
+        context_dim = 0
+        context_phase_names = []
+        context_reason_names = []
+        context_num_experts = 0
     expected_obs_shapes = {
         "camera0_rgb": (2, (3, 224, 224)),
         "robot0_eef_pos": (2, (3,)),
@@ -56,7 +74,7 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "robot0_ft_right": (32, (6,)),
     }
     if is_valve_context_policy:
-        expected_obs_shapes[_VALVE_CONTEXT_KEY] = (1, (10,))
+        expected_obs_shapes[_VALVE_CONTEXT_KEY] = (1, (context_dim,))
     required_modalities = {"camera0_rgb", "robot0_ft_left", "robot0_ft_right"}
     missing_modalities = sorted(required_modalities - set(obs_meta.keys()))
     if missing_modalities:
@@ -138,7 +156,11 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
 
     contract_requirements = {
         "task.model_contract.version": (
-            "dual_ft_context_786_action11_v1"
+            (
+                "dual_ft_context_v2_4state_786_action11_v1"
+                if context_schema == VALVE_CONTEXT_V2_SCHEMA
+                else "dual_ft_context_786_action11_v1"
+            )
             if is_valve_context_policy
             else "dual_ft_786_action11_base_sidecar_bias_only_width_feedback_v6"
         ),
@@ -264,27 +286,34 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "policy.obs_encoder.vision_feature_dim": 768,
     }
     if is_valve_context_policy:
+        is_v2_context = context_schema == VALVE_CONTEXT_V2_SCHEMA
         contract_requirements.update(
             {
-                "task.model_contract.valve_context_schema": (
-                    "umi_valve_context_sidecar_v1"
-                ),
-                "task.model_contract.valve_context_dim": 10,
+                "task.model_contract.valve_context_schema": context_schema,
+                "task.model_contract.valve_context_dim": context_dim,
                 "task.model_contract.valve_context_key": _VALVE_CONTEXT_KEY,
-                "task.model_contract.valve_context_classifier_version": "v4",
+                "task.model_contract.valve_context_classifier_version": (
+                    "observer_v2_4state" if is_v2_context else "v4"
+                ),
                 "task.model_contract.valve_context_classifier_frozen": True,
                 "task.model_contract.valve_context_routing": (
-                    "soft_phase_moe_residual_v1"
+                    "soft_phase_moe_residual_v2"
+                    if is_v2_context
+                    else "soft_phase_moe_residual_v1"
                 ),
                 "task.model_contract.valve_context_input_wrench_key": (
-                    "wrench_12d_capture"
+                    "wrench_12d" if is_v2_context else "wrench_12d_capture"
                 ),
                 "policy.obs_encoder.valve_context_key": _VALVE_CONTEXT_KEY,
-                "policy.obs_encoder.valve_context_dim": 10,
+                "policy.obs_encoder.valve_context_dim": context_dim,
                 "policy.obs_encoder.valve_context_hidden_dim": 128,
                 "policy.obs_encoder.valve_expert_bottleneck_dim": 128,
             }
         )
+        if is_v2_context:
+            contract_requirements[
+                "policy.obs_encoder.valve_context_num_phase_experts"
+            ] = context_num_experts
     for path, expected in contract_requirements.items():
         actual = OmegaConf.select(cfg, path, default=None)
         if actual != expected:
@@ -331,14 +360,25 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
             f"expected={EXPECTED_ACTION_CHANNELS} got={action_channels}"
         )
     if is_valve_context_policy:
+        expected_context_key = (
+            "valve_context_5d"
+            if context_schema == VALVE_CONTEXT_V2_SCHEMA
+            else _VALVE_CONTEXT_KEY
+        )
         for path, expected in {
-            "task.model_contract.valve_context_phase_names": _VALVE_PHASE_NAMES,
-            "task.model_contract.valve_context_error_reason_names": _VALVE_REASON_NAMES,
-            "task.valve_context.schema": "umi_valve_context_sidecar_v1",
-            "task.valve_context.context_key": _VALVE_CONTEXT_KEY,
-            "task.valve_context.timestamp_key": "valve_context_timestamp_s",
+            "task.model_contract.valve_context_phase_names": context_phase_names,
+            "task.model_contract.valve_context_error_reason_names": context_reason_names,
+            "task.valve_context.schema": context_schema,
+            "task.valve_context.context_key": expected_context_key,
+            "task.valve_context.timestamp_key": (
+                "valve_context_timestamp_s"
+            ),
             "task.valve_context.episode_ends_key": "rgb_episode_ends",
-            "task.valve_context.input_wrench_key": "wrench_12d_capture",
+            "task.valve_context.input_wrench_key": (
+                "wrench_12d"
+                if context_schema == VALVE_CONTEXT_V2_SCHEMA
+                else "wrench_12d_capture"
+            ),
             "task.valve_context.classifier_frozen": True,
         }.items():
             actual = OmegaConf.select(cfg, path, default=None)
@@ -425,7 +465,14 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
     )
     exact_state_contract = {
         "obs_encoder.architecture_contract_version": (
-            (), 3 if is_valve_context_policy else 2
+            (),
+            (
+                4
+                if context_schema == VALVE_CONTEXT_V2_SCHEMA
+                else 3
+            )
+            if is_valve_context_policy
+            else 2,
         ),
         "obs_encoder.left_ft_encoder.temporal_contract_version": ((), 1),
         "obs_encoder.right_ft_encoder.temporal_contract_version": ((), 1),
@@ -443,7 +490,7 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         exact_state_contract.update(
             {
                 "obs_encoder.valve_stage_conditioner.stage_encoder.0.weight": (
-                    (128, 10), None
+                    (128, context_dim), None
                 ),
                 "obs_encoder.valve_stage_conditioner.stage_encoder.0.bias": (
                     (128,), None
@@ -497,7 +544,7 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
                         f"{expected_scalar}, got {scalar}"
                     )
         if is_valve_context_policy:
-            for expert_idx in range(5):
+            for expert_idx in range(context_num_experts):
                 expert_shapes = {
                     f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network.0.weight": (768,),
                     f"obs_encoder.valve_stage_conditioner.experts.{expert_idx}.network.0.bias": (768,),
@@ -569,5 +616,8 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "validated_state_names": sorted(policy_states),
         "valve_context_enabled": is_valve_context_policy,
         "valve_context_key": _VALVE_CONTEXT_KEY if is_valve_context_policy else None,
-        "valve_context_dim": 10 if is_valve_context_policy else 0,
+        "valve_context_dim": context_dim,
+        "valve_context_schema": context_schema,
+        "valve_context_phase_names": context_phase_names,
+        "valve_context_num_phase_experts": context_num_experts,
     }

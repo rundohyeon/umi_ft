@@ -4,7 +4,7 @@
 *.zarr/
 *.zarr.zip
 *.zip
-
+*.npz
 
 # Model checkpoints and exported weights
 *.ckpt

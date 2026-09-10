@@ -99,7 +99,13 @@ from umi.real_world.umi_env import UmiEnv
 from umi.real_world.rg2ft_obs import prepare_rg2ft_policy_obs
 from umi.real_world.valve_state_context import (
     ValveStateContextRuntime,
+    ValveStateContextRuntimeV2,
     sha256_file as _sha256_file,
+)
+from diffusion_policy.common.valve_context_contract import (
+    VALVE_CONTEXT_V1_SCHEMA,
+    VALVE_CONTEXT_V2_SCHEMA,
+    valve_context_spec,
 )
 from umi.real_world.grasp_force_width_feedback import (
     GraspForceWidthFeedbackConfig,
@@ -652,6 +658,11 @@ def _policy_input_rgb_from_obs(obs) -> np.ndarray | None:
     return _rgb_uint8_from_any(img)
 
 
+def _context_log_value_columns(context_schema: str) -> list[str]:
+    columns = list(valve_context_spec(context_schema)["value_columns"])
+    return ["context_warmed_up" if name == "warmed_up" else name for name in columns]
+
+
 class _ValveContextInputCapture:
     """Persist the exact frozen-classifier input stream for later inspection.
 
@@ -667,7 +678,13 @@ class _ValveContextInputCapture:
     feature, not deployment data.
     """
 
-    def __init__(self, root: pathlib.Path, *, episode_start_timestamp_s: float):
+    def __init__(
+        self,
+        root: pathlib.Path,
+        *,
+        episode_start_timestamp_s: float,
+        context_schema: str = VALVE_CONTEXT_V1_SCHEMA,
+    ):
         self.root = pathlib.Path(root)
         self.image_dir = self.root.joinpath("images")
         self.window_dir = self.root.joinpath("classifier_windows")
@@ -681,6 +698,20 @@ class _ValveContextInputCapture:
         self._window_idx = 0
         self._image_file_by_timestamp_key: dict[int, str] = {}
         self._closed = False
+        self.context_schema = str(context_schema)
+        self.context_spec = valve_context_spec(self.context_schema)
+        self.context_dim = int(self.context_spec["dim"])
+        if self.context_schema == VALVE_CONTEXT_V1_SCHEMA:
+            # warmed_up is already a dedicated CSV column in the legacy log.
+            self._frame_context_columns = list(
+                self.context_spec["value_columns"][:-1]
+            )
+            self._frame_context_slice = slice(0, 9)
+        else:
+            self._frame_context_columns = list(
+                self.context_spec["value_columns"]
+            )
+            self._frame_context_slice = slice(0, self.context_dim)
 
         self._frame_file = open(self.root.joinpath("context_frames.csv"), "w", newline="")
         self._frame_writer = csv.writer(self._frame_file)
@@ -692,9 +723,7 @@ class _ValveContextInputCapture:
                 "tcp_rotvec_x_rad", "tcp_rotvec_y_rad", "tcp_rotvec_z_rad",
                 "gripper_width_m",
                 "phase", "error_reason", "warmed_up",
-                "phase_approach", "phase_turning", "phase_endpoint_reached",
-                "phase_task_complete", "phase_error", "reason_none",
-                "reason_turn_no_contact", "reason_post_contact_drop", "reason_other",
+                *self._frame_context_columns,
             ]
         )
 
@@ -721,6 +750,9 @@ class _ValveContextInputCapture:
             json.dumps(
                 {
                     "format_version": 2,
+                    "context_schema": self.context_schema,
+                    "context_dim": self.context_dim,
+                    "context_phase_names": list(self.context_spec["phase_names"]),
                     "image_encoding": "lossless PNG; RGB pixels exactly passed to classifier",
                     "image_resolution": [224, 224, 3],
                     "frame_csv": "context_frames.csv",
@@ -738,15 +770,20 @@ class _ValveContextInputCapture:
                             "moveaxis(read_rgb_png, -1, 1).astype(float32) / 255.0, "
                             "before ValveStateClassifier.forward's built-in ImageNet normalization"
                         ),
-                        "lowdim": "[x,y,z,rotation_6d(6),gripper_width_m]; classifier normalization is identity",
+                        "lowdim": (
+                            "[x,y,z,rotation_6d(6),gripper_width_m]; v1 uses "
+                            "base-frame pose, v2 uses latest-TCP-relative pose"
+                        ),
                         "wrench_history_physical": "[T,H,12] corrected physical N/Nm history passed to predict_window",
                         "wrench_history_model_scaled": (
                             "exact [T,H,12] model input after division by "
                             "[10,10,10,0.1,0.1,0.1] for each left/right finger"
                         ),
                         "wrench_mask": "[T,H] causal valid-sample mask passed to the model",
-                        "rgb_imagenet_mean": [0.485, 0.456, 0.406],
-                        "rgb_imagenet_std": [0.229, 0.224, 0.225],
+                        "normalization": (
+                            "wrench_history_model_scaled records the exact frozen "
+                            "observer force normalizer output"
+                        ),
                     },
                     "no_imu_file": (
                         "No physical IMU is a direct input of this classifier, so no "
@@ -853,7 +890,11 @@ class _ValveContextInputCapture:
         if timestamp_key in self._image_file_by_timestamp_key:
             raise ValueError("context capture received a duplicate RGB timestamp")
         self._image_file_by_timestamp_key[timestamp_key] = str(image_relpath)
-        values = np.asarray(context_record.values, dtype=np.float64).reshape(10)
+        if str(getattr(context_record, "schema", self.context_schema)) != self.context_schema:
+            raise ValueError("context record schema changed during capture")
+        values = np.asarray(context_record.values, dtype=np.float64).reshape(
+            self.context_dim
+        )
         self._frame_writer.writerow(
             [
                 self._frame_idx,
@@ -866,7 +907,7 @@ class _ValveContextInputCapture:
                 context_record.phase_name,
                 context_record.error_reason_name,
                 int(context_record.warmed_up),
-                *values[:9].tolist(),
+                *values[self._frame_context_slice].tolist(),
             ]
         )
         self._frame_idx += 1
@@ -3191,12 +3232,18 @@ def _render_policy_output_video_panel(
         lines.append(f"F/T width correction: {width_correction_m * 1000.0:+.3f} mm")
     if valve_context_record is not None:
         context = np.asarray(valve_context_record.values, dtype=np.float64)
+        schema = str(
+            getattr(valve_context_record, "schema", VALVE_CONTEXT_V1_SCHEMA)
+        )
+        spec = valve_context_spec(schema)
         lines.extend([
-            "valve context (frozen classifier v4):",
+            f"valve context ({schema}):",
             f" phase={valve_context_record.phase_name} "
             f"reason={valve_context_record.error_reason_name} "
             f"warm={int(valve_context_record.warmed_up)}",
-            " p=" + " ".join(f"{value:.2f}" for value in context[:5]),
+            " p=" + " ".join(
+                f"{value:.2f}" for value in context[:len(spec["phase_names"])]
+            ),
         ])
     return _render_text_panel(lines, width=width, height=height)
 
@@ -3293,7 +3340,18 @@ def _render_valve_context_video_panel(
         return panel
 
     values = np.asarray(valve_context_record.values, dtype=np.float64).reshape(-1)
-    if values.shape != (10,) or not np.all(np.isfinite(values)):
+    schema = str(
+        getattr(valve_context_record, "schema", VALVE_CONTEXT_V1_SCHEMA)
+    )
+    try:
+        spec = valve_context_spec(schema)
+    except ValueError:
+        spec = None
+    if (
+        spec is None
+        or values.shape != (int(spec["dim"]),)
+        or not np.all(np.isfinite(values))
+    ):
         cv2.putText(
             panel, "context: invalid diagnostic value", (8, 47),
             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 255), 1, cv2.LINE_AA,
@@ -3306,11 +3364,11 @@ def _render_valve_context_video_panel(
         f"warm={int(valve_context_record.warmed_up)}",
         (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (200, 255, 200), 1, cv2.LINE_AA,
     )
-    phases = ("approach", "turning", "endpoint", "complete", "error")
-    reasons = ("none", "no-contact", "drop", "other")
+    phases = tuple(spec["phase_names"])
+    reasons = tuple(spec["reason_names"])
     bar_x, bar_w, bar_h = 92, max(40, width - 106), 11
     y = 61
-    for label, value in zip(phases, values[:5]):
+    for label, value in zip(phases, values[:len(phases)]):
         cv2.putText(panel, label, (7, y + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.32,
                     (230, 230, 230), 1, cv2.LINE_AA)
         cv2.rectangle(panel, (bar_x, y), (bar_x + bar_w, y + bar_h), (65, 65, 65), -1)
@@ -3322,21 +3380,25 @@ def _render_valve_context_video_panel(
         cv2.putText(panel, f"{value:.3f}", (bar_x + 4, y + 9),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.31, (0, 0, 0), 1, cv2.LINE_AA)
         y += 14
-    cv2.putText(panel, "error reason probabilities", (7, y + 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 220, 150), 1, cv2.LINE_AA)
-    y += 16
-    for label, value in zip(reasons, values[5:9]):
-        cv2.putText(panel, label, (7, y + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.32,
-                    (230, 230, 230), 1, cv2.LINE_AA)
-        cv2.rectangle(panel, (bar_x, y), (bar_x + bar_w, y + bar_h), (65, 65, 65), -1)
-        cv2.rectangle(
-            panel, (bar_x, y),
-            (bar_x + int(round(bar_w * float(np.clip(value, 0.0, 1.0)))), y + bar_h),
-            (120, 120, 255), -1,
-        )
-        cv2.putText(panel, f"{value:.3f}", (bar_x + 4, y + 9),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.31, (0, 0, 0), 1, cv2.LINE_AA)
-        y += 14
+    if reasons:
+        cv2.putText(panel, "error reason probabilities", (7, y + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 220, 150), 1, cv2.LINE_AA)
+        y += 16
+        phase_count = len(phases)
+        for label, value in zip(
+            reasons, values[phase_count:phase_count + len(reasons)]
+        ):
+            cv2.putText(panel, label, (7, y + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.32,
+                        (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (bar_x, y), (bar_x + bar_w, y + bar_h), (65, 65, 65), -1)
+            cv2.rectangle(
+                panel, (bar_x, y),
+                (bar_x + int(round(bar_w * float(np.clip(value, 0.0, 1.0)))), y + bar_h),
+                (120, 120, 255), -1,
+            )
+            cv2.putText(panel, f"{value:.3f}", (bar_x + 4, y + 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.31, (0, 0, 0), 1, cv2.LINE_AA)
+            y += 14
     return panel
 
 
@@ -3629,11 +3691,10 @@ def _make_eval_comparison_frame(
 )
 @click.option(
     "--valve_classifier_checkpoint",
-    default=_DEFAULT_VALVE_CLASSIFIER_CHECKPOINT,
-    show_default=True,
+    default=None,
     help=(
-        "Frozen valve-state classifier v4 final.pt. Required only by a "
-        "dual-F/T context checkpoint."
+        "Frozen valve context observer checkpoint. By default, use the path "
+        "serialized by the action-policy checkpoint (v1 falls back to final.pt)."
     ),
 )
 @click.option(
@@ -4058,6 +4119,7 @@ def main(input, output, robot_config,
     checkpoint_contract = inspect_dual_ft_checkpoint_payload(payload)
     cfg = checkpoint_contract["cfg"]
     valve_context_enabled = bool(checkpoint_contract.get("valve_context_enabled", False))
+    valve_context_schema = checkpoint_contract.get("valve_context_schema")
     expected_valve_classifier_sha256 = None
     if valve_context_enabled:
         expected_valve_classifier_sha256 = str(
@@ -4087,7 +4149,8 @@ def main(input, output, robot_config,
         print(
             "valve context contract: "
             f"key={checkpoint_contract['valve_context_key']} "
-            f"dim={checkpoint_contract['valve_context_dim']} classifier=v4 "
+            f"dim={checkpoint_contract['valve_context_dim']} "
+            f"schema={valve_context_schema} "
             f"expected_sha256={expected_valve_classifier_sha256}"
         )
     # The checkpoint payload restores all trained weights immediately after
@@ -4702,9 +4765,17 @@ def main(input, output, robot_config,
                         "--valve_classifier_device must be auto, cpu, cuda, or cuda:N; "
                         f"got {valve_classifier_device!r}"
                     )
-                classifier_path = pathlib.Path(
-                    valve_classifier_checkpoint
-                ).expanduser().resolve()
+                configured_classifier_path = valve_classifier_checkpoint
+                if configured_classifier_path in (None, ""):
+                    configured_classifier_path = OmegaConf.select(
+                        cfg, "task.valve_context.checkpoint_path", default=None
+                    )
+                if configured_classifier_path in (None, ""):
+                    configured_classifier_path = _DEFAULT_VALVE_CLASSIFIER_CHECKPOINT
+                classifier_path = pathlib.Path(str(configured_classifier_path)).expanduser()
+                if not classifier_path.is_absolute():
+                    classifier_path = _PROJECT_ROOT / classifier_path
+                classifier_path = classifier_path.resolve()
                 if not classifier_path.is_file():
                     raise click.ClickException(
                         "frozen valve classifier checkpoint is missing: "
@@ -4717,17 +4788,29 @@ def main(input, output, robot_config,
                         f"{expected_valve_classifier_sha256}, got {actual_classifier_sha256}"
                     )
                 try:
-                    valve_context_runtime = ValveStateContextRuntime(
+                    runtime_type = (
+                        ValveStateContextRuntimeV2
+                        if valve_context_schema == VALVE_CONTEXT_V2_SCHEMA
+                        else ValveStateContextRuntime
+                    )
+                    valve_context_runtime = runtime_type(
                         classifier_path, device=classifier_device
                     )
                 except Exception as exc:
                     raise click.ClickException(
-                        f"failed to load frozen valve classifier v4: {exc}"
+                        f"failed to load frozen valve context observer: {exc}"
                     ) from exc
+                if valve_context_runtime.context_schema != valve_context_schema:
+                    raise click.ClickException(
+                        "valve observer schema does not match the action checkpoint: "
+                        f"observer={valve_context_runtime.context_schema} "
+                        f"policy={valve_context_schema}"
+                    )
                 print(
-                    "valve classifier: "
+                    "valve context observer: "
                     f"{classifier_path} sha256={actual_classifier_sha256} "
-                    f"device={classifier_device}"
+                    f"device={classifier_device} "
+                    f"version={valve_context_runtime.observer_version}"
                 )
                 if save_context_inputs:
                     print(
@@ -5691,11 +5774,9 @@ def main(input, output, robot_config,
                             [
                                 'iter_idx', 'wall_time', 'classifier_timestamp_s',
                                 'phase', 'error_reason', 'warmed_up',
-                                'phase_approach', 'phase_turning',
-                                'phase_endpoint_reached', 'phase_task_complete',
-                                'phase_error', 'reason_none',
-                                'reason_turn_no_contact',
-                                'reason_post_contact_drop', 'reason_other',
+                                *_context_log_value_columns(
+                                    valve_context_runtime.context_schema
+                                ),
                             ]
                         )
                         if save_context_inputs:
@@ -5705,6 +5786,7 @@ def main(input, output, robot_config,
                                 # preroll too: those samples can be selected by
                                 # the first 16-step temporal windows.
                                 episode_start_timestamp_s=context_history_start_s,
+                                context_schema=valve_context_runtime.context_schema,
                             )
                         context_worker = _ValveContextWorker(
                             valve_context_runtime,
@@ -5713,7 +5795,12 @@ def main(input, output, robot_config,
                             poll_hz=60.0,
                             max_cached_records=256,
                             history_frames=120,
-                            initial_history_frames=16,
+                            initial_history_frames=(
+                                4
+                                if valve_context_runtime.context_schema
+                                == VALVE_CONTEXT_V2_SCHEMA
+                                else 16
+                            ),
                             anchor_recovery_history_frames=32,
                         )
                         context_worker.start(

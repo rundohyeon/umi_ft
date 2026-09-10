@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from eval_real_indy_rg2 import _PolicyInputCapture, _ValveContextInputCapture
+from diffusion_policy.common.valve_context_contract import VALVE_CONTEXT_V2_SCHEMA
 
 
 def _record(timestamp_s=10.02):
@@ -178,3 +179,38 @@ def test_policy_input_capture_preserves_exact_predict_action_arrays(tmp_path):
     assert ft_rows[0]["finger"] == "left"
     assert ft_rows[-1]["finger"] == "right"
     assert not (root / "imu.csv").exists()
+
+
+def test_context_capture_supports_four_state_v2_columns(tmp_path):
+    root = tmp_path / "context_v2_inputs"
+    capture = _ValveContextInputCapture(
+        root,
+        episode_start_timestamp_s=10.0,
+        context_schema=VALVE_CONTEXT_V2_SCHEMA,
+    )
+    record = SimpleNamespace(
+        timestamp_s=10.02,
+        phase_name="recovery",
+        error_reason_name="n/a",
+        warmed_up=True,
+        schema=VALVE_CONTEXT_V2_SCHEMA,
+        values=np.asarray([0.05, 0.1, 0.8, 0.05, 1.0], dtype=np.float32),
+    )
+    capture.append_frame(
+        timestamp_s=10.02,
+        rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+        position_m=np.zeros(3),
+        rotation_axis_angle_rad=np.zeros(3),
+        gripper_width_m=0.05,
+        latest_wrench_timestamp_s=None,
+        context_record=record,
+    )
+    capture.close()
+
+    with open(root / "context_frames.csv", newline="") as file:
+        rows = list(csv.DictReader(file))
+    assert len(rows) == 1
+    assert rows[0]["phase"] == "recovery"
+    assert rows[0]["phase_recovery"] == str(float(record.values[2]))
+    assert rows[0]["context_valid"] == "1.0"
+    assert "reason_none" not in rows[0]
