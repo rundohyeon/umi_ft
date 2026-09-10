@@ -3,6 +3,8 @@
 /dataset_*.zip
 *.zarr/
 *.zarr.zip
+*.zip
+
 
 # Model checkpoints and exported weights
 *.ckpt
