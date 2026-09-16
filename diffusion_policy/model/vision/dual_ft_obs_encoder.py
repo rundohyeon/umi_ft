@@ -147,6 +147,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
         self.right_ft_key = right_ft_key
         self.fusion_dim = int(fusion_dim)
         self.valve_context_key = valve_context_key
+        self.vision_backbone_frozen = bool(frozen)
 
         obs_meta = shape_meta["obs"]
         for key in (left_ft_key, right_ft_key):
@@ -196,6 +197,16 @@ class DualFTObsEncoder(ModuleAttrMixin):
                 "Dual-F/T policy allowlist requires exactly one RGB stream, got "
                 f"{self.vision_pose_encoder.rgb_keys}"
             )
+        if self.vision_backbone_frozen:
+            if any(
+                param.requires_grad
+                for param in self.vision_pose_encoder.key_model_map.parameters()
+            ):
+                raise AssertionError("frozen vision backbone has trainable parameters")
+            # policy.train() is called every epoch. Keep the frozen timm
+            # backbone deterministic while leaving image augmentation and all
+            # trainable F/T/fusion/context modules in training mode.
+            self.vision_pose_encoder.key_model_map.eval()
 
         if int(vision_feature_dim) == self.fusion_dim:
             self.visual_projection = nn.Identity()
@@ -269,12 +280,19 @@ class DualFTObsEncoder(ModuleAttrMixin):
         )
         logger.info(
             "DualFTObsEncoder: visual tokens=%d, fusion_dim=%d, "
-            "low_dim_output=%d, shared_ft=%s",
+            "low_dim_output=%d, shared_ft=%s, frozen_vision=%s",
             rgb_horizon,
             self.fusion_dim,
             self.low_dim_output_dim,
             self.share_ft_encoder,
+            self.vision_backbone_frozen,
         )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.vision_backbone_frozen:
+            self.vision_pose_encoder.key_model_map.eval()
+        return self
 
     def _visual_tokens(self, obs_dict):
         tokens = []

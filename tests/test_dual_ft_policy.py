@@ -367,6 +367,57 @@ def test_dual_ft_optimizer_groups_split_pretrained_and_new_modules():
     )
 
 
+def test_dual_ft_optimizer_omits_frozen_vision_only():
+    policy = _policy(_shape_meta())
+    vision = policy.obs_encoder.vision_pose_encoder.key_model_map
+    vision.requires_grad_(False)
+    policy.obs_encoder.vision_backbone_frozen = True
+    cfg = OmegaConf.create(
+        {
+            "optimizer": {"lr": 3e-4},
+            "policy": {"obs_encoder": {"pretrained": True, "frozen": True}},
+            "optimizer_parameter_groups": {
+                "mode": "dual_ft",
+                "pretrained_vision_lr": 3e-5,
+                "fusion_transformer_lr": 1e-4,
+                "new_obs_lr": 3e-4,
+            },
+        }
+    )
+
+    groups = _build_optimizer_param_groups(policy, cfg)
+    by_name = {group["name"]: group for group in groups}
+    assert set(by_name) == {
+        "diffusion_model",
+        "fusion_transformer",
+        "new_obs_modules",
+    }
+    grouped_ids = {
+        id(param) for group in groups for param in group["params"]
+    }
+    assert not any(id(param) in grouped_ids for param in vision.parameters())
+    assert grouped_ids == {
+        id(param) for param in policy.parameters() if param.requires_grad
+    }
+
+
+def test_frozen_vision_backbone_stays_in_eval_mode_during_policy_training():
+    encoder = _dual_encoder(_shape_meta())
+    encoder.vision_pose_encoder.key_model_map.requires_grad_(False)
+    encoder.vision_backbone_frozen = True
+
+    encoder.train()
+
+    assert encoder.training
+    assert encoder.fusion.training
+    assert encoder.left_ft_encoder.training
+    assert not encoder.vision_pose_encoder.key_model_map.training
+    assert not any(
+        param.requires_grad
+        for param in encoder.vision_pose_encoder.key_model_map.parameters()
+    )
+
+
 def test_four_gpu_resume_scheduler_preserves_epoch90_learning_rate():
     base_lrs = [3e-4, 3e-5, 1e-4, 3e-4]
     checkpoint_lrs = [

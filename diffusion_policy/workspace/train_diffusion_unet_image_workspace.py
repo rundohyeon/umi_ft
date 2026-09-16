@@ -110,6 +110,19 @@ def _build_optimizer_param_groups(model, cfg):
         for param in obs_encoder.vision_pose_encoder.key_model_map.parameters()
         if param.requires_grad
     }
+    vision_frozen = bool(
+        OmegaConf.select(cfg, "policy.obs_encoder.frozen", default=False)
+    )
+    if vision_frozen and vision_ids:
+        raise ValueError(
+            "policy.obs_encoder.frozen=true but the timm backbone still has "
+            "trainable parameters"
+        )
+    if not vision_frozen and not vision_ids:
+        raise ValueError(
+            "policy.obs_encoder.frozen=false but the timm backbone has no "
+            "trainable parameters"
+        )
     fusion_ids = {
         id(param) for param in obs_encoder.fusion.parameters()
         if param.requires_grad
@@ -136,11 +149,6 @@ def _build_optimizer_param_groups(model, cfg):
             "lr": base_lr,
         },
         {
-            "name": "pretrained_vision",
-            "params": vision_params,
-            "lr": float(split_cfg.pretrained_vision_lr),
-        },
-        {
             "name": "fusion_transformer",
             "params": fusion_params,
             "lr": float(split_cfg.fusion_transformer_lr),
@@ -151,6 +159,15 @@ def _build_optimizer_param_groups(model, cfg):
             "lr": float(split_cfg.new_obs_lr),
         },
     ]
+    if not vision_frozen:
+        param_groups.insert(
+            1,
+            {
+                "name": "pretrained_vision",
+                "params": vision_params,
+                "lr": float(split_cfg.pretrained_vision_lr),
+            },
+        )
     empty = [group["name"] for group in param_groups if not group["params"]]
     if empty:
         raise ValueError(

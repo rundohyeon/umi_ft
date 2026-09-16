@@ -9,6 +9,10 @@ shape_meta: ${task.shape_meta}
 
 policy:
   obs_encoder:
+    # The warm-start Dual-F/T checkpoint already contains the task-adapted
+    # timm ViT. Keep only that backbone frozen for the context experiment;
+    # F/T, fusion, context conditioning, and diffusion remain trainable.
+    frozen: true
     valve_context_key: valve_context
     valve_context_dim: 5
     valve_context_num_phase_experts: 4

@@ -297,6 +297,7 @@ class DualFTInferenceContractTest(unittest.TestCase):
         self.assertEqual(contract["action_horizon"], 16)
         self.assertEqual(contract["action_dim"], 11)
         self.assertEqual(contract["normalizer_owner"], "policy.predict_action")
+        self.assertEqual(contract["architecture_contract_version"], 2)
 
     def test_four_state_context_checkpoint_contract(self):
         contract = inspect_dual_ft_checkpoint_payload(_v2_context_payload())
@@ -307,6 +308,7 @@ class DualFTInferenceContractTest(unittest.TestCase):
             "umi_valve_context_sidecar_v2_4state",
         )
         self.assertEqual(contract["valve_context_num_phase_experts"], 4)
+        self.assertEqual(contract["architecture_contract_version"], 4)
 
     def test_rgb_only_checkpoint_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "RGB-only/non-dual"):

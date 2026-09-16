@@ -373,10 +373,21 @@ def load_policy(
             raise ValueError("context policy evaluation requires a context sidecar")
         cfg.task.valve_context_sidecar_path = str(context_sidecar_path)
         cfg.task.dataset.valve_context_sidecar_path = str(context_sidecar_path)
-    if OmegaConf.select(cfg, "policy.obs_encoder.pretrained", default=None) is not None:
-        cfg.policy.obs_encoder.pretrained = False
-    if OmegaConf.select(cfg, "policy.obs_encoder.transforms", default=None) is not None:
-        cfg.policy.obs_encoder.transforms = None
+    # Instantiate without downloading timm weights: strict checkpoint loading
+    # immediately replaces the temporary initialization. TimmObsEncoder
+    # intentionally rejects frozen=True with pretrained=False during training,
+    # so temporarily unfreeze only the construction config and restore the
+    # serialized evaluation behavior after loading.
+    policy_cfg = copy.deepcopy(cfg.policy)
+    serialized_vision_frozen = bool(
+        OmegaConf.select(cfg, "policy.obs_encoder.frozen", default=False)
+    )
+    if OmegaConf.select(policy_cfg, "obs_encoder.pretrained", default=None) is not None:
+        policy_cfg.obs_encoder.pretrained = False
+    if OmegaConf.select(policy_cfg, "obs_encoder.transforms", default=None) is not None:
+        policy_cfg.obs_encoder.transforms = None
+    if serialized_vision_frozen:
+        policy_cfg.obs_encoder.frozen = False
 
     state_name = _select_state_name(
         payload,
@@ -389,9 +400,14 @@ def load_policy(
     # policy so CPU memory does not peak at workspace-training levels.
     payload.clear()
 
-    policy = hydra.utils.instantiate(cfg.policy)
+    policy = hydra.utils.instantiate(policy_cfg)
     policy.load_state_dict(selected_state, strict=True)
     del selected_state
+    if serialized_vision_frozen:
+        vision_models = policy.obs_encoder.vision_pose_encoder.key_model_map
+        vision_models.requires_grad_(False)
+        vision_models.eval()
+        policy.obs_encoder.vision_backbone_frozen = True
     if num_inference_steps is not None:
         if num_inference_steps <= 0:
             raise ValueError("num_inference_steps must be positive")
@@ -426,7 +442,7 @@ def load_policy(
         ),
     }
     if marker_values != {
-        "architecture": 2,
+        "architecture": contract["architecture_contract_version"],
         "left_temporal": 1,
         "right_temporal": 1,
     }:

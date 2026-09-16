@@ -66,6 +66,11 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         context_phase_names = []
         context_reason_names = []
         context_num_experts = 0
+    architecture_contract_version = (
+        (4 if context_schema == VALVE_CONTEXT_V2_SCHEMA else 3)
+        if is_valve_context_policy
+        else 2
+    )
     expected_obs_shapes = {
         "camera0_rgb": (2, (3, 224, 224)),
         "robot0_eef_pos": (2, (3,)),
@@ -466,13 +471,7 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
     exact_state_contract = {
         "obs_encoder.architecture_contract_version": (
             (),
-            (
-                4
-                if context_schema == VALVE_CONTEXT_V2_SCHEMA
-                else 3
-            )
-            if is_valve_context_policy
-            else 2,
+            architecture_contract_version,
         ),
         "obs_encoder.left_ft_encoder.temporal_contract_version": ((), 1),
         "obs_encoder.right_ft_encoder.temporal_contract_version": ((), 1),
@@ -620,4 +619,5 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "valve_context_schema": context_schema,
         "valve_context_phase_names": context_phase_names,
         "valve_context_num_phase_experts": context_num_experts,
+        "architecture_contract_version": architecture_contract_version,
     }
