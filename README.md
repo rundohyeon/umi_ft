@@ -420,21 +420,102 @@ accelerate launch \
   hydra.run.dir=data/outputs/260827_dual_ft_context_v2_4gpu_b32_run1
 ```
 
+### Causal-smoothed F/T difference tokens
+
+The `ft_raw_delta` variant keeps both 32-sample absolute F/T histories and
+adds separately encoded left/right difference histories.  Differences are
+computed inside the observation encoder from a causal EMA (`alpha=0.25`) as
+`smooth[t] - smooth[t-1]`; the first difference is zero.  This makes training
+and deployment identical and requires no new dataset or sidecar fields.  The
+fusion sequence is six tokens:
+
+```text
+[RGB_old, RGB_current, left_raw, right_raw, left_delta, right_delta]
+```
+
+The command below warm-starts the frozen-ViT four-state action checkpoint,
+uses GPUs 2 and 3 with global batch 32, logs losses, and keeps only
+`checkpoints/latest.ckpt`:
+
+```bash
+accelerate launch \
+  --multi_gpu \
+  --num_processes 2 \
+  --gpu_ids 2,3 \
+  --mixed_precision no \
+  --main_process_port 29512 \
+  train.py \
+  --config-name=train_diffusion_unet_timm_umi_dual_ft_context_v2_ft_raw_delta_workspace \
+  task.dataset_path=three_dataset/dataset.zarr.zip \
+  task.force_sidecar_path=three_dataset/dataset_force_sidecar.zarr \
+  task.valve_context_sidecar_path=three_dataset/dataset_valve_context_v2_4state.zarr \
+  training.init_from_checkpoint=data/outputs/three_dataset_dual_ft_context_v2_frozen_vit_2gpu_b32_run1/checkpoints/latest.ckpt \
+  training.init_weights=auto \
+  training.resume=false \
+  dataloader.batch_size=16 \
+  val_dataloader.batch_size=16 \
+  dataloader.num_workers=4 \
+  val_dataloader.num_workers=2 \
+  hydra.run.dir=data/outputs/three_dataset_context_v2_ft_raw_delta_2gpu_b32_run1
+```
+
+The real-robot entry point reads this feature mode from the checkpoint. It
+passes the same causal 32-sample histories to the policy; the restored
+observation encoder computes the EMA differences internally. No separately
+computed live delta input is accepted. Run the hardware-free asset/contract
+preflight first:
+
+```bash
+conda run -n umi python eval_real_indy_rg2_dual_ft.py \
+  --checkpoint data/outputs/three_dataset_context_v2_ft_raw_delta_2gpu_b32_run1/checkpoints/latest.ckpt \
+  --inspect-checkpoint
+```
+
+This verifies architecture marker 5, the six-token order, EMA alpha, frozen
+four-state observer SHA-256, and automatically resolves
+`three_dataset/dataset.zarr.zip` from the checkpoint. Then run one guarded
+planning cycle. This connects to the controllers but submits no waypoint:
+
+```bash
+conda run -n umi python eval_real_indy_rg2_dual_ft.py \
+  --checkpoint data/outputs/three_dataset_context_v2_ft_raw_delta_2gpu_b32_run1/checkpoints/latest.ckpt \
+  --robot-config example/eval_robots_config_indy_rg2.yaml \
+  --log-dir data/eval_dual_ft/raw_delta_real_dryrun \
+  --n-action-steps 1 \
+  --dry-run \
+  --max-cycles 1
+```
+
+Dry-run enables motion-debug, policy-input, and coordinate-transform audits
+by default. After inspecting the live image overlap, startup bias, context,
+F/T freshness, six-token fusion, and predicted waypoint, remove `--dry-run`
+for the first physical one-cycle test. Keep `--n-action-steps 1` and
+`--max-cycles 1` during that commissioning step.
+
+After the raw+delta ablation, the compact variant replaces each raw-history
+token with the latest causally smoothed absolute F/T value while retaining the
+full delta history.  Run the same command with these two substitutions:
+
+```text
+--config-name=train_diffusion_unet_timm_umi_dual_ft_context_v2_ft_latest_delta_workspace
+hydra.run.dir=data/outputs/three_dataset_context_v2_ft_latest_delta_2gpu_b32_run1
+```
+
 Run a hardware-free validation on a new checkpoint:
 
 ```bash
 conda run -n umi python eval_dual_ft_offline.py \
-  --checkpoint data/outputs/260827_dual_ft_context_v2_4gpu_b32_run1/checkpoints/latest.ckpt \
-  --dataset session_260827/dataset.zarr.zip \
-  --force-sidecar session_260827/dataset_force_sidecar.zarr \
-  --context-sidecar session_260827/dataset_valve_context_v2_4state.zarr \
+  --checkpoint data/outputs/three_dataset_context_v2_ft_raw_delta_2gpu_b32_run1/checkpoints/latest.ckpt \
+  --dataset three_dataset/dataset.zarr.zip \
+  --force-sidecar three_dataset/dataset_force_sidecar.zarr \
+  --context-sidecar three_dataset/dataset_valve_context_v2_4state.zarr \
   --split validation \
   --weights auto \
   --device cuda:0 \
   --batch-size 8 \
   --num-workers 4 \
   --max-samples 256 \
-  --output data/eval_dual_ft/context_v2_validation.json
+  --output data/eval_dual_ft/raw_delta_validation.json
 ```
 
 For robot evaluation, first suppress all submitted waypoints:

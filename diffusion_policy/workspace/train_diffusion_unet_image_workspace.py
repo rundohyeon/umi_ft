@@ -84,13 +84,24 @@ def _build_optimizer_param_groups(model, cfg):
             f"got {mode!r}"
         )
     obs_encoder = model.obs_encoder
-    required_attributes = (
+    required_attributes = [
         "vision_pose_encoder",
-        "left_ft_encoder",
-        "right_ft_encoder",
         "fusion",
         "fusion_projection",
-    )
+    ]
+    ft_feature_mode = str(getattr(obs_encoder, "ft_feature_mode", "raw_history"))
+    if ft_feature_mode in ("raw_history", "raw_history_plus_delta_history"):
+        required_attributes.extend(["left_ft_encoder", "right_ft_encoder"])
+    elif ft_feature_mode == "latest_absolute_plus_delta_history":
+        required_attributes.extend(
+            ["left_ft_absolute_encoder", "right_ft_absolute_encoder"]
+        )
+    else:
+        raise ValueError(f"unsupported dual-F/T feature mode {ft_feature_mode!r}")
+    if ft_feature_mode != "raw_history":
+        required_attributes.extend(
+            ["left_ft_delta_encoder", "right_ft_delta_encoder", "ft_difference"]
+        )
     missing = [
         name for name in required_attributes if not hasattr(obs_encoder, name)
     ]
@@ -216,19 +227,21 @@ def _select_initial_policy_state(payload, requested: str):
 
 
 def _load_shared_policy_weights(target, source_state: dict) -> dict:
-    """Warm-start matching action weights while keeping v2 context new.
+    """Warm-start every shape-compatible action-policy weight.
 
     Dataset normalizers are recomputed for the new run. The architecture marker
-    and all context-conditioner parameters must also remain target-initialized.
+    remains target-initialized.  A context conditioner is reused when the
+    source checkpoint has a compatible one; it stays new when warm-starting
+    from an older policy that did not contain context conditioning.
     """
 
     target_state = target.state_dict()
     excluded_prefixes = (
         "normalizer.",
-        "obs_encoder.valve_stage_conditioner.",
         "obs_encoder.architecture_contract_version",
     )
     loaded = []
+    migrated_shape = []
     skipped_missing = []
     skipped_shape = []
     skipped_excluded = []
@@ -240,19 +253,50 @@ def _load_shared_policy_weights(target, source_state: dict) -> dict:
         if key not in target_state:
             skipped_missing.append(key)
             continue
-        if tuple(value.shape) != tuple(target_state[key].shape):
+        source_shape = tuple(value.shape)
+        target_shape = tuple(target_state[key].shape)
+        if (
+            key == "obs_encoder.position_embedding"
+            and len(source_shape) == 2
+            and len(target_shape) == 2
+            and source_shape[1] == target_shape[1]
+            and source_shape[0] < target_shape[0]
+        ):
+            migrated = target_state[key].clone()
+            migrated[: source_shape[0]] = value
+            merged[key] = migrated
+            migrated_shape.append(key)
+            continue
+        if (
+            key == "obs_encoder.fusion_projection.weight"
+            and len(source_shape) == 2
+            and len(target_shape) == 2
+            and source_shape[0] == target_shape[0]
+            and source_shape[1] < target_shape[1]
+        ):
+            # Token order keeps RGB/left-raw/right-raw first.  Copy their
+            # learned projection exactly and start the appended delta-token
+            # columns at zero for a stable warm start.
+            migrated = torch.zeros_like(target_state[key])
+            migrated[:, : source_shape[1]] = value
+            merged[key] = migrated
+            migrated_shape.append(key)
+            continue
+        if source_shape != target_shape:
             skipped_shape.append(key)
             continue
         merged[key] = value
         loaded.append(key)
-    required_fragments = (
+    required_fragments = [
         "model.",
         "obs_encoder.vision_pose_encoder.",
-        "obs_encoder.left_ft_encoder.",
-        "obs_encoder.right_ft_encoder.",
         "obs_encoder.fusion.",
         "obs_encoder.fusion_projection.",
-    )
+    ]
+    if hasattr(target.obs_encoder, "left_ft_encoder"):
+        required_fragments.extend(
+            ["obs_encoder.left_ft_encoder.", "obs_encoder.right_ft_encoder."]
+        )
     missing_fragments = [
         prefix for prefix in required_fragments
         if not any(key.startswith(prefix) for key in loaded)
@@ -265,6 +309,7 @@ def _load_shared_policy_weights(target, source_state: dict) -> dict:
     target.load_state_dict(merged, strict=True)
     return {
         "loaded": len(loaded),
+        "migrated_shape": len(migrated_shape),
         "skipped_excluded": len(skipped_excluded),
         "skipped_missing": len(skipped_missing),
         "skipped_shape": len(skipped_shape),

@@ -49,8 +49,13 @@ The evaluator fails closed unless the checkpoint contains:
 - condition `[B,786]`, action `[B,16,11]`, and timestep embedding 32;
 - stock offline position/axis-angle pose with no quaternion round trip, while
   live/legacy 7-D pose remains fixed to `xyzw` (`qx,qy,qz,qw`);
-- official-form fusion over four local tokens, pose-only 18-D proprioception,
-  architecture marker 2, and left/right temporal marker 1;
+- official-form fusion with pose-only 18-D proprioception and an exact
+  checkpoint-selected F/T contract: four tokens / architecture marker 2–4 for
+  absolute history, or six tokens / marker 5–6 for causal EMA-delta variants;
+- for marker 5, token order
+  `[rgb_old, rgb_current, left_raw_history, right_raw_history,
+  left_delta_history, right_delta_history]`, EMA alpha `0.25`, a zero first
+  difference, and separate left/right delta encoders;
 - native left/right `[32,6]` F/T sliced only from sidecar `wrench_12d`, which
   already contains the per-episode bias removal, with identity axis/sign;
 - a complete, finite checkpoint normalizer for every observation and all 11

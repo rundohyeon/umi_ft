@@ -86,8 +86,85 @@ class CausalFTEncoder(nn.Module):
         return self.forward_sequence(history)[:, -1]
 
 
+class CausalFTDifference(nn.Module):
+    """Causally smooth a wrench history and form its backward difference.
+
+    The EMA starts from the first (possibly repeat-padded) sample, so padded
+    episode prefixes produce exactly zero deltas.  Both training and real-time
+    inference run this module *after* the policy's affine F/T normalizer.  EMA
+    commutes with that affine transform and the offset cancels in the
+    difference, so this is equivalent to smoothing physical wrench first and
+    then scaling its difference.
+    """
+
+    def __init__(self, ema_alpha: float = 0.25):
+        super().__init__()
+        ema_alpha = float(ema_alpha)
+        if not 0.0 < ema_alpha <= 1.0:
+            raise ValueError("F/T EMA alpha must be in (0, 1]")
+        self.register_buffer(
+            "difference_contract_version",
+            torch.tensor(1, dtype=torch.int64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "ema_alpha",
+            torch.tensor(ema_alpha, dtype=torch.float32),
+            persistent=True,
+        )
+
+    def forward(self, history):
+        if history.ndim != 3 or history.shape[-1] != 6:
+            raise ValueError(
+                f"F/T history must have shape [B,T,6], got {tuple(history.shape)}"
+            )
+        if history.shape[1] < 1:
+            raise ValueError("F/T history must contain at least one sample")
+        alpha = self.ema_alpha.to(dtype=history.dtype, device=history.device)
+        previous = history[:, 0]
+        smoothed = [previous]
+        for index in range(1, history.shape[1]):
+            previous = alpha * history[:, index] + (1.0 - alpha) * previous
+            smoothed.append(previous)
+        smoothed = torch.stack(smoothed, dim=1)
+        difference = torch.cat(
+            [
+                torch.zeros_like(smoothed[:, :1]),
+                smoothed[:, 1:] - smoothed[:, :-1],
+            ],
+            dim=1,
+        )
+        return smoothed, difference
+
+
+class LatestAbsoluteFTEncoder(nn.Module):
+    """Encode the latest causally smoothed absolute wrench as one token."""
+
+    def __init__(self, input_dim=6, hidden_dim=128, output_dim=768):
+        super().__init__()
+        self.register_buffer(
+            "absolute_contract_version",
+            torch.tensor(1, dtype=torch.int64),
+            persistent=True,
+        )
+        self.network = nn.Sequential(
+            nn.Linear(int(input_dim), int(hidden_dim)),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Linear(int(hidden_dim), int(output_dim)),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+        )
+
+    def forward(self, smoothed_history):
+        if smoothed_history.ndim != 3 or smoothed_history.shape[-1] != 6:
+            raise ValueError(
+                "smoothed F/T history must have shape [B,T,6], got "
+                f"{tuple(smoothed_history.shape)}"
+            )
+        return self.network(smoothed_history[:, -1])
+
+
 class DualFTObsEncoder(ModuleAttrMixin):
-    """Existing TARGET vision/pose encoder augmented by two native F/T tokens.
+    """TARGET vision/pose encoder augmented by native F/T fusion tokens.
 
     The vision backbone, image transforms, and low-dimensional pose flattening
     are delegated to :class:`TimmObsEncoder`. Left and right histories never
@@ -119,6 +196,8 @@ class DualFTObsEncoder(ModuleAttrMixin):
         fusion_position_encoding: str = "learnable",
         ft_channel_dims=(16, 32, 64, 128),
         share_ft_encoder: bool = False,
+        ft_feature_mode: str = "raw_history",
+        ft_delta_ema_alpha: float = 0.25,
         valve_context_key: str | None = None,
         valve_context_dim: int = 10,
         valve_context_hidden_dim: int = 128,
@@ -126,16 +205,45 @@ class DualFTObsEncoder(ModuleAttrMixin):
         valve_context_num_phase_experts: int = 5,
     ):
         super().__init__()
-        if valve_context_key is None:
+        ft_feature_mode = str(ft_feature_mode)
+        supported_ft_modes = {
+            "raw_history",
+            "raw_history_plus_delta_history",
+            "latest_absolute_plus_delta_history",
+        }
+        if ft_feature_mode not in supported_ft_modes:
+            raise ValueError(
+                f"unsupported F/T feature mode {ft_feature_mode!r}; "
+                f"expected one of {sorted(supported_ft_modes)}"
+            )
+        if valve_context_key is None and ft_feature_mode == "raw_history":
             architecture_contract_version = 2
-        elif (int(valve_context_dim), int(valve_context_num_phase_experts)) == (10, 5):
+        elif (
+            (int(valve_context_dim), int(valve_context_num_phase_experts)) == (10, 5)
+            and ft_feature_mode == "raw_history"
+        ):
             architecture_contract_version = 3
-        elif (int(valve_context_dim), int(valve_context_num_phase_experts)) == (5, 4):
+        elif (
+            (int(valve_context_dim), int(valve_context_num_phase_experts)) == (5, 4)
+            and ft_feature_mode == "raw_history"
+        ):
             architecture_contract_version = 4
+        elif (
+            (int(valve_context_dim), int(valve_context_num_phase_experts)) == (5, 4)
+            and ft_feature_mode == "raw_history_plus_delta_history"
+        ):
+            architecture_contract_version = 5
+        elif (
+            (int(valve_context_dim), int(valve_context_num_phase_experts)) == (5, 4)
+            and ft_feature_mode == "latest_absolute_plus_delta_history"
+        ):
+            architecture_contract_version = 6
         else:
             raise ValueError(
-                "unsupported valve context encoder contract: "
-                f"dim={valve_context_dim}, experts={valve_context_num_phase_experts}"
+                "unsupported valve-context/F/T encoder contract: "
+                f"context_key={valve_context_key!r}, dim={valve_context_dim}, "
+                f"experts={valve_context_num_phase_experts}, "
+                f"ft_feature_mode={ft_feature_mode!r}"
             )
         self.register_buffer(
             "architecture_contract_version",
@@ -148,6 +256,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
         self.fusion_dim = int(fusion_dim)
         self.valve_context_key = valve_context_key
         self.vision_backbone_frozen = bool(frozen)
+        self.ft_feature_mode = ft_feature_mode
 
         obs_meta = shape_meta["obs"]
         for key in (left_ft_key, right_ft_key):
@@ -215,24 +324,59 @@ class DualFTObsEncoder(ModuleAttrMixin):
                 int(vision_feature_dim), self.fusion_dim
             )
 
-        self.left_ft_encoder = CausalFTEncoder(
-            channel_dims=ft_channel_dims,
-            output_dim=self.fusion_dim,
-        )
-        if share_ft_encoder:
-            self.right_ft_encoder = self.left_ft_encoder
-        else:
-            self.right_ft_encoder = CausalFTEncoder(
+        if self.ft_feature_mode in (
+            "raw_history",
+            "raw_history_plus_delta_history",
+        ):
+            self.left_ft_encoder = CausalFTEncoder(
                 channel_dims=ft_channel_dims,
                 output_dim=self.fusion_dim,
             )
+            if share_ft_encoder:
+                self.right_ft_encoder = self.left_ft_encoder
+            else:
+                self.right_ft_encoder = CausalFTEncoder(
+                    channel_dims=ft_channel_dims,
+                    output_dim=self.fusion_dim,
+                )
+        else:
+            absolute_hidden_dim = int(tuple(ft_channel_dims)[-1])
+            self.left_ft_absolute_encoder = LatestAbsoluteFTEncoder(
+                hidden_dim=absolute_hidden_dim,
+                output_dim=self.fusion_dim,
+            )
+            if share_ft_encoder:
+                self.right_ft_absolute_encoder = self.left_ft_absolute_encoder
+            else:
+                self.right_ft_absolute_encoder = LatestAbsoluteFTEncoder(
+                    hidden_dim=absolute_hidden_dim,
+                    output_dim=self.fusion_dim,
+                )
+
+        if self.ft_feature_mode != "raw_history":
+            self.ft_difference = CausalFTDifference(
+                ema_alpha=float(ft_delta_ema_alpha)
+            )
+            self.left_ft_delta_encoder = CausalFTEncoder(
+                channel_dims=ft_channel_dims,
+                output_dim=self.fusion_dim,
+            )
+            if share_ft_encoder:
+                self.right_ft_delta_encoder = self.left_ft_delta_encoder
+            else:
+                self.right_ft_delta_encoder = CausalFTEncoder(
+                    channel_dims=ft_channel_dims,
+                    output_dim=self.fusion_dim,
+                )
         self.share_ft_encoder = bool(share_ft_encoder)
 
         rgb_horizon = sum(
             int(legacy_shape_meta["obs"][key]["horizon"])
             for key in self.vision_pose_encoder.rgb_keys
         )
-        self.num_fusion_tokens = rgb_horizon + 2
+        self.num_fusion_tokens = rgb_horizon + (
+            2 if self.ft_feature_mode == "raw_history" else 4
+        )
         if int(fusion_layers) != 1:
             raise ValueError(
                 "official UMI-FT fusion contract requires fusion_layers=1"
@@ -279,9 +423,12 @@ class DualFTObsEncoder(ModuleAttrMixin):
             and not attr.get("ignore_by_policy", False)
         )
         logger.info(
-            "DualFTObsEncoder: visual tokens=%d, fusion_dim=%d, "
-            "low_dim_output=%d, shared_ft=%s, frozen_vision=%s",
+            "DualFTObsEncoder: visual tokens=%d, fusion tokens=%d, "
+            "ft_mode=%s, fusion_dim=%d, low_dim_output=%d, shared_ft=%s, "
+            "frozen_vision=%s",
             rgb_horizon,
+            self.num_fusion_tokens,
+            self.ft_feature_mode,
             self.fusion_dim,
             self.low_dim_output_dim,
             self.share_ft_encoder,
@@ -333,8 +480,8 @@ class DualFTObsEncoder(ModuleAttrMixin):
     def set_fusion_attention_capture(self, enabled: bool) -> None:
         """Capture per-head fusion self-attention during the next forward pass.
 
-        The returned attention is descriptive only: it is the 4-token fusion
-        layer's query-to-key weight matrix, not a causal action attribution.
+        The returned attention is descriptive only: it is the fusion layer's
+        query-to-key weight matrix, not a causal action attribution.
         """
         self.capture_fusion_attention = bool(enabled)
         self.last_fusion_attention = None
@@ -345,7 +492,26 @@ class DualFTObsEncoder(ModuleAttrMixin):
         for key in self.vision_pose_encoder.rgb_keys:
             horizon = int(self.shape_meta["obs"][key]["horizon"])
             names.extend(f"{key}[t={idx}]" for idx in range(horizon))
-        names.extend([self.left_ft_key, self.right_ft_key])
+        if self.ft_feature_mode == "raw_history":
+            names.extend([self.left_ft_key, self.right_ft_key])
+        elif self.ft_feature_mode == "raw_history_plus_delta_history":
+            names.extend(
+                [
+                    self.left_ft_key,
+                    self.right_ft_key,
+                    f"{self.left_ft_key}_delta",
+                    f"{self.right_ft_key}_delta",
+                ]
+            )
+        else:
+            names.extend(
+                [
+                    f"{self.left_ft_key}_latest_absolute",
+                    f"{self.right_ft_key}_latest_absolute",
+                    f"{self.left_ft_key}_delta",
+                    f"{self.right_ft_key}_delta",
+                ]
+            )
         if len(names) != self.num_fusion_tokens:
             raise AssertionError(
                 f"fusion token labels {len(names)} != {self.num_fusion_tokens}"
@@ -361,7 +527,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
         # TransformerEncoderLayer normally calls MultiheadAttention with
         # need_weights=False. Reproduce that layer's forward exactly while
         # requesting its [B, heads, query, key] weights for eval diagnostics.
-        # There is no mask/cross-attention in this fixed four-token fusion.
+        # There is no mask/cross-attention in this fixed-size token fusion.
         fusion = self.fusion
         if fusion.norm_first:
             attn_src = fusion.norm1(src)
@@ -394,10 +560,33 @@ class DualFTObsEncoder(ModuleAttrMixin):
 
     def forward(self, obs_dict):
         visual = self._visual_tokens(obs_dict)
-        left = self.left_ft_encoder(obs_dict[self.left_ft_key]).unsqueeze(1)
-        right = self.right_ft_encoder(obs_dict[self.right_ft_key]).unsqueeze(1)
+        left_history = obs_dict[self.left_ft_key]
+        right_history = obs_dict[self.right_ft_key]
+        if self.ft_feature_mode == "raw_history":
+            ft_tokens = [
+                self.left_ft_encoder(left_history),
+                self.right_ft_encoder(right_history),
+            ]
+        else:
+            left_smoothed, left_delta = self.ft_difference(left_history)
+            right_smoothed, right_delta = self.ft_difference(right_history)
+            if self.ft_feature_mode == "raw_history_plus_delta_history":
+                absolute_tokens = [
+                    self.left_ft_encoder(left_history),
+                    self.right_ft_encoder(right_history),
+                ]
+            else:
+                absolute_tokens = [
+                    self.left_ft_absolute_encoder(left_smoothed),
+                    self.right_ft_absolute_encoder(right_smoothed),
+                ]
+            ft_tokens = absolute_tokens + [
+                self.left_ft_delta_encoder(left_delta),
+                self.right_ft_delta_encoder(right_delta),
+            ]
+        ft_tokens = [token.unsqueeze(1) for token in ft_tokens]
         batch_size = visual.shape[0]
-        tokens = torch.cat([visual, left, right], dim=1)
+        tokens = torch.cat([visual, *ft_tokens], dim=1)
         if tokens.shape[1] != self.num_fusion_tokens:
             raise ValueError(
                 f"unexpected fusion token count {tokens.shape[1]} != "

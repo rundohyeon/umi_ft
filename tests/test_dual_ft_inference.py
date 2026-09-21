@@ -290,6 +290,68 @@ def _v2_context_payload():
     return payload
 
 
+def _v2_delta_payload(*, latest_absolute=False):
+    payload = _v2_context_payload()
+    cfg = payload["cfg"]
+    state = payload["state_dicts"]["model"]
+    mode = (
+        "latest_absolute_plus_delta_history"
+        if latest_absolute
+        else "raw_history_plus_delta_history"
+    )
+    cfg.policy.obs_encoder.ft_feature_mode = mode
+    cfg.policy.obs_encoder.ft_delta_ema_alpha = 0.25
+    cfg.task.model_contract.update(
+        {
+            "version": (
+                "dual_ft_context_v2_4state_ft_latest_delta_786_action11_v1"
+                if latest_absolute
+                else "dual_ft_context_v2_4state_ft_raw_delta_786_action11_v1"
+            ),
+            "ft_temporal_contract": (
+                "latest_causal_ema_absolute_plus_delta32_v1"
+                if latest_absolute
+                else "raw32_plus_causal_ema_delta32_v1"
+            ),
+            "ft_feature_mode": mode,
+            "ft_delta_filter": "causal_ema_v1",
+            "ft_delta_ema_alpha": 0.25,
+            "ft_delta_definition": "smoothed_t_minus_smoothed_t_minus_1",
+            "ft_delta_first_sample": "zero",
+        }
+    )
+    state["obs_encoder.architecture_contract_version"] = torch.tensor(
+        6 if latest_absolute else 5
+    )
+    state["obs_encoder.position_embedding"] = torch.empty(6, 768)
+    state["obs_encoder.fusion_projection.weight"] = torch.empty(768, 4608)
+    state.update(
+        {
+            "obs_encoder.ft_difference.difference_contract_version": torch.tensor(1),
+            "obs_encoder.ft_difference.ema_alpha": torch.tensor(0.25),
+            "obs_encoder.left_ft_delta_encoder.temporal_contract_version": torch.tensor(1),
+            "obs_encoder.right_ft_delta_encoder.temporal_contract_version": torch.tensor(1),
+            "obs_encoder.left_ft_delta_encoder.network.0.conv.weight": torch.empty(16, 6, 2),
+            "obs_encoder.right_ft_delta_encoder.network.0.conv.weight": torch.empty(16, 6, 2),
+        }
+    )
+    if latest_absolute:
+        for key in list(state):
+            if key.startswith("obs_encoder.left_ft_encoder.") or key.startswith(
+                "obs_encoder.right_ft_encoder."
+            ):
+                del state[key]
+        state.update(
+            {
+                "obs_encoder.left_ft_absolute_encoder.absolute_contract_version": torch.tensor(1),
+                "obs_encoder.right_ft_absolute_encoder.absolute_contract_version": torch.tensor(1),
+                "obs_encoder.left_ft_absolute_encoder.network.0.weight": torch.empty(128, 6),
+                "obs_encoder.right_ft_absolute_encoder.network.0.weight": torch.empty(128, 6),
+            }
+        )
+    return payload
+
+
 class DualFTInferenceContractTest(unittest.TestCase):
     def test_checkpoint_contract_requires_dual_encoders_and_normalizers(self):
         contract = inspect_dual_ft_checkpoint_payload(_payload())
@@ -309,6 +371,23 @@ class DualFTInferenceContractTest(unittest.TestCase):
         )
         self.assertEqual(contract["valve_context_num_phase_experts"], 4)
         self.assertEqual(contract["architecture_contract_version"], 4)
+
+    def test_raw_and_delta_checkpoint_contract(self):
+        contract = inspect_dual_ft_checkpoint_payload(_v2_delta_payload())
+        self.assertEqual(contract["architecture_contract_version"], 5)
+        self.assertEqual(contract["ft_feature_mode"], "raw_history_plus_delta_history")
+        self.assertEqual(contract["num_fusion_tokens"], 6)
+
+    def test_latest_absolute_and_delta_checkpoint_contract(self):
+        contract = inspect_dual_ft_checkpoint_payload(
+            _v2_delta_payload(latest_absolute=True)
+        )
+        self.assertEqual(contract["architecture_contract_version"], 6)
+        self.assertEqual(
+            contract["ft_feature_mode"],
+            "latest_absolute_plus_delta_history",
+        )
+        self.assertEqual(contract["num_fusion_tokens"], 6)
 
     def test_rgb_only_checkpoint_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "RGB-only/non-dual"):

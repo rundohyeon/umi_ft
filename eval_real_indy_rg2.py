@@ -3845,8 +3845,9 @@ def _make_eval_comparison_frame(
     default=False,
     show_default=True,
     help=(
-        "Save the Dual-F/T fusion layer's per-head 4x4 self-attention to the "
-        "eval log. This is descriptive attention, not causal attribution."
+        "Save the Dual-F/T fusion layer's per-head token-by-token self-attention "
+        "to the eval log (4x4 for raw-only, 6x6 for delta-token checkpoints). "
+        "This is descriptive attention, not causal attribution."
     ),
 )
 @click.option(
@@ -4145,6 +4146,14 @@ def main(input, output, robot_config,
         f"{checkpoint_contract['ft_dim']}], normalizer="
         f"{checkpoint_contract['normalizer_owner']}"
     )
+    print(
+        "F/T feature contract: "
+        f"mode={checkpoint_contract['ft_feature_mode']} "
+        f"architecture={checkpoint_contract['architecture_contract_version']} "
+        f"fusion_tokens={checkpoint_contract['num_fusion_tokens']} "
+        "(derived delta features, when configured, are computed causally "
+        "inside the restored observation encoder)"
+    )
     if valve_context_enabled:
         print(
             "valve context contract: "
@@ -4233,7 +4242,7 @@ def main(input, output, robot_config,
             image_contract_errors.append("--disable_eval_image_aug must be enabled")
         if image_contract_errors:
             raise click.ClickException(
-                "live image preprocessing differs from session_260827 training: "
+                "live image preprocessing differs from the checkpoint training contract: "
                 + "; ".join(image_contract_errors)
             )
         print(

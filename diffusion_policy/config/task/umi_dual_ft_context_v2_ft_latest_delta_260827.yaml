@@ -1,0 +1,15 @@
+defaults:
+  - umi_dual_ft_context_v2_ft_raw_delta_260827
+  - _self_
+
+name: umi_dual_ft_context_v2_ft_latest_delta_260827
+
+# Compact ablation: retain the latest causally smoothed absolute wrench as one
+# token per finger, while temporal dynamics come from the full delta history.
+model_contract:
+  version: dual_ft_context_v2_4state_ft_latest_delta_786_action11_v1
+  ft_temporal_contract: latest_causal_ema_absolute_plus_delta32_v1
+  ft_feature_mode: latest_absolute_plus_delta_history
+  ft_fusion_token_order:
+    [rgb_old, rgb_current, left_latest_absolute, right_latest_absolute,
+     left_delta_history, right_delta_history]

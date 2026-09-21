@@ -1,0 +1,21 @@
+defaults:
+  - umi_dual_ft_context_v2_260827
+  - _self_
+
+name: umi_dual_ft_context_v2_ft_raw_delta_260827
+
+# Keep the full absolute 32-sample history and append an independently encoded
+# causal-EMA backward-difference history for each finger.  The encoder computes
+# these derived inputs after the existing affine F/T normalizer, so no new Zarr
+# arrays or normalizer keys are required.
+model_contract:
+  version: dual_ft_context_v2_4state_ft_raw_delta_786_action11_v1
+  ft_temporal_contract: raw32_plus_causal_ema_delta32_v1
+  ft_feature_mode: raw_history_plus_delta_history
+  ft_delta_filter: causal_ema_v1
+  ft_delta_ema_alpha: 0.25
+  ft_delta_definition: smoothed_t_minus_smoothed_t_minus_1
+  ft_delta_first_sample: zero
+  ft_fusion_token_order:
+    [rgb_old, rgb_current, left_raw_history, right_raw_history,
+     left_delta_history, right_delta_history]

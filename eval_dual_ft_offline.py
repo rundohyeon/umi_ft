@@ -50,8 +50,24 @@ IMPLEMENTATION_FILES = (
     "diffusion_policy/config/task/umi_dual_ft.yaml",
     "diffusion_policy/config/task/umi_dual_ft_260827_bias_only.yaml",
     "diffusion_policy/config/task/umi_dual_ft_context_v2_260827.yaml",
+    (
+        "diffusion_policy/config/task/"
+        "umi_dual_ft_context_v2_ft_raw_delta_260827.yaml"
+    ),
+    (
+        "diffusion_policy/config/task/"
+        "umi_dual_ft_context_v2_ft_latest_delta_260827.yaml"
+    ),
     "diffusion_policy/config/train_diffusion_unet_timm_umi_dual_ft_workspace.yaml",
     "diffusion_policy/config/train_diffusion_unet_timm_umi_dual_ft_context_v2_workspace.yaml",
+    (
+        "diffusion_policy/config/"
+        "train_diffusion_unet_timm_umi_dual_ft_context_v2_ft_raw_delta_workspace.yaml"
+    ),
+    (
+        "diffusion_policy/config/"
+        "train_diffusion_unet_timm_umi_dual_ft_context_v2_ft_latest_delta_workspace.yaml"
+    ),
     "diffusion_policy/dataset/umi_dual_ft_dataset.py",
     "diffusion_policy/model/vision/dual_ft_obs_encoder.py",
     "diffusion_policy/model/vision/valve_stage_conditioner.py",
@@ -432,20 +448,61 @@ def load_policy(
             "restored policy action must be [16,11], got "
             f"[{policy.action_horizon},{policy.action_dim}]"
         )
+    encoder = policy.obs_encoder
     marker_values = {
-        "architecture": int(policy.obs_encoder.architecture_contract_version),
-        "left_temporal": int(
-            policy.obs_encoder.left_ft_encoder.temporal_contract_version
-        ),
-        "right_temporal": int(
-            policy.obs_encoder.right_ft_encoder.temporal_contract_version
-        ),
+        "architecture": int(encoder.architecture_contract_version),
+        "ft_feature_mode": str(getattr(encoder, "ft_feature_mode", "raw_history")),
     }
-    if marker_values != {
+    expected_markers = {
         "architecture": contract["architecture_contract_version"],
-        "left_temporal": 1,
-        "right_temporal": 1,
-    }:
+        "ft_feature_mode": contract["ft_feature_mode"],
+    }
+    if hasattr(encoder, "left_ft_encoder"):
+        marker_values.update(
+            {
+                "left_temporal": int(
+                    encoder.left_ft_encoder.temporal_contract_version
+                ),
+                "right_temporal": int(
+                    encoder.right_ft_encoder.temporal_contract_version
+                ),
+            }
+        )
+        expected_markers.update({"left_temporal": 1, "right_temporal": 1})
+    else:
+        marker_values.update(
+            {
+                "left_absolute": int(
+                    encoder.left_ft_absolute_encoder.absolute_contract_version
+                ),
+                "right_absolute": int(
+                    encoder.right_ft_absolute_encoder.absolute_contract_version
+                ),
+            }
+        )
+        expected_markers.update({"left_absolute": 1, "right_absolute": 1})
+    if hasattr(encoder, "ft_difference"):
+        marker_values.update(
+            {
+                "difference": int(
+                    encoder.ft_difference.difference_contract_version
+                ),
+                "delta_left_temporal": int(
+                    encoder.left_ft_delta_encoder.temporal_contract_version
+                ),
+                "delta_right_temporal": int(
+                    encoder.right_ft_delta_encoder.temporal_contract_version
+                ),
+            }
+        )
+        expected_markers.update(
+            {
+                "difference": 1,
+                "delta_left_temporal": 1,
+                "delta_right_temporal": 1,
+            }
+        )
+    if marker_values != expected_markers:
         raise ValueError(f"restored policy contract buffers mismatch: {marker_values}")
     _normalizer_summary(policy)
     return LoadedPolicy(
@@ -735,6 +792,14 @@ def _dataset_provenance(
 ) -> dict[str, Any]:
     ft_cfg = OmegaConf.to_container(cfg.task.dataset.ft, resolve=True)
     model_contract = OmegaConf.to_container(cfg.task.model_contract, resolve=True)
+    ft_feature_mode = str(
+        OmegaConf.select(
+            cfg,
+            "policy.obs_encoder.ft_feature_mode",
+            default="raw_history",
+        )
+    )
+    fusion_tokens = 4 if ft_feature_mode == "raw_history" else 6
     if str(ft_cfg.get("wrench_key")) != "wrench_12d":
         raise ValueError("evaluation requires native sidecar wrench_key='wrench_12d'")
     if str(ft_cfg.get("bias_removal")) != "precomputed_in_sidecar":
@@ -788,6 +853,13 @@ def _dataset_provenance(
             "dataset_padding": str(ft_cfg["padding"]),
             "encoder_padding_contract": str(
                 model_contract["ft_temporal_contract"]
+            ),
+            "feature_mode": ft_feature_mode,
+            "fusion_tokens": fusion_tokens,
+            "delta_ema_alpha": (
+                float(model_contract["ft_delta_ema_alpha"])
+                if "ft_delta_ema_alpha" in model_contract
+                else None
             ),
         },
         "causal_drop_all_episodes": {

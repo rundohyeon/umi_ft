@@ -10,6 +10,7 @@ from diffusion_policy.model.common.normalizer import (
 )
 from diffusion_policy.model.vision.dual_ft_obs_encoder import (
     CausalConv1d,
+    CausalFTDifference,
     CausalFTEncoder,
     DualFTObsEncoder,
 )
@@ -166,6 +167,27 @@ def test_ft_encoder_final_token_uses_all_32_timesteps():
     assert torch.all(influence > 0), influence
 
 
+def test_causal_ema_difference_is_zero_for_constant_history():
+    transform = CausalFTDifference(ema_alpha=0.25)
+    history = torch.full((2, 32, 6), 3.5)
+    smoothed, difference = transform(history)
+    torch.testing.assert_close(smoothed, history)
+    torch.testing.assert_close(difference, torch.zeros_like(difference))
+
+
+def test_causal_ema_difference_does_not_use_future_samples():
+    torch.manual_seed(0)
+    transform = CausalFTDifference(ema_alpha=0.25)
+    history = torch.randn(2, 32, 6)
+    changed = history.clone()
+    changed[:, 17:] += 100.0
+    smooth_a, delta_a = transform(history)
+    smooth_b, delta_b = transform(changed)
+    torch.testing.assert_close(smooth_a[:, :17], smooth_b[:, :17])
+    torch.testing.assert_close(delta_a[:, :17], delta_b[:, :17])
+    assert torch.count_nonzero(delta_a[:, 0]) == 0
+
+
 def test_legacy_rgb_pose_forward_contract():
     shape_meta = _shape_meta(include_ft=False)
     encoder = TimmObsEncoder(
@@ -270,6 +292,87 @@ def test_four_state_valve_context_routes_four_experts():
     assert int(encoder.architecture_contract_version) == 4
     assert len(encoder.valve_stage_conditioner.experts) == 4
     assert encoder(obs).shape == (2, 82)
+
+
+def _four_state_delta_encoder(ft_feature_mode):
+    shape_meta = _shape_meta()
+    shape_meta["obs"]["valve_context"] = {
+        "shape": [5],
+        "horizon": 1,
+        "type": "low_dim",
+        "ignore_by_policy": True,
+    }
+    encoder = DualFTObsEncoder(
+        shape_meta=shape_meta,
+        model_name="resnet18",
+        pretrained=False,
+        frozen=False,
+        global_pool="",
+        transforms=None,
+        feature_aggregation="avg",
+        downsample_ratio=32,
+        vision_feature_dim=512,
+        fusion_dim=64,
+        fusion_heads=8,
+        fusion_feedforward_dim=128,
+        ft_channel_dims=[8, 16, 32, 32],
+        valve_context_key="valve_context",
+        valve_context_dim=5,
+        valve_context_num_phase_experts=4,
+        valve_context_hidden_dim=16,
+        valve_expert_bottleneck_dim=16,
+        ft_feature_mode=ft_feature_mode,
+        ft_delta_ema_alpha=0.25,
+    )
+    obs = _obs(batch_size=2)
+    obs["valve_context"] = torch.tensor(
+        [[[1, 0, 0, 0, 1]], [[0, 1, 0, 0, 1]]], dtype=torch.float32
+    )
+    return encoder, obs
+
+
+def test_raw_and_delta_histories_add_two_fusion_tokens():
+    encoder, obs = _four_state_delta_encoder(
+        "raw_history_plus_delta_history"
+    )
+    assert int(encoder.architecture_contract_version) == 5
+    assert encoder.num_fusion_tokens == 6
+    assert encoder.fusion_projection.in_features == 6 * 64
+    assert encoder.fusion_token_names() == [
+        "camera0_rgb[t=0]",
+        "camera0_rgb[t=1]",
+        "robot0_ft_left",
+        "robot0_ft_right",
+        "robot0_ft_left_delta",
+        "robot0_ft_right_delta",
+    ]
+    result = encoder(obs)
+    assert result.shape == (2, 82)
+    result.square().mean().backward()
+    assert next(encoder.left_ft_delta_encoder.parameters()).grad.abs().sum() > 0
+    assert next(encoder.right_ft_delta_encoder.parameters()).grad.abs().sum() > 0
+
+
+def test_latest_absolute_and_delta_histories_use_six_tokens():
+    encoder, obs = _four_state_delta_encoder(
+        "latest_absolute_plus_delta_history"
+    )
+    assert int(encoder.architecture_contract_version) == 6
+    assert encoder.num_fusion_tokens == 6
+    assert not hasattr(encoder, "left_ft_encoder")
+    assert encoder.fusion_token_names()[2:] == [
+        "robot0_ft_left_latest_absolute",
+        "robot0_ft_right_latest_absolute",
+        "robot0_ft_left_delta",
+        "robot0_ft_right_delta",
+    ]
+    result = encoder(obs)
+    assert result.shape == (2, 82)
+    result.square().mean().backward()
+    assert (
+        next(encoder.left_ft_absolute_encoder.parameters()).grad.abs().sum() > 0
+    )
+    assert next(encoder.left_ft_delta_encoder.parameters()).grad.abs().sum() > 0
 
 
 def test_dual_ft_attention_capture_preserves_fusion_output():

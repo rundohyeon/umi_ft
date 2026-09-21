@@ -1,0 +1,23 @@
+defaults:
+  - train_diffusion_unet_timm_umi_dual_ft_context_v2_workspace
+  - override task: umi_dual_ft_context_v2_ft_raw_delta_260827
+  - _self_
+
+name: train_diffusion_unet_timm_umi_dual_ft_context_v2_ft_raw_delta
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+
+policy:
+  obs_encoder:
+    ft_feature_mode: raw_history_plus_delta_history
+    ft_delta_ema_alpha: 0.25
+
+training:
+  init_from_checkpoint: null
+  init_weights: auto
+  resume: false
+
+# Keep only checkpoints/latest.ckpt while W&B and logs.json.txt retain losses.
+checkpoint:
+  topk:
+    k: 0

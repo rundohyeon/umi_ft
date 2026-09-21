@@ -28,6 +28,10 @@ EXPECTED_ACTION_CHANNELS = [
 ]
 
 _VALVE_CONTEXT_KEY = "valve_context"
+_FT_FEATURE_RAW = "raw_history"
+_FT_FEATURE_RAW_DELTA = "raw_history_plus_delta_history"
+_FT_FEATURE_LATEST_DELTA = "latest_absolute_plus_delta_history"
+_FT_DELTA_MODES = {_FT_FEATURE_RAW_DELTA, _FT_FEATURE_LATEST_DELTA}
 
 
 def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
@@ -66,11 +70,32 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         context_phase_names = []
         context_reason_names = []
         context_num_experts = 0
-    architecture_contract_version = (
-        (4 if context_schema == VALVE_CONTEXT_V2_SCHEMA else 3)
-        if is_valve_context_policy
-        else 2
+    ft_feature_mode = str(
+        OmegaConf.select(
+            cfg,
+            "policy.obs_encoder.ft_feature_mode",
+            default=_FT_FEATURE_RAW,
+        )
     )
+    if ft_feature_mode not in {
+        _FT_FEATURE_RAW,
+        _FT_FEATURE_RAW_DELTA,
+        _FT_FEATURE_LATEST_DELTA,
+    }:
+        raise ValueError(f"unsupported checkpoint F/T feature mode {ft_feature_mode!r}")
+    if ft_feature_mode in _FT_DELTA_MODES and context_schema != VALVE_CONTEXT_V2_SCHEMA:
+        raise ValueError("F/T delta-token checkpoints require four-state valve context")
+    if ft_feature_mode == _FT_FEATURE_RAW_DELTA:
+        architecture_contract_version = 5
+    elif ft_feature_mode == _FT_FEATURE_LATEST_DELTA:
+        architecture_contract_version = 6
+    else:
+        architecture_contract_version = (
+            (4 if context_schema == VALVE_CONTEXT_V2_SCHEMA else 3)
+            if is_valve_context_policy
+            else 2
+        )
+    num_fusion_tokens = 6 if ft_feature_mode in _FT_DELTA_MODES else 4
     expected_obs_shapes = {
         "camera0_rgb": (2, (3, 224, 224)),
         "robot0_eef_pos": (2, (3,)),
@@ -161,20 +186,34 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
 
     contract_requirements = {
         "task.model_contract.version": (
-            (
-                "dual_ft_context_v2_4state_786_action11_v1"
-                if context_schema == VALVE_CONTEXT_V2_SCHEMA
-                else "dual_ft_context_786_action11_v1"
+            "dual_ft_context_v2_4state_ft_raw_delta_786_action11_v1"
+            if ft_feature_mode == _FT_FEATURE_RAW_DELTA
+            else (
+                "dual_ft_context_v2_4state_ft_latest_delta_786_action11_v1"
+                if ft_feature_mode == _FT_FEATURE_LATEST_DELTA
+                else (
+                    (
+                        "dual_ft_context_v2_4state_786_action11_v1"
+                        if context_schema == VALVE_CONTEXT_V2_SCHEMA
+                        else "dual_ft_context_786_action11_v1"
+                    )
+                    if is_valve_context_policy
+                    else "dual_ft_786_action11_base_sidecar_bias_only_width_feedback_v6"
+                )
             )
-            if is_valve_context_policy
-            else "dual_ft_786_action11_base_sidecar_bias_only_width_feedback_v6"
         ),
         "task.model_contract.condition_dim": 786,
         "task.model_contract.pose_quaternion_order": "xyzw",
         "task.model_contract.offline_pose_source_representation": "axis_angle",
         "task.model_contract.vision_pretrained": True,
         "task.model_contract.ft_temporal_contract": (
-            "full_32_samples_no_padding_v1"
+            "raw32_plus_causal_ema_delta32_v1"
+            if ft_feature_mode == _FT_FEATURE_RAW_DELTA
+            else (
+                "latest_causal_ema_absolute_plus_delta32_v1"
+                if ft_feature_mode == _FT_FEATURE_LATEST_DELTA
+                else "full_32_samples_no_padding_v1"
+            )
         ),
         "task.model_contract.action_schema_version": (
             "pose9_width1_grasp_force1_v1"
@@ -319,6 +358,20 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
             contract_requirements[
                 "policy.obs_encoder.valve_context_num_phase_experts"
             ] = context_num_experts
+    if ft_feature_mode in _FT_DELTA_MODES:
+        contract_requirements.update(
+            {
+                "task.model_contract.ft_feature_mode": ft_feature_mode,
+                "task.model_contract.ft_delta_filter": "causal_ema_v1",
+                "task.model_contract.ft_delta_definition": (
+                    "smoothed_t_minus_smoothed_t_minus_1"
+                ),
+                "task.model_contract.ft_delta_first_sample": "zero",
+                "task.model_contract.ft_delta_ema_alpha": 0.25,
+                "policy.obs_encoder.ft_feature_mode": ft_feature_mode,
+                "policy.obs_encoder.ft_delta_ema_alpha": 0.25,
+            }
+        )
     for path, expected in contract_requirements.items():
         actual = OmegaConf.select(cfg, path, default=None)
         if actual != expected:
@@ -447,16 +500,35 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
 
     required_state_fragments = (
         "obs_encoder.architecture_contract_version",
-        "obs_encoder.left_ft_encoder.network.",
-        "obs_encoder.right_ft_encoder.network.",
-        "obs_encoder.left_ft_encoder.temporal_contract_version",
-        "obs_encoder.right_ft_encoder.temporal_contract_version",
         "obs_encoder.position_embedding",
         "obs_encoder.fusion_projection.",
         "normalizer.params_dict.robot0_ft_left.",
         "normalizer.params_dict.robot0_ft_right.",
         "normalizer.params_dict.action.",
     )
+    if ft_feature_mode in (_FT_FEATURE_RAW, _FT_FEATURE_RAW_DELTA):
+        required_state_fragments = required_state_fragments + (
+            "obs_encoder.left_ft_encoder.network.",
+            "obs_encoder.right_ft_encoder.network.",
+            "obs_encoder.left_ft_encoder.temporal_contract_version",
+            "obs_encoder.right_ft_encoder.temporal_contract_version",
+        )
+    else:
+        required_state_fragments = required_state_fragments + (
+            "obs_encoder.left_ft_absolute_encoder.network.",
+            "obs_encoder.right_ft_absolute_encoder.network.",
+            "obs_encoder.left_ft_absolute_encoder.absolute_contract_version",
+            "obs_encoder.right_ft_absolute_encoder.absolute_contract_version",
+        )
+    if ft_feature_mode in _FT_DELTA_MODES:
+        required_state_fragments = required_state_fragments + (
+            "obs_encoder.ft_difference.difference_contract_version",
+            "obs_encoder.ft_difference.ema_alpha",
+            "obs_encoder.left_ft_delta_encoder.network.",
+            "obs_encoder.right_ft_delta_encoder.network.",
+            "obs_encoder.left_ft_delta_encoder.temporal_contract_version",
+            "obs_encoder.right_ft_delta_encoder.temporal_contract_version",
+        )
     if is_valve_context_policy:
         required_state_fragments = required_state_fragments + (
             "obs_encoder.valve_stage_conditioner.stage_encoder.",
@@ -473,10 +545,10 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
             (),
             architecture_contract_version,
         ),
-        "obs_encoder.left_ft_encoder.temporal_contract_version": ((), 1),
-        "obs_encoder.right_ft_encoder.temporal_contract_version": ((), 1),
-        "obs_encoder.position_embedding": ((4, 768), None),
-        "obs_encoder.fusion_projection.weight": ((768, 3072), None),
+        "obs_encoder.position_embedding": ((num_fusion_tokens, 768), None),
+        "obs_encoder.fusion_projection.weight": (
+            (768, num_fusion_tokens * 768), None
+        ),
         "obs_encoder.fusion_projection.bias": ((768,), None),
         "normalizer.params_dict.robot0_ft_left.scale": ((6,), None),
         "normalizer.params_dict.robot0_ft_left.offset": ((6,), None),
@@ -485,6 +557,29 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "normalizer.params_dict.action.scale": ((11,), None),
         "normalizer.params_dict.action.offset": ((11,), None),
     }
+    if ft_feature_mode in (_FT_FEATURE_RAW, _FT_FEATURE_RAW_DELTA):
+        exact_state_contract.update(
+            {
+                "obs_encoder.left_ft_encoder.temporal_contract_version": ((), 1),
+                "obs_encoder.right_ft_encoder.temporal_contract_version": ((), 1),
+            }
+        )
+    else:
+        exact_state_contract.update(
+            {
+                "obs_encoder.left_ft_absolute_encoder.absolute_contract_version": ((), 1),
+                "obs_encoder.right_ft_absolute_encoder.absolute_contract_version": ((), 1),
+            }
+        )
+    if ft_feature_mode in _FT_DELTA_MODES:
+        exact_state_contract.update(
+            {
+                "obs_encoder.ft_difference.difference_contract_version": ((), 1),
+                "obs_encoder.ft_difference.ema_alpha": ((), None),
+                "obs_encoder.left_ft_delta_encoder.temporal_contract_version": ((), 1),
+                "obs_encoder.right_ft_delta_encoder.temporal_contract_version": ((), 1),
+            }
+        )
     if is_valve_context_policy:
         exact_state_contract.update(
             {
@@ -542,6 +637,18 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
                         f"checkpoint {state_name} state {key} must equal "
                         f"{expected_scalar}, got {scalar}"
                     )
+        if ft_feature_mode in _FT_DELTA_MODES:
+            stored_alpha = float(
+                torch.as_tensor(state["obs_encoder.ft_difference.ema_alpha"])
+                .detach()
+                .cpu()
+                .item()
+            )
+            if not np.isclose(stored_alpha, 0.25, rtol=0.0, atol=1e-7):
+                raise ValueError(
+                    f"checkpoint {state_name} F/T EMA alpha must equal 0.25, "
+                    f"got {stored_alpha}"
+                )
         if is_valve_context_policy:
             for expert_idx in range(context_num_experts):
                 expert_shapes = {
@@ -620,4 +727,6 @@ def inspect_dual_ft_checkpoint_payload(payload: dict) -> dict:
         "valve_context_phase_names": context_phase_names,
         "valve_context_num_phase_experts": context_num_experts,
         "architecture_contract_version": architecture_contract_version,
+        "ft_feature_mode": ft_feature_mode,
+        "num_fusion_tokens": num_fusion_tokens,
     }
