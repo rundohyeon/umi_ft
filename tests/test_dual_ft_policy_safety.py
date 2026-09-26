@@ -5,6 +5,7 @@ from umi.real_world.dual_ft_policy_safety import (
     FTSafetyConfig,
     PolicyMotionSafetyConfig,
     PolicySafetyError,
+    read_and_validate_latest_ft,
     validate_ft_load,
     validate_policy_waypoints,
 )
@@ -60,6 +61,51 @@ def test_ft_guard_is_fail_closed_for_force_torque_and_grasp_load():
     with pytest.raises(PolicySafetyError, match="stale"):
         validate_ft_load(
             np.zeros(6), np.zeros(6), 0.0, cfg, latest_sample_age_s=0.06
+        )
+
+
+class _LatestFTEnv:
+    def __init__(self, state):
+        self.state = state
+        self.calls = 0
+
+    def get_latest_ft_state(self):
+        self.calls += 1
+        return self.state
+
+
+def test_read_and_validate_latest_ft_uses_fresh_snapshot_timestamp_and_loads():
+    left = np.zeros(6)
+    right = np.zeros(6)
+    left[2] = 1.0
+    right[2] = 3.0
+    env = _LatestFTEnv(
+        {
+            "left_raw": left.copy(),
+            "right_raw": right.copy(),
+            "left": left.copy(),
+            "right": right.copy(),
+            "timestamp": 10.0,
+        }
+    )
+    state, measured_grasp_force_n, sample_age_s = read_and_validate_latest_ft(
+        env,
+        np.zeros(12),
+        FTSafetyConfig(max_latest_sample_age_s=0.05),
+        time_func=lambda: 10.02,
+    )
+
+    assert env.calls == 1
+    assert state is env.state
+    assert measured_grasp_force_n == pytest.approx(1.0)
+    assert sample_age_s == pytest.approx(0.02)
+
+    with pytest.raises(PolicySafetyError, match="stale"):
+        read_and_validate_latest_ft(
+            env,
+            np.zeros(12),
+            FTSafetyConfig(max_latest_sample_age_s=0.05),
+            time_func=lambda: 10.06,
         )
 
 

@@ -68,6 +68,11 @@ class TimmObsEncoder(ModuleAttrMixin):
             feature_aggregation: str='spatial_embedding',
             downsample_ratio: int=32,
             position_encording: str='learnable',
+            # Checkpoint restoration constructs the module before loading the
+            # serialized backbone weights.  In that narrow case, avoid a
+            # network/cache lookup for pretrained weights while preserving the
+            # frozen parameter contract.
+            allow_frozen_without_pretrained: bool=False,
 
         ):
         """
@@ -91,7 +96,11 @@ class TimmObsEncoder(ModuleAttrMixin):
         )
 
         if frozen:
-            assert pretrained
+            if not pretrained and not allow_frozen_without_pretrained:
+                raise AssertionError(
+                    "frozen vision backbones require pretrained weights unless "
+                    "they are about to be restored from a checkpoint"
+                )
             for param in model.parameters():
                 param.requires_grad = False
         

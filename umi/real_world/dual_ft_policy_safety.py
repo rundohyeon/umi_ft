@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import time
 
 import numpy as np
 import scipy.spatial.transform as st
+
+from umi.real_world.grasp_force_width_feedback import (
+    signed_grasp_force_from_native_wrenches,
+)
 
 
 class PolicySafetyError(RuntimeError):
@@ -106,6 +111,39 @@ def validate_ft_load(
             f"grasp overload: |force|={abs(float(grasp_force_n)):.3f} N > "
             f"{cfg.max_abs_grasp_force_n:.3f} N"
         )
+
+
+def read_and_validate_latest_ft(
+    env,
+    startup_bias_12d,
+    config,
+    *,
+    time_func=None,
+):
+    """Read and validate a fresh F/T snapshot immediately before an action.
+
+    Keeping the read and age calculation together prevents diagnostic rendering
+    or file I/O from consuming the freshness budget between the snapshot and
+    the safety check.
+    """
+
+    if time_func is None:
+        time_func = time.time
+    latest_ft = env.get_latest_ft_state()
+    measured_grasp_force_n = signed_grasp_force_from_native_wrenches(
+        latest_ft["left_raw"],
+        latest_ft["right_raw"],
+        startup_bias_12d,
+    )
+    sample_age_s = float(time_func()) - float(latest_ft["timestamp"])
+    validate_ft_load(
+        latest_ft["left"],
+        latest_ft["right"],
+        measured_grasp_force_n,
+        config,
+        latest_sample_age_s=sample_age_s,
+    )
+    return latest_ft, measured_grasp_force_n, sample_age_s
 
 
 def validate_policy_waypoints(targets, current_tcp6, current_width_m, config):
