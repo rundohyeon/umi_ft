@@ -124,6 +124,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
         valve_context_hidden_dim: int = 128,
         valve_expert_bottleneck_dim: int = 128,
         valve_context_num_phase_experts: int = 5,
+        allow_frozen_without_pretrained: bool = False,
     ):
         super().__init__()
         if valve_context_key is None:
@@ -191,6 +192,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
             feature_aggregation=feature_aggregation,
             downsample_ratio=downsample_ratio,
             position_encording=position_encording,
+            allow_frozen_without_pretrained=allow_frozen_without_pretrained,
         )
         if len(self.vision_pose_encoder.rgb_keys) != 1:
             raise ValueError(

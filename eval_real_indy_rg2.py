@@ -96,7 +96,10 @@ from umi.real_world.real_inference_util import (
     get_real_umi_action,
 )
 from umi.real_world.umi_env import UmiEnv
-from umi.real_world.rg2ft_obs import prepare_rg2ft_policy_obs
+from umi.real_world.rg2ft_obs import (
+    FTObservationStaleError,
+    prepare_rg2ft_policy_obs,
+)
 from umi.real_world.valve_state_context import (
     ValveStateContextRuntime,
     ValveStateContextRuntimeV2,
@@ -120,7 +123,7 @@ from umi.real_world.dual_ft_policy_safety import (
     FTSafetyConfig,
     PolicyMotionSafetyConfig,
     PolicySafetyError,
-    validate_ft_load,
+    read_and_validate_latest_ft,
     validate_policy_waypoints,
 )
 
@@ -2266,6 +2269,97 @@ def _format_timing_stats_ms(samples) -> str:
     )
 
 
+def _runtime_cycle_counts(runtime_metrics: dict) -> dict:
+    """Return cycle counters with non-overlapping, non-negative meanings."""
+    attempted = int(runtime_metrics["attempted_cycles"])
+    completed = int(runtime_metrics["completed_cycles"])
+    valid_observations = int(runtime_metrics["valid_observations"])
+    safety_rejections = int(runtime_metrics["safety_rejections"])
+    if not 0 <= completed <= valid_observations <= attempted:
+        raise ValueError(
+            "runtime cycle counters must satisfy "
+            "completed <= valid_observations <= attempted"
+        )
+    if not 0 <= safety_rejections <= attempted - completed:
+        raise ValueError(
+            "runtime safety rejections cannot exceed incomplete attempts"
+        )
+    return {
+        "cycles": attempted,
+        "completed_cycles": completed,
+        "valid_observation_cycles": valid_observations,
+        "dropped_cycles": attempted - valid_observations,
+        "safety_rejected_cycles": safety_rejections,
+    }
+
+
+def _exec_actions_with_fresh_ft_guard(
+    env,
+    actions,
+    action_timestamps,
+    startup_bias_12d,
+    ft_safety_cfg,
+):
+    """Validate a newly read F/T snapshot, then submit without intervening I/O."""
+    _, measured_grasp_force_n, sample_age_s = read_and_validate_latest_ft(
+        env,
+        startup_bias_12d,
+        ft_safety_cfg,
+    )
+    env.exec_actions(
+        actions=actions,
+        timestamps=action_timestamps,
+        compensate_latency=False,
+    )
+    return measured_grasp_force_n, sample_age_s
+
+
+def _get_warmup_observation_with_retry(
+    env,
+    *,
+    timeout_s=3.0,
+    retry_interval_s=0.02,
+    monotonic_func=None,
+    sleep_func=None,
+):
+    """Wait briefly for a fresh startup observation before any policy motion."""
+    timeout_s = float(timeout_s)
+    retry_interval_s = float(retry_interval_s)
+    if timeout_s <= 0.0 or retry_interval_s <= 0.0:
+        raise ValueError("warmup retry timeout and interval must be positive")
+    if monotonic_func is None:
+        monotonic_func = time.monotonic
+    if sleep_func is None:
+        sleep_func = time.sleep
+
+    deadline = monotonic_func() + timeout_s
+    stale_retries = 0
+    while True:
+        try:
+            obs = env.get_obs(include_valve_context_stream=False)
+            if stale_retries:
+                print(
+                    "[warmup] fresh dual-F/T observation recovered after "
+                    f"{stale_retries} stale retries."
+                )
+            return obs
+        except FTObservationStaleError as exc:
+            stale_retries += 1
+            remaining_s = deadline - monotonic_func()
+            if remaining_s <= 0.0:
+                raise FTObservationStaleError(
+                    "policy warmup did not receive a fresh dual-F/T observation "
+                    f"within {timeout_s:.2f}s after {stale_retries} retries; "
+                    f"last error: {exc}"
+                ) from exc
+            if stale_retries == 1:
+                print(
+                    "[warmup] transient stale dual-F/T observation; waiting up to "
+                    f"{timeout_s:.2f}s for a fresh camera-aligned sample."
+                )
+            sleep_func(min(retry_interval_s, remaining_s))
+
+
 def _array_minmax_str(arr) -> str:
     a = np.asarray(arr)
     if a.size == 0:
@@ -4158,6 +4252,13 @@ def main(input, output, robot_config,
     # download when this self-contained folder is moved to the robot PC.
     if OmegaConf.select(cfg, "policy.obs_encoder.pretrained") is not None:
         cfg.policy.obs_encoder.pretrained = False
+        if bool(OmegaConf.select(cfg, "policy.obs_encoder.frozen", default=False)):
+            OmegaConf.update(
+                cfg,
+                "policy.obs_encoder.allow_frozen_without_pretrained",
+                True,
+                force_add=True,
+            )
     print("model_name:", cfg.policy.obs_encoder.model_name)
     left_ft_meta = OmegaConf.select(
         cfg, "task.shape_meta.obs.robot0_ft_left", default=None
@@ -4845,7 +4946,7 @@ def main(input, output, robot_config,
                     )
 
             print("Warming up policy inference")
-            obs = env.get_obs(include_valve_context_stream=False)
+            obs = _get_warmup_observation_with_retry(env)
             if no_gripper:
                 obs = _with_synthetic_gripper_width(
                     obs,
@@ -5997,10 +6098,13 @@ def main(input, output, robot_config,
                     policy_iter_count = 0
                     perv_target_pose = None
                     runtime_metrics = {
-                        "cycles": 0,
+                        "attempted_cycles": 0,
+                        "completed_cycles": 0,
                         "valid_observations": 0,
+                        "safety_rejections": 0,
                         "ft_left_age": [],
                         "ft_right_age": [],
+                        "safety_ft_age": [],
                         "obs_assembly": [],
                         "inference": [],
                         "loop": [],
@@ -6008,6 +6112,7 @@ def main(input, output, robot_config,
                         "robot_command_calls": 0,
                     }
                     while True:
+                        runtime_metrics["attempted_cycles"] += 1
                         # calculate timing
                         t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
 
@@ -6388,9 +6493,9 @@ def main(input, output, robot_config,
 
                         force_feedback_result = None
                         if force_feedback is not None:
-                            latest_ft = env.get_latest_ft_state()
-                            raw_left = latest_ft["left_raw"]
-                            raw_right = latest_ft["right_raw"]
+                            feedback_ft = env.get_latest_ft_state()
+                            raw_left = feedback_ft["left_raw"]
+                            raw_right = feedback_ft["right_raw"]
                             force_feedback_result = force_feedback.correct_from_native_wrenches(
                                 policy_width_m=this_target_poses[:, 6],
                                 predicted_force_n=this_force_reference,
@@ -6398,8 +6503,6 @@ def main(input, output, robot_config,
                                 right_wrench=raw_right,
                                 startup_bias_12d=startup_bias_12d,
                             )
-                            corrected_left = latest_ft["left"]
-                            corrected_right = latest_ft["right"]
                             this_target_poses[:, 6] = force_feedback_result[
                                 "corrected_width_m"
                             ]
@@ -6500,17 +6603,6 @@ def main(input, output, robot_config,
                         except Exception as exc:
                             print(f"[eval_log] failed to add output/attention video frame: {exc}")
 
-                        if force_feedback_result is not None:
-                            validate_ft_load(
-                                corrected_left,
-                                corrected_right,
-                                force_feedback_result["measured_force_n"],
-                                ft_safety_cfg,
-                                latest_sample_age_s=(
-                                    time.time() - latest_ft["timestamp"]
-                                ),
-                            )
-
                         current_width_m = float(
                             np.asarray(obs["robot0_gripper_width"][-1]).reshape(-1)[0]
                         )
@@ -6556,6 +6648,62 @@ def main(input, output, robot_config,
                                 direct_gripper.width_max_m,
                             )
 
+                        # Read and validate a new F/T snapshot at the actual
+                        # command boundary. No rendering, logging, or printing
+                        # is allowed between this guard and exec_actions.
+                        if plan_only:
+                            if force_feedback_result is not None:
+                                (
+                                    _safety_ft,
+                                    safety_grasp_force_n,
+                                    safety_ft_age_s,
+                                ) = read_and_validate_latest_ft(
+                                    env,
+                                    startup_bias_12d,
+                                    ft_safety_cfg,
+                                )
+                            print(
+                                "[plan_only] skipped exec_actions; "
+                                "compare delta xyz above with teleop axes."
+                            )
+                        else:
+                            if force_feedback_result is not None:
+                                (
+                                    safety_grasp_force_n,
+                                    safety_ft_age_s,
+                                ) = _exec_actions_with_fresh_ft_guard(
+                                    env,
+                                    this_target_poses,
+                                    action_timestamps,
+                                    startup_bias_12d,
+                                    ft_safety_cfg,
+                                )
+                            else:
+                                env.exec_actions(
+                                    actions=this_target_poses,
+                                    timestamps=action_timestamps,
+                                    compensate_latency=False,
+                                )
+                            if motion_momentum_candidate_target_tcp6 is not None:
+                                motion_momentum_last_target_tcp6 = (
+                                    motion_momentum_candidate_target_tcp6
+                                )
+                                motion_momentum_last_delta_tcp6 = (
+                                    motion_momentum_candidate_delta_tcp6
+                                )
+                            runtime_metrics["robot_command_calls"] += 1
+                            print(f"Submitted {len(this_target_poses)} steps of actions.")
+
+                        if force_feedback_result is not None:
+                            runtime_metrics["safety_ft_age"].append(
+                                safety_ft_age_s
+                            )
+                            print(
+                                "Pre-command F/T safety: "
+                                f"age={safety_ft_age_s * 1000.0:.3f} ms "
+                                f"grasp_force={safety_grasp_force_n:.3f} N"
+                            )
+
                         if scheduled_action_csv_writer is not None:
                             scheduled_wall_time = time.time()
                             for scheduled_idx, target_row in enumerate(this_target_poses):
@@ -6574,28 +6722,6 @@ def main(input, output, robot_config,
                                     + [force_reference]
                                 )
                             scheduled_action_csv_file.flush()
-
-                        # execute actions
-                        if plan_only:
-                            print(
-                                "[plan_only] skipped exec_actions; "
-                                "compare delta xyz above with teleop axes."
-                            )
-                        else:
-                            env.exec_actions(
-                                actions=this_target_poses,
-                                timestamps=action_timestamps,
-                                compensate_latency=False
-                            )
-                            if motion_momentum_candidate_target_tcp6 is not None:
-                                motion_momentum_last_target_tcp6 = (
-                                    motion_momentum_candidate_target_tcp6
-                                )
-                                motion_momentum_last_delta_tcp6 = (
-                                    motion_momentum_candidate_delta_tcp6
-                                )
-                            runtime_metrics["robot_command_calls"] += 1
-                            print(f"Submitted {len(this_target_poses)} steps of actions.")
 
                         # --- per-step eval logging (CSV + comparison video) ---
                         obs_pos = np.asarray(obs['robot0_eef_pos'][-1], dtype=np.float64).ravel()
@@ -6709,7 +6835,7 @@ def main(input, output, robot_config,
                             print("Max Duration reached.")
                             stop_episode = True
                         policy_iter_count += 1
-                        runtime_metrics["cycles"] += 1
+                        runtime_metrics["completed_cycles"] += 1
                         runtime_metrics["loop"].append(
                             time.perf_counter() - t_loop_start
                         )
@@ -6733,6 +6859,7 @@ def main(input, output, robot_config,
                         iter_idx += steps_per_inference
 
                 except PolicySafetyError as exc:
+                    runtime_metrics["safety_rejections"] += 1
                     env.hold_robot()
                     env.end_episode()
                     raise click.ClickException(
@@ -6861,11 +6988,14 @@ def main(input, output, robot_config,
                             + f" to {eval_log_dir}"
                         )
                     if 'runtime_metrics' in locals():
+                        cycle_counts = _runtime_cycle_counts(runtime_metrics)
                         print("[dual-F/T runtime summary]")
                         print(
-                            "  cycles=", runtime_metrics["cycles"],
-                            "valid_observation_cycles=", runtime_metrics["valid_observations"],
-                            "dropped_cycles=", runtime_metrics["cycles"] - runtime_metrics["valid_observations"],
+                            "  cycles=", cycle_counts["cycles"],
+                            "completed_cycles=", cycle_counts["completed_cycles"],
+                            "valid_observation_cycles=", cycle_counts["valid_observation_cycles"],
+                            "dropped_cycles=", cycle_counts["dropped_cycles"],
+                            "safety_rejected_cycles=", cycle_counts["safety_rejected_cycles"],
                         )
                         print(
                             "  left_ft_age:",
@@ -6874,6 +7004,10 @@ def main(input, output, robot_config,
                         print(
                             "  right_ft_age:",
                             _format_timing_stats_ms(runtime_metrics["ft_right_age"]),
+                        )
+                        print(
+                            "  pre_command_ft_age:",
+                            _format_timing_stats_ms(runtime_metrics["safety_ft_age"]),
                         )
                         print(
                             "  observation_assembly:",

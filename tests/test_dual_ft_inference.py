@@ -7,7 +7,10 @@ from omegaconf import OmegaConf
 from diffusion_policy.common.dual_ft_contract import (
     inspect_dual_ft_checkpoint_payload,
 )
-from umi.real_world.rg2ft_obs import causal_ft_history_from_streams
+from umi.real_world.rg2ft_obs import (
+    FTObservationStaleError,
+    causal_ft_history_from_streams,
+)
 
 
 def _payload(*, include_right=True, include_normalizer=True):
@@ -360,7 +363,7 @@ class DualFTInferenceContractTest(unittest.TestCase):
         self.assertLessEqual(result["robot0_ft_right_timestamps"].max(), 1.045)
 
     def test_stale_stream_fails_closed(self):
-        with self.assertRaisesRegex(RuntimeError, "stale"):
+        with self.assertRaisesRegex(FTObservationStaleError, "stale"):
             causal_ft_history_from_streams(
                 np.array([1.0]), np.zeros((1, 6), dtype=np.float32),
                 np.array([1.0]), np.zeros((1, 6), dtype=np.float32),

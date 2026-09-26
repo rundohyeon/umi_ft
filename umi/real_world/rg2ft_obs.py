@@ -3,6 +3,10 @@ from __future__ import annotations
 import numpy as np
 
 
+class FTObservationStaleError(RuntimeError):
+    """The newest causal F/T sample is too old for a policy observation."""
+
+
 def compute_ft_tare_offset(combined_ft, n_avg=25):
     """Average the newest raw 12-axis samples for a software F/T tare."""
     values = np.asarray(combined_ft, dtype=np.float64)
@@ -127,7 +131,7 @@ def causal_ft_history_from_streams(
         if right_age > max_age:
             stale.append(f"right age={right_age:.6f}s")
         if stale:
-            raise RuntimeError(
+            raise FTObservationStaleError(
                 "dual-F/T observation is stale (" + ", ".join(stale)
                 + f"; limit={max_age:.6f}s)"
             )

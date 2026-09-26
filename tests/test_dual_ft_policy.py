@@ -1,5 +1,6 @@
 import tempfile
 
+import pytest
 import torch
 from diffusers import DDIMScheduler
 from omegaconf import OmegaConf
@@ -180,6 +181,40 @@ def test_legacy_rgb_pose_forward_contract():
     )
     obs = {key: value for key, value in _obs().items() if key in shape_meta["obs"]}
     assert encoder(obs).shape == (1, 1042)
+
+
+def test_frozen_encoder_requires_pretrained_outside_checkpoint_restore():
+    shape_meta = _shape_meta(include_ft=False)
+    with pytest.raises(AssertionError, match="restored from a checkpoint"):
+        TimmObsEncoder(
+            shape_meta=shape_meta,
+            model_name="resnet18",
+            pretrained=False,
+            frozen=True,
+            global_pool="",
+            transforms=None,
+            feature_aggregation="avg",
+            downsample_ratio=32,
+        )
+
+
+def test_frozen_encoder_can_be_initialized_for_checkpoint_restore():
+    shape_meta = _shape_meta(include_ft=False)
+    encoder = TimmObsEncoder(
+        shape_meta=shape_meta,
+        model_name="resnet18",
+        pretrained=False,
+        frozen=True,
+        global_pool="",
+        transforms=None,
+        feature_aggregation="avg",
+        downsample_ratio=32,
+        allow_frozen_without_pretrained=True,
+    )
+    assert not any(
+        parameter.requires_grad
+        for parameter in encoder.key_model_map.parameters()
+    )
 
 
 def test_dual_ft_forward_backward_uses_independent_encoders():

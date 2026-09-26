@@ -50,7 +50,7 @@
   ],
   "ft_startup_bias": {
     "sample_count": 200,
-    "timeout_s": 5.0,
+    "timeout_s": 20.0,
     "max_force_std_n": 0.35,
     "max_torque_std_nm": 0.03,
     "max_force_peak_to_peak_n": 1.5,
