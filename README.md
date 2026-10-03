@@ -620,3 +620,25 @@ This repository is released under the MIT license. See [LICENSE](LICENSE) for ad
 * We used [Steffen Urban](https://github.com/urbste)'s [OpenImuCameraCalibrator](https://github.com/urbste/OpenImuCameraCalibrator/) for camera and IMU calibration.
 * The UMI gripper's core mechanism is adpated from [Push/Pull Gripper](https://www.thingiverse.com/thing:2204113) by [John Mulac](https://www.thingiverse.com/3dprintingworld/designs).
 * UMI's soft finger is adapted from [Alex Alspach](http://alexalspach.com/)'s original design at TRI.
+
+## Context-aware imitation learning
+
+For the labelled 284-episode **approach / turning / recovery / error** dataset,
+use the [RGB + F/T classifier training guide](docs/context_rgb_force_training.md).
+It trains a frozen-CLIP / causal-F/T-CNN / small-Transformer classifier without
+TCP inputs, including a `torchrun` command for physical GPUs 2 and 3.
+
+The configurable context pipeline adds local offline Qwen-VL weak labeling, human
+playback/review, a small causal Transformer, and soft residual conditioning of
+the existing dual-F/T diffusion policy. It is separate from the four-state valve
+observer above and needs no LLM during robot inference. Class count comes from
+`context/qwen/config/context_labels.yaml`, currently approach, turning, finish, and error.
+The v6 labeler receives RGB, force magnitudes, TCP rotation and previous predictions
+for one-finger valve manipulation; TCP position statistics are excluded. It writes to
+`data/context_labels_v6/` and uses a separate `context/qwen/.venv` environment.
+
+For Qwen3.5-9B, use the separate comparison config
+`context/qwen/config/context_labels_qwen35.yaml`. Its isolated inference worker,
+GPU 3 command, and video export are documented in [the Qwen guide](context/qwen/README.md).
+
+See [the architecture, configuration, commands, tests, and limitations](docs/context_aware_pipeline.md).

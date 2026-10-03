@@ -1,0 +1,18 @@
+# Archived configuration for reviewing the original text-only labels.
+contexts:
+  0: {name: approach, description: 'approach to the target'}
+  1: {name: turning, description: 'turning the valve'}
+  2: {name: finish, description: 'finishing the task'}
+  3: {name: error, description: 'error during the task'}
+unknown_label: -1
+label_version: v1
+policy_config: train_diffusion_unet_timm_umi_dual_ft_workspace
+dataset_overrides: []
+output_dir: data/context_labels
+model_path: context/qwen/checkpoints/Qwen2.5-0.5B-Instruct
+offline: true
+seed: 42
+label_stride: 6
+history_length: 32
+max_new_tokens: 160
+max_retries: 2

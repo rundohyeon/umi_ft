@@ -119,7 +119,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor], fixed_action_prefix: torch.Tensor=None) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], fixed_action_prefix: torch.Tensor=None, context_label=None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         fixed_action_prefix: unnormalized action prefix
@@ -131,7 +131,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         B = next(iter(nobs.values())).shape[0]
 
         # condition through global feature
-        global_cond = self.obs_encoder(nobs)
+        global_cond, context_logits = self.encode_condition(nobs, obs_dict, batch={'context_label': context_label}, inference=True)
 
         # empty data for action
         cond_data = torch.zeros(size=(B, self.action_horizon, self.action_dim), device=self.device, dtype=self.dtype)
@@ -160,7 +160,15 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             'action': action_pred,
             'action_pred': action_pred
         }
+        if getattr(self, 'last_context', None) is not None:
+            result['context'] = self.last_context
         return result
+
+    def encode_condition(self, nobs, raw_obs, batch=None, inference=False):
+        return self.obs_encoder(nobs), None
+
+    def auxiliary_loss(self, logits, batch):
+        return 0.
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
@@ -173,7 +181,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         nactions = self.normalizer['action'].normalize(batch['action'])
         
         assert self.obs_as_global_cond
-        global_cond = self.obs_encoder(nobs)
+        global_cond, context_logits = self.encode_condition(nobs, batch['obs'], batch=batch)
 
         # train on multiple diffusion samples per obs
         if self.train_diffusion_n_samples != 1:
@@ -224,7 +232,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
 
-        return loss
+        return loss + self.auxiliary_loss(context_logits, batch)
 
     def forward(self, batch):
         return self.compute_loss(batch)

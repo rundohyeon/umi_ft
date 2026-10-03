@@ -1,0 +1,37 @@
+policy_config: train_diffusion_unet_timm_umi_dual_ft_workspace
+dataset_overrides: []
+context_definitions: context/qwen/config/context_labels.yaml
+labels:
+  auto_path: data/context_labels_v6/auto_labels.jsonl
+  reviewed_path: data/context_labels_v6/reviewed_labels.parquet
+  source: reviewed
+  threshold: 0.9
+  reviewed_weight: 1.0
+  auto_weight: 0.3
+  mix_auto: false
+encoder:
+  # Context classification uses RGB and native F/T only; no TCP pose inputs.
+  input_keys: [camera0_rgb, robot0_ft_left, robot0_ft_right]
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.1
+  history_length: 32
+  rgb_pool_size: 4
+  feedforward_dim: 256
+seed: 42
+val_ratio: 0.15
+test_ratio: 0.15
+class_balancing: true
+batch_size: 32
+num_workers: 0
+epochs: 30
+learning_rate: 0.0003
+weight_decay: 0.0001
+device: cpu
+cpu_threads: 4
+max_batches: null
+statistics_max_batches: null
+checkpoint: checkpoints/context_encoder_best.pt
+output_dir: outputs/context_eval
+split_path: data/context_labels_v6/episode_splits.json

@@ -1,0 +1,40 @@
+contexts:
+  0:
+    name: approach
+    description: 'The robot finger moves closer to the valve lever. Require visible approach; lack of force alone does not establish approach.'
+  1:
+    name: turning
+    description: 'The RIGHT finger applies force while turning the lever. The camera moves with the finger and lever: the lever may stay nearly fixed in the image while the fixed rig, signs and background rotate relative to the finger. Right-finger force together with this coherent background rotation and maintained finger-lever interaction supports turning. Visible motion of the lever within the image is not required.'
+  2:
+    name: finish
+    description: 'The RIGHT finger force magnitude |F| drops sharply relative to its recent observed level. Assign finish when this sharp decrease is observed at the current time. A preceding force increase, visible stop of rotation, or retreat from the lever is not required. A steady low force, a small fluctuation, or missing force samples alone does not establish finish.'
+  3:
+    name: error
+    description: 'The valve lever turns while valid finger-force observations show no force, OR the previously visible lever disappears from view. Interpret lever motion using the moving-camera geometry; background movement from camera repositioning alone does not establish lever turning. Lever disappearance is an error even during retreat. Missing force samples do not mean no force.'
+unknown_label: -1
+label_version: v6
+policy_config: train_diffusion_unet_timm_umi_dual_ft_workspace
+dataset_overrides: []
+output_dir: data/context_labels_v6
+# Paths are relative to the umi_ft repository root.
+backend: qwen2_5_vl
+model_path: context/qwen/checkpoints/Qwen2.5-VL-3B-Instruct
+max_pixels: 50176  # 224 * 224, matching the recorded RGB resolution.
+inputs:
+  rgb: true
+  rgb_frames: 8
+  tcp_position: false
+  tcp_rotation: true
+  gripper_width: true
+  force_torque: true  # Read native F/T; Qwen receives only |F|, no axes or torques.
+  # Preserve brief right-finger |F| peaks and their order (no contact threshold).
+  force_history_bins: 12
+  previous_labels: true
+  previous_label_count: 8
+offline: true
+seed: 42
+# Native RGB is ~60 Hz; stride 6 labels ~10 anchors/second.
+label_stride: 6
+history_length: 121  # About 2 seconds of past RGB, ending at the labeled frame.
+max_new_tokens: 160
+max_retries: 2

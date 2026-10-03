@@ -32,8 +32,10 @@ from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from accelerate import Accelerator
 from accelerate.utils import broadcast_object_list
+from diffusion_policy.context.labels import register_context_resolvers
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+register_context_resolvers()
 
 
 def _trainable_parameters(module):
@@ -57,6 +59,8 @@ def _build_optimizer_param_groups(model, cfg):
     """
 
     base_lr = float(cfg.optimizer.lr)
+    if hasattr(model, 'optimizer_groups'):
+        return model.optimizer_groups(base_lr)
     split_cfg = OmegaConf.select(
         cfg, "optimizer_parameter_groups", default=None
     )
@@ -296,6 +300,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
 
+        # Persist the resolved head size so deployment never reads a training YAML.
+        num_classes = OmegaConf.select(cfg, 'policy.context.num_classes', default=None)
+        if num_classes is not None:
+            cfg.policy.context.num_classes = int(num_classes)
+
         # set seed
         seed = cfg.training.seed
         torch.manual_seed(seed)
@@ -329,12 +338,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             **optimizer_cfg
         )
 
+        # Stage A is loaded only when starting training, never when reconstructing deployment.
         # configure training state
         self.global_step = 0
         self.epoch = 0
 
-        # do not save optimizer if resume=False
-        if not cfg.training.resume:
+        # Preserve legacy checkpoint behavior; new context runs must save Adam
+        # state from their first epoch so later resume is actually resumable.
+        if not cfg.training.resume and not hasattr(self.model, 'context_encoder'):
             self.exclude_keys = ['optimizer']
 
     def run(self):
@@ -347,6 +358,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             raise ValueError(
                 "training.resume and training.init_from_checkpoint are mutually exclusive"
             )
+
+        if (getattr(self.model, 'curriculum', None) == 'adapter'
+                and getattr(self.model, 'context_mode', None) != 'none'
+                and not cfg.training.resume and not init_checkpoint):
+            raise ValueError('Adapter curriculum requires training.init_from_checkpoint for the existing action policy')
 
         accelerator = Accelerator(log_with='wandb')
         # Hydra resolves ${now:...} independently in every launched process.
@@ -380,7 +396,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 ).expanduser().resolve()
             if resume_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {resume_ckpt_path}")
-                self.load_checkpoint(path=resume_ckpt_path)
+                resumed_payload = self.load_checkpoint(path=resume_ckpt_path)
+                saved_context_metadata = OmegaConf.select(
+                    resumed_payload.get('cfg'), 'context_training.metadata', default=None)
+                if saved_context_metadata is not None:
+                    from omegaconf import open_dict
+                    with open_dict(self.cfg.context_training):
+                        self.cfg.context_training.metadata = saved_context_metadata
+                del resumed_payload
                 # Checkpoints are written after the labeled epoch's training
                 # batches and before the final per-epoch counter increment.
                 # Continue with the next epoch/global step exactly once.
@@ -401,10 +424,25 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     f"No latest checkpoint at {resume_ckpt_path}; starting fresh"
                 )
 
+        context_checkpoint = OmegaConf.select(cfg, 'context_training.encoder_checkpoint', default=None)
+        if context_checkpoint and not cfg.training.resume:
+            context_metadata = self.model.load_context_checkpoint(context_checkpoint)
+            from omegaconf import open_dict
+            with open_dict(self.cfg.context_training):
+                self.cfg.context_training.metadata = context_metadata
+            if self.ema_model is not None:
+                self.ema_model.load_context_checkpoint(context_checkpoint)
+
         # configure dataset
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset) or isinstance(dataset, BaseDataset)
+        context_metadata = OmegaConf.select(self.cfg, 'context_training.metadata', default=None)
+        if context_metadata is not None and hasattr(dataset, 'context_splits'):
+            from diffusion_policy.context.data import source_fingerprint
+            if (dataset.context_splits != dict(context_metadata.episode_splits)
+                    or source_fingerprint(dataset) != context_metadata.source_fingerprint):
+                raise ValueError('Stage A and Stage B episode/data splits differ')
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         accelerator.print(
             "training distribution: "
@@ -449,6 +487,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 "initialized shared action-policy weights: "
                 + " ".join(f"{key}={value}" for key, value in init_report.items())
             )
+
+        if context_metadata is not None and hasattr(self.model, 'context_definition_digest'):
+            digest = bytes(self.model.context_definition_digest.cpu().tolist()).hex()
+            if digest != context_metadata.context_definition_hash:
+                raise ValueError('Warm-start context definitions differ from Stage A/label definitions')
 
         # configure lr scheduler
         # With Accelerate's default split_batches=False, each distributed
@@ -669,14 +712,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         gt_action = batch['action']
-                        pred_action = policy.predict_action(batch['obs'], None)['action_pred']
+                        pred_action = policy.predict_action(batch['obs'], None, **({'context_label': batch['context_label']} if getattr(policy, 'context_mode', None) == 'oracle' else {}))['action_pred']
                         log_action_mse(step_log, 'train', pred_action, gt_action)
 
                         if len(val_dataloader) > 0:
                             val_sampling_batch = next(iter(val_dataloader))
                             batch = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
                             gt_action = batch['action']
-                            pred_action = policy.predict_action(batch['obs'], None)['action_pred']
+                            pred_action = policy.predict_action(batch['obs'], None, **({'context_label': batch['context_label']} if getattr(policy, 'context_mode', None) == 'oracle' else {}))['action_pred']
                             log_action_mse(step_log, 'val', pred_action, gt_action)
 
                         del batch

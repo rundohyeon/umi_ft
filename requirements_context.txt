@@ -1,0 +1,8 @@
+# Install in the existing umi environment; core training dependencies are unchanged.
+pyarrow>=12,<20
+streamlit>=1.35,<1.50
+plotly>=5.24,<7
+transformers>=4.45,<4.46
+# Existing diffusers uses cached_download, removed in Hub 0.26.
+huggingface-hub>=0.23.2,<0.26
+pytest>=7

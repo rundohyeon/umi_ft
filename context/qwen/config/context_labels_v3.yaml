@@ -1,0 +1,40 @@
+contexts:
+  0:
+    name: approach
+    description: 'The robot finger moves closer to the valve lever. Require visible approach; lack of force alone does not establish approach.'
+  1:
+    name: turning
+    description: 'Force is observed on the RIGHT finger while the valve lever visibly rotates relative to the valve body. Both right-finger force and lever rotation must be supported at the same time.'
+  2:
+    name: finish
+    description: 'The lever stops rotating, right-finger force then increases sharply, and the robot subsequently moves away from the lever. Require evidence of this ordered sequence before assigning finish at the retreat stage; stopping or a force spike alone is insufficient.'
+  3:
+    name: error
+    description: 'The valve lever rotates while valid finger-force observations show no force, OR the previously visible lever disappears from view. Lever disappearance is an error even during retreat. Missing force samples do not mean no force; uncertainty about visibility is not proof of disappearance.'
+unknown_label: -1
+label_version: v3
+policy_config: train_diffusion_unet_timm_umi_dual_ft_workspace
+dataset_overrides: []
+output_dir: data/context_labels_v3
+# Paths are relative to the umi_ft repository root.
+backend: qwen2_5_vl
+model_path: context/qwen/checkpoints/Qwen2.5-VL-3B-Instruct
+max_pixels: 50176  # 224 * 224, matching the recorded RGB resolution.
+inputs:
+  rgb: true
+  rgb_frames: 8
+  tcp_position: false
+  tcp_rotation: true
+  gripper_width: true
+  force_torque: true
+  # Preserve brief right-finger force peaks and their order (no contact threshold).
+  force_history_bins: 12
+  previous_labels: true
+  previous_label_count: 8
+offline: true
+seed: 42
+# Native RGB is ~60 Hz; stride 6 labels ~10 anchors/second.
+label_stride: 6
+history_length: 121  # About 2 seconds of past RGB, ending at the labeled frame.
+max_new_tokens: 160
+max_retries: 2

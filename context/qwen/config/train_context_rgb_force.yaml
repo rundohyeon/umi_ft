@@ -1,0 +1,43 @@
+# Four-state classifier: frozen pretrained CLIP + causal dual F/T CNNs + Transformer.
+# No TCP, gripper, target action, Qwen output, or predicted-context sidecar inputs.
+dataset:
+  dataset_path: three_dataset/dataset.zarr.zip
+  force_sidecar_path: three_dataset/dataset_force_sidecar.zarr
+  label_path: three_dataset/canonical_context_supervision_v2_4state_284.npz
+  rgb_stride: 3
+  ft_history: 32
+  ft_feature_mode: ${model.ft_feature_mode}
+  ft_mean_window: ${model.ft_mean_window}
+  ft_delta_lag: ${model.ft_delta_lag}
+  max_force_age_s: 0.012
+  rule_label_weight: 0.3
+  manual_label_weight: 1.0
+model:
+  model_name: vit_base_patch16_clip_224.openai
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 4
+  feedforward_dim: 256
+  dropout: 0.1
+  rgb_horizon: 2
+  ft_horizon: 32
+  # Per finger: raw(6) + trailing mean(6) + lagged-mean difference(6).
+  # Nine extra preceding samples yield 32 feature steps from 41 raw samples.
+  ft_feature_mode: raw_mean_delta
+  ft_mean_window: 5
+  ft_delta_lag: 5
+  num_classes: 4
+seed: 260904
+val_ratio: 0.15
+test_episode_numbers: [37, 45, 47, 87, 104, 202, 211, 246, 273, 281]
+epochs: 30
+batch_size: 32  # Per GPU: global batch 64 with two processes.
+num_workers: 4  # Per process.
+cpu_threads: 2
+learning_rate: 0.0003
+weight_decay: 0.0001
+max_grad_norm: 1.0
+amp: true
+device: cuda
+log_every: 100
+output_dir: outputs/context_rgb_force_4state_ft_features

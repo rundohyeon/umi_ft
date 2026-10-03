@@ -1,0 +1,38 @@
+contexts:
+  0:
+    name: approach
+    description: 'A single robot finger approaches or aligns with the valve to prepare contact. There is no grasp or pinch. Do not infer approach from TCP translation statistics.'
+  1:
+    name: turning
+    description: 'The robot manipulates the valve with one finger, without grasping it. Visible valve rotation attributable to finger contact supports this class; TCP rotation alone does not prove valve rotation.'
+  2:
+    name: finish
+    description: 'The intended valve operation is observably complete. A brief pause, elapsed time or loss of contact alone is insufficient. If the available observations cannot establish completion, use unknown.'
+  3:
+    name: error
+    description: 'Observable failure of the one-finger valve interaction, such as unintended slip or loss of effective contact while attempting to turn. High force alone is insufficient. Uncertainty is unknown, not error.'
+unknown_label: -1
+label_version: v2
+policy_config: train_diffusion_unet_timm_umi_dual_ft_workspace
+dataset_overrides: []
+output_dir: data/context_labels_v2
+# Paths are relative to the umi_ft repository root.
+backend: qwen2_5_vl
+model_path: context/qwen/checkpoints/Qwen2.5-VL-3B-Instruct
+max_pixels: 50176  # 224 * 224, matching the recorded RGB resolution.
+inputs:
+  rgb: true
+  rgb_frames: 4
+  tcp_position: false
+  tcp_rotation: true
+  gripper_width: true
+  force_torque: true
+  previous_labels: true
+  previous_label_count: 8
+offline: true
+seed: 42
+# Native RGB is ~60 Hz; stride 6 labels ~10 anchors/second.
+label_stride: 6
+history_length: 32
+max_new_tokens: 160
+max_retries: 2

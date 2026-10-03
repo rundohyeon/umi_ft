@@ -1,0 +1,9 @@
+# Python 3.11; isolated from UMI. PyPI torch 2.9.1 uses CUDA 12.8 on Linux.
+torch==2.9.1
+torchvision==0.24.1
+transformers==5.17.0
+flash-linear-attention==0.5.2
+# Prebuilt for Linux x86_64, Python 3.11, Torch 2.9, CUDA 12, CXX11 ABI.
+causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0%2Bcu12torch2.9cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+accelerate>=1.10,<2
+pillow>=11,<13

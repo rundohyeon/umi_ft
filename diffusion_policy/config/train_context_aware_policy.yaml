@@ -1,0 +1,58 @@
+defaults:
+  - train_diffusion_unet_timm_umi_dual_ft_workspace
+  - _self_
+name: train_context_aware_policy
+context_training:
+  definitions_path: context/qwen/config/context_labels.yaml
+  encoder_checkpoint: checkpoints/context_encoder_best.pt
+policy:
+  _target_: diffusion_policy.policy.context_aware_policy.ContextAwarePolicy
+  context:
+    num_classes: ${context_num_classes:${context_training.definitions_path}}
+    mode: soft
+    embedding_dim: 32
+    fusion_hidden_dim: 128
+    gate_init: -4.0
+    lambda_context: 0.1
+    smoothing_alpha: null
+    freeze_encoder: true
+    curriculum: adapter
+    log_every: 10
+    encoder:
+      input_keys: [camera0_rgb, robot0_ft_left, robot0_ft_right]
+      hidden_dim: 128
+      num_layers: 2
+      num_heads: 4
+      dropout: 0.1
+      history_length: 32
+      rgb_pool_size: 4
+      feedforward_dim: 256
+    learning_rates:
+      action: 0.00001
+      observations: 0.000003
+      context_encoder: 0.00001
+      context_embedding: 0.0003
+      context_fusion: 0.0003
+task:
+  dataset:
+    _target_: diffusion_policy.context.data.ContextUmiDataset
+    context_split_path: data/context_labels_v6/episode_splits.json
+    require_known_context: false
+    split_seed: 42
+    test_ratio: 0.15
+    context_val_ratio: 0.15
+    context_labels:
+      num_classes: ${policy.context.num_classes}
+      auto_path: data/context_labels_v6/auto_labels.jsonl
+      reviewed_path: data/context_labels_v6/reviewed_labels.parquet
+      source: reviewed
+      threshold: 0.9
+      reviewed_weight: 1.0
+      auto_weight: 0.3
+      mix_auto: false
+training:
+  init_from_checkpoint: null
+  init_weights: auto
+  resume: false
+logging:
+  mode: offline

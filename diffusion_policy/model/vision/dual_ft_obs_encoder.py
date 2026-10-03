@@ -42,7 +42,7 @@ class CausalConv1d(nn.Module):
 
 
 class CausalFTEncoder(nn.Module):
-    """Encode a causal ``[B,T,6]`` native-sensor wrench history to one token."""
+    """Encode causal ``[B,T,input_dim]`` history; native wrench defaults to six channels."""
 
     def __init__(
         self,
@@ -54,6 +54,9 @@ class CausalFTEncoder(nn.Module):
         negative_slope=0.1,
     ):
         super().__init__()
+        self.input_dim = int(input_dim)
+        if self.input_dim < 1:
+            raise ValueError('F/T input_dim must be positive')
         self.register_buffer(
             "temporal_contract_version",
             torch.tensor(1, dtype=torch.int64),
@@ -76,9 +79,9 @@ class CausalFTEncoder(nn.Module):
         self.network = nn.Sequential(*layers)
 
     def forward_sequence(self, history):
-        if history.ndim != 3 or history.shape[-1] != 6:
+        if history.ndim != 3 or history.shape[-1] != self.input_dim:
             raise ValueError(
-                f"F/T history must have shape [B,T,6], got {tuple(history.shape)}"
+                f"F/T history must have shape [B,T,{self.input_dim}], got {tuple(history.shape)}"
             )
         return self.network(history.transpose(1, 2)).transpose(1, 2)
 

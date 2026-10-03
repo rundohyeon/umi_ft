@@ -6248,6 +6248,10 @@ def main(input, output, robot_config,
                             obs_dict = dict_apply(obs_dict_np, 
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
+                            if 'context' in result:
+                                from diffusion_policy.context.runtime import log_context
+                                log_context(result, obs_timestamps[-1], iter_idx, eval_log_dir,
+                                    int(getattr(policy, 'context_config', {}).get('log_every', 10)))
                             raw_action = result["action_pred"][0].detach().to("cpu").numpy()
                             raw_model_action = raw_action.copy()
                             expected_action_shape = (

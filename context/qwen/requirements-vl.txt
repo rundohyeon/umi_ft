@@ -1,0 +1,4 @@
+# Install into context/qwen/.venv with the existing UMI torch installation.
+# Keep the original UMI/Diffusers environment on its current Hub version.
+transformers==4.51.3
+huggingface-hub>=0.30,<0.31

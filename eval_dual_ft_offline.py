@@ -360,9 +360,14 @@ def load_policy(
     }
     for path, expected in expected_targets.items():
         actual = str(OmegaConf.select(cfg, path, default=""))
-        if actual != expected:
+        allowed = {expected}
+        if path == "policy._target_":
+            allowed.add("diffusion_policy.policy.context_aware_policy.ContextAwarePolicy")
+        if path == "task.dataset._target_":
+            allowed.add("diffusion_policy.context.data.ContextUmiDataset")
+        if actual not in allowed:
             raise ValueError(
-                f"checkpoint target {path} must be {expected!r}, got {actual!r}"
+                f"checkpoint target {path} must be one of {sorted(allowed)!r}, got {actual!r}"
             )
     cfg.task.dataset_path = str(dataset_path)
     cfg.task.dataset.dataset_path = str(dataset_path)
@@ -882,6 +887,10 @@ def evaluate_loader(
     action_end_offset_ms: list[float] = []
     episode_indices: set[int] = set()
 
+    context_records = []
+    per_context_error = {i: [0.0, 0] for i in range(getattr(policy, 'num_context_classes', 5))}
+    if getattr(policy, 'smoothing_alpha', None) is not None:
+        raise ValueError('Batched offline evaluation requires smoothing_alpha=null; use streaming inference for smoothing')
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
             break
@@ -918,7 +927,17 @@ def evaluate_loader(
             torch.manual_seed(seed + batch_index * 1009)
             if device.type == "cuda":
                 torch.cuda.manual_seed_all(seed + batch_index * 1009)
-            loss = policy.compute_loss({"obs": obs, "action": target})
+            loss_batch = {"obs": obs, "action": target}
+            if "context_label" in batch:
+                loss_batch["context_label"] = batch["context_label"].to(device)
+                loss_batch["context_weight"] = batch["context_weight"].to(device)
+            # Report the existing action loss separately from auxiliary classification.
+            saved_lambda = getattr(policy, 'lambda_context', None)
+            if saved_lambda is not None: policy.lambda_context = 0.0
+            try:
+                loss = policy.compute_loss(loss_batch)
+            finally:
+                if saved_lambda is not None: policy.lambda_context = saved_lambda
             _assert_finite_tensor("diffusion loss", loss)
             loss_sum += float(loss.detach().cpu()) * batch_size
             loss_samples += batch_size
@@ -930,7 +949,21 @@ def evaluate_loader(
                 torch.cuda.manual_seed_all(repeat_seed)
                 torch.cuda.synchronize(device)
             started = time.perf_counter()
-            prediction = policy.predict_action(obs)["action_pred"]
+            predict_kwargs = {}
+            if getattr(policy, 'context_mode', None) == 'oracle':
+                predict_kwargs['context_label'] = batch['context_label'].to(device)
+            output = policy.predict_action(obs, **predict_kwargs)
+            prediction = output["action_pred"]
+            if repeat == 0 and 'context' in output and 'context_label' in batch:
+                probabilities = output['context']['raw_probabilities'].detach().cpu().numpy()
+                sample_errors = (prediction-target).square().flatten(1).mean(1).detach().cpu().numpy()
+                for j, label in enumerate(batch['context_label'].tolist()):
+                    context_records.append(dict(label=label, probabilities=probabilities[j].tolist(),
+                        episode=int(batch['sample_info']['episode_index'][j]),
+                        timestamp=float(batch['sample_info']['anchor_timestamp'][j])))
+                    if label >= 0:
+                        per_context_error[label][0] += float(sample_errors[j])
+                        per_context_error[label][1] += 1
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             inference_seconds.append(time.perf_counter() - started)
@@ -1050,6 +1083,9 @@ def evaluate_loader(
         raise ValueError("evaluation dataloader yielded zero batches")
     latency_ms = np.asarray(inference_seconds, dtype=np.float64) * 1000.0
     return {
+        "context_records": context_records,
+        "per_context_action_mse": {str(k): {'mse': value/count if count else None, 'samples': count}
+                                   for k, (value, count) in per_context_error.items()},
         "evaluated_batches": evaluated_batches,
         "evaluated_samples": evaluated_samples,
         "prediction_repeats": prediction_repeats,
