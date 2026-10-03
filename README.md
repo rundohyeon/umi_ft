@@ -672,6 +672,31 @@ use the [RGB + F/T classifier training guide](docs/context_rgb_force_training.md
 It trains a frozen-CLIP / causal-F/T-CNN / small-Transformer classifier without
 TCP inputs, including a `torchrun` command for physical GPUs 2 and 3.
 
+### Frame-by-frame RGB / F/T debugging and label review
+
+Use the small browser UI in `tools/debug_context_labels.py` to inspect the
+canonical dataset's video frames, synchronized force/torque, and A/T/R/E labels:
+
+```bash
+conda activate umi
+python -m streamlit run tools/debug_context_labels.py \
+  --server.address 127.0.0.1 --server.port 8502
+```
+
+Open **http://localhost:8502**. It starts at EP194 (the first manually labelled
+episode). Select any episode, step with **← / →**, play/pause with **Space**, or
+enter an exact frame number. F/T plots offer raw axes, the trailing five-sample
+mean, and the lagged-mean difference. Force (N) and torque (Nm) use separate
+plots. **1–4** assign approach/turning/recovery/error to a frame or inclusive
+selected range; **U** clears a label, **Z** undoes an edit, **S** saves.
+
+Edits are stored in `outputs/context_label_debug/review.json` and restored on
+restart. The UI keeps the original dataset/labels read-only and does not feed
+these review patches into training automatically. It requires the three files
+in `three_dataset`, but no model checkpoint or GPU. See the
+[debug UI guide](docs/context_label_debug_ui.md) for data paths, SSH forwarding,
+and command-line options.
+
 ### Real-robot evaluation of `context_encoder_best.pt` / `best.pt`
 
 Use **`eval_real_context_rgb_force.py`** for this trained RGB + native-F/T
