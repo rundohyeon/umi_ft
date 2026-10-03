@@ -25,6 +25,10 @@ from diffusion_policy.model.vision.valve_context_observer_v2 import (
     load_frozen_context_observer,
 )
 from umi.common.pose_util import mat_to_pose10d, pose_to_mat
+from umi.real_world.rgb_force_context import (
+    ObservationUnavailable,
+    RGBForceContextRuntime,
+)
 
 
 _CLASSIFIER_ROOT = Path(__file__).resolve().parents[2] / "valve_state_classifier_v4"
@@ -471,7 +475,426 @@ class ValveStateContextRuntimeV2:
         return record
 
 
+class RGBForceValveContextRuntime:
+    """Adapt the RGB/native-F/T Stage-A classifier to policy context v2.
+
+    Both observers expose four ordered probabilities plus a validity flag, but
+    this observer consumes two RGB frames about 50 ms apart and one 41-sample
+    native F/T history at t. It does not consume TCP pose or gripper width.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        device: str = "cuda",
+        max_rgb_buffer: int = 256,
+        max_force_buffer: int = 2000,
+        max_rgb_cadence_rewarm_frames: int = 3,
+    ):
+        checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"RGB/F-T context checkpoint not found: {checkpoint_path}"
+            )
+        if int(max_rgb_buffer) < 1 + OBSERVER_RGB_STRIDE:
+            raise ValueError("RGB/F-T context buffer must retain at least four frames")
+        if int(max_force_buffer) < 41:
+            raise ValueError("RGB/F-T context buffer must retain at least 41 F/T samples")
+        if int(max_rgb_cadence_rewarm_frames) < 1:
+            raise ValueError("RGB/F-T cadence rewarm limit must be positive")
+
+        self.checkpoint_path = checkpoint_path
+        self.checkpoint_sha256 = sha256_file(checkpoint_path)
+        self.device = str(device)
+        self._runtime = RGBForceContextRuntime(checkpoint_path, device=self.device)
+        phase_names = tuple(self._runtime.metadata.get("phase_names", ()))
+        if phase_names != tuple(OBSERVER_PHASE_NAMES):
+            raise ValueError(
+                "RGB/F-T observer phase order must be "
+                f"{tuple(OBSERVER_PHASE_NAMES)}, got {phase_names}"
+            )
+        self.rgb_target_span_s = (
+            float(self._runtime.metadata.get("rgb_stride", OBSERVER_RGB_STRIDE))
+            / 60.0
+        )
+        self.checkpoint_metadata = dict(self._runtime.metadata)
+        self.checkpoint_metadata["integration_rgb_target_span_s"] = (
+            self.rgb_target_span_s
+        )
+        self.max_rgb_cadence_rewarm_frames = int(
+            max_rgb_cadence_rewarm_frames
+        )
+        self.checkpoint_metadata["max_rgb_cadence_rewarm_frames"] = (
+            self.max_rgb_cadence_rewarm_frames
+        )
+        self.context_schema = VALVE_CONTEXT_V2_SCHEMA
+        self.context_dim = 5
+        self.phase_names = OBSERVER_PHASE_NAMES
+        self.observer_version = "rgb_force_context_4state"
+        self._rgb_timestamps = deque(maxlen=int(max_rgb_buffer))
+        self._rgb_frames = deque(maxlen=int(max_rgb_buffer))
+        self._force_timestamps = deque(maxlen=int(max_force_buffer))
+        self._force_values = deque(maxlen=int(max_force_buffer))
+        self._last_wrench_timestamp = -np.inf
+        self._last_prediction_timestamp = -np.inf
+        self._episode_start_timestamp = -np.inf
+        self._consecutive_rgb_cadence_unavailable = 0
+        self.last_record: ValveContextRecord | None = None
+        self.last_model_inputs: dict[str, np.ndarray] | None = None
+        self.last_unavailable_reason: str | None = None
+
+    def reset(self, *, episode_start_timestamp_s: float | None = None) -> None:
+        self._rgb_timestamps.clear()
+        self._rgb_frames.clear()
+        self._force_timestamps.clear()
+        self._force_values.clear()
+        self._last_wrench_timestamp = -np.inf
+        self._last_prediction_timestamp = -np.inf
+        self._consecutive_rgb_cadence_unavailable = 0
+        if episode_start_timestamp_s is None:
+            self._episode_start_timestamp = -np.inf
+        else:
+            self._episode_start_timestamp = float(episode_start_timestamp_s)
+            if not np.isfinite(self._episode_start_timestamp):
+                raise ValueError("episode start timestamp must be finite")
+        self.last_record = None
+        self.last_model_inputs = None
+        self.last_unavailable_reason = None
+
+    @property
+    def last_prediction_timestamp(self) -> float:
+        return float(self._last_prediction_timestamp)
+
+    def get_last_classifier_model_inputs(self) -> dict[str, np.ndarray]:
+        if not isinstance(self.last_model_inputs, dict):
+            raise RuntimeError(
+                "RGB/F-T observer has not produced a complete causal input window"
+            )
+        return {
+            key: np.asarray(value).copy()
+            for key, value in self.last_model_inputs.items()
+        }
+
+    def append_causal_wrench_history(
+        self,
+        timestamps,
+        left_wrench,
+        right_wrench,
+        *,
+        anchor_timestamp_s: float,
+    ) -> int:
+        timestamps = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+        left_wrench = np.asarray(left_wrench, dtype=np.float32)
+        right_wrench = np.asarray(right_wrench, dtype=np.float32)
+        if left_wrench.shape != (len(timestamps), 6) or right_wrench.shape != (
+            len(timestamps), 6
+        ):
+            raise ValueError("RGB/F-T observer requires matching [N,6] F/T arrays")
+        if (
+            not np.isfinite(timestamps).all()
+            or not np.isfinite(left_wrench).all()
+            or not np.isfinite(right_wrench).all()
+        ):
+            raise ValueError("RGB/F-T observer F/T history contains NaN or Inf")
+        if np.any(np.diff(timestamps) < 0.0):
+            raise ValueError("RGB/F-T observer F/T timestamps must be sorted")
+        if np.any(timestamps > float(anchor_timestamp_s) + 1e-6):
+            raise ValueError("RGB/F-T observer would consume future F/T samples")
+
+        appended = 0
+        for timestamp, left, right in zip(timestamps, left_wrench, right_wrench):
+            timestamp = float(timestamp)
+            if timestamp < self._episode_start_timestamp:
+                continue
+            if timestamp <= self._last_wrench_timestamp:
+                continue
+            self._force_timestamps.append(timestamp)
+            self._force_values.append(
+                np.concatenate([left, right]).astype(np.float32)
+            )
+            self._last_wrench_timestamp = timestamp
+            appended += 1
+        return appended
+
+    @torch.inference_mode()
+    def predict(
+        self,
+        *,
+        timestamp_s: float,
+        rgb: np.ndarray,
+        position_m: np.ndarray,
+        rotation_axis_angle_rad: np.ndarray,
+        gripper_width_m: float,
+        ft_timestamps: np.ndarray,
+        ft_left: np.ndarray,
+        ft_right: np.ndarray,
+    ) -> ValveContextRecord:
+        # These values remain in the common worker signature, but this model
+        # deliberately does not consume them.
+        del position_m, rotation_axis_angle_rad, gripper_width_m
+        timestamp_s = float(timestamp_s)
+        if timestamp_s < self._episode_start_timestamp:
+            raise ValueError("RGB/F-T observer RGB timestamp predates this episode")
+        if (
+            not np.isfinite(timestamp_s)
+            or timestamp_s <= self._last_prediction_timestamp
+        ):
+            raise ValueError(
+                "RGB/F-T observer timestamps must be finite and strictly increasing "
+                f"(last={self._last_prediction_timestamp}, got={timestamp_s})"
+            )
+        rgb = np.asarray(rgb)
+        if rgb.shape != (224, 224, 3) or rgb.dtype != np.uint8:
+            raise ValueError(
+                "RGB/F-T observer must receive final policy RGB uint8 [224,224,3], "
+                f"got {rgb.shape} {rgb.dtype}"
+            )
+
+        self.append_causal_wrench_history(
+            ft_timestamps, ft_left, ft_right, anchor_timestamp_s=timestamp_s
+        )
+        self._rgb_timestamps.append(timestamp_s)
+        self._rgb_frames.append(np.ascontiguousarray(rgb).copy())
+        rgb_times = np.fromiter(self._rgb_timestamps, dtype=np.float64)
+        rgb_frames = np.stack(self._rgb_frames)
+        force_times = np.fromiter(self._force_timestamps, dtype=np.float64)
+        wrench_12d = (
+            np.stack(self._force_values).astype(np.float32)
+            if self._force_values
+            else np.empty((0, 12), dtype=np.float32)
+        )
+
+        self.last_model_inputs = None
+        self.last_unavailable_reason = None
+        try:
+            obs, timing = self._runtime.prepare(
+                rgb_times,
+                rgb_frames,
+                force_times,
+                wrench_12d,
+                episode_start=self._episode_start_timestamp,
+                rgb_target_span_s=self.rgb_target_span_s,
+            )
+            prediction = self._runtime.predict(obs)
+        except ObservationUnavailable as exc:
+            reason = str(exc)
+            cadence_rewarm = reason.startswith("rgb_cadence_mismatch")
+            if cadence_rewarm:
+                self._consecutive_rgb_cadence_unavailable += 1
+                if (
+                    self._consecutive_rgb_cadence_unavailable
+                    > self.max_rgb_cadence_rewarm_frames
+                ):
+                    raise
+            elif not reason.startswith("warming_up_"):
+                raise
+            # A bounded RGB gap and normal startup both publish context_valid=0.
+            # The policy loop holds the robot and skips inference for this anchor.
+            self.last_unavailable_reason = reason
+            record = context_from_observer_probabilities(
+                np.full(4, 0.25, dtype=np.float32),
+                timestamp_s=timestamp_s,
+                context_valid=False,
+            )
+        else:
+            self._consecutive_rgb_cadence_unavailable = 0
+            probabilities = np.asarray(
+                prediction["probabilities"], dtype=np.float32
+            ).reshape(4)
+            record = context_from_observer_probabilities(
+                probabilities,
+                timestamp_s=timestamp_s,
+                context_valid=True,
+            )
+            self.last_model_inputs = {
+                "observer_input_schema": np.asarray(
+                    str(self._runtime.metadata["schema"])
+                ),
+                "rgb_timestamp_s": np.asarray(
+                    timing["rgb_timestamps"], dtype=np.float64
+                ),
+                "camera0_rgb": np.asarray(obs["camera0_rgb"], dtype=np.uint8),
+                "ft_timestamp_s": np.asarray(
+                    timing["ft_timestamps"], dtype=np.float64
+                ),
+                "robot0_ft_left": np.asarray(
+                    obs["robot0_ft_left"], dtype=np.float32
+                ),
+                "robot0_ft_right": np.asarray(
+                    obs["robot0_ft_right"], dtype=np.float32
+                ),
+            }
+        self._last_prediction_timestamp = timestamp_s
+        self.last_record = record
+        return record
+
+    @torch.inference_mode()
+    def predict_policy_anchor(
+        self,
+        *,
+        timestamp_s: float,
+        rgb: np.ndarray,
+        rgb_timestamps: np.ndarray,
+        rgb_frames: np.ndarray,
+        ft_timestamps: np.ndarray,
+        ft_left: np.ndarray,
+        ft_right: np.ndarray,
+    ) -> ValveContextRecord:
+        """Predict once for an exact policy RGB anchor from retained sensor history.
+
+        Unlike the legacy stateful observer, the RGB/F-T model is a stateless
+        sliding-window classifier. It therefore needs one exact two-image /
+        41-wrench window per policy inference, not inference on every camera
+        frame. The policy image is matched by timestamp and pixels before any
+        model work, and all future RGB/F-T samples are excluded.
+        """
+        timestamp_s = float(timestamp_s)
+        if (
+            not np.isfinite(timestamp_s)
+            or timestamp_s <= self._last_prediction_timestamp
+        ):
+            raise ValueError(
+                "RGB/F-T policy anchors must be finite and strictly increasing "
+                f"(last={self._last_prediction_timestamp}, got={timestamp_s})"
+            )
+        policy_rgb = np.asarray(rgb)
+        if policy_rgb.shape != (224, 224, 3) or policy_rgb.dtype != np.uint8:
+            raise ValueError(
+                "RGB/F-T policy anchor must be uint8 [224,224,3], "
+                f"got {policy_rgb.shape} {policy_rgb.dtype}"
+            )
+
+        rgb_timestamps = np.asarray(
+            rgb_timestamps, dtype=np.float64
+        ).reshape(-1)
+        rgb_frames = np.asarray(rgb_frames)
+        if (
+            rgb_frames.shape != (len(rgb_timestamps), 224, 224, 3)
+            or rgb_frames.dtype != np.uint8
+        ):
+            raise ValueError(
+                "RGB/F-T retained RGB history must be uint8 [N,224,224,3]"
+            )
+        if (
+            len(rgb_timestamps) == 0
+            or not np.isfinite(rgb_timestamps).all()
+            or np.any(np.diff(rgb_timestamps) <= 0.0)
+        ):
+            raise ValueError(
+                "RGB/F-T retained RGB timestamps must be finite and strictly increasing"
+            )
+        matching_indices = np.flatnonzero(
+            np.isclose(
+                rgb_timestamps,
+                timestamp_s,
+                rtol=0.0,
+                atol=1e-6,
+            )
+        )
+        if len(matching_indices) != 1:
+            raise ValueError(
+                "retained RGB history does not contain exactly one policy anchor "
+                f"(anchor={timestamp_s:.6f}, matches={len(matching_indices)})"
+            )
+        anchor_idx = int(matching_indices[0])
+        anchor_rgb = np.ascontiguousarray(rgb_frames[anchor_idx])
+        if not np.array_equal(anchor_rgb, policy_rgb):
+            raise ValueError(
+                "retained RGB pixels differ from the policy RGB at the same timestamp"
+            )
+
+        ft_timestamps = np.asarray(ft_timestamps, dtype=np.float64).reshape(-1)
+        ft_left = np.asarray(ft_left, dtype=np.float32)
+        ft_right = np.asarray(ft_right, dtype=np.float32)
+        if (
+            ft_left.shape != (len(ft_timestamps), 6)
+            or ft_right.shape != (len(ft_timestamps), 6)
+        ):
+            raise ValueError("RGB/F-T retained F/T history must be matching [N,6]")
+        if (
+            len(ft_timestamps) == 0
+            or not np.isfinite(ft_timestamps).all()
+            or not np.isfinite(ft_left).all()
+            or not np.isfinite(ft_right).all()
+            or np.any(np.diff(ft_timestamps) <= 0.0)
+        ):
+            raise ValueError(
+                "RGB/F-T retained F/T history must be finite and strictly increasing"
+            )
+
+        causal_rgb_timestamps = rgb_timestamps[: anchor_idx + 1]
+        causal_rgb_frames = rgb_frames[: anchor_idx + 1]
+        ft_end = int(np.searchsorted(ft_timestamps, timestamp_s, side="right"))
+        causal_ft_timestamps = ft_timestamps[:ft_end]
+        causal_wrench = np.concatenate(
+            [ft_left[:ft_end], ft_right[:ft_end]], axis=-1
+        ).astype(np.float32)
+
+        self.last_model_inputs = None
+        self.last_unavailable_reason = None
+        try:
+            obs, timing = self._runtime.prepare(
+                causal_rgb_timestamps,
+                causal_rgb_frames,
+                causal_ft_timestamps,
+                causal_wrench,
+                episode_start=self._episode_start_timestamp,
+                rgb_target_span_s=self.rgb_target_span_s,
+            )
+            prediction = self._runtime.predict(obs)
+        except ObservationUnavailable as exc:
+            reason = str(exc)
+            cadence_rewarm = reason.startswith("rgb_cadence_mismatch")
+            if cadence_rewarm:
+                self._consecutive_rgb_cadence_unavailable += 1
+                if (
+                    self._consecutive_rgb_cadence_unavailable
+                    > self.max_rgb_cadence_rewarm_frames
+                ):
+                    raise
+            elif not reason.startswith("warming_up_"):
+                raise
+            self.last_unavailable_reason = reason
+            record = context_from_observer_probabilities(
+                np.full(4, 0.25, dtype=np.float32),
+                timestamp_s=timestamp_s,
+                context_valid=False,
+            )
+        else:
+            self._consecutive_rgb_cadence_unavailable = 0
+            probabilities = np.asarray(
+                prediction["probabilities"], dtype=np.float32
+            ).reshape(4)
+            record = context_from_observer_probabilities(
+                probabilities,
+                timestamp_s=timestamp_s,
+                context_valid=True,
+            )
+            self.last_model_inputs = {
+                "observer_input_schema": np.asarray(
+                    str(self._runtime.metadata["schema"])
+                ),
+                "rgb_timestamp_s": np.asarray(
+                    timing["rgb_timestamps"], dtype=np.float64
+                ),
+                "camera0_rgb": np.asarray(obs["camera0_rgb"], dtype=np.uint8),
+                "ft_timestamp_s": np.asarray(
+                    timing["ft_timestamps"], dtype=np.float64
+                ),
+                "robot0_ft_left": np.asarray(
+                    obs["robot0_ft_left"], dtype=np.float32
+                ),
+                "robot0_ft_right": np.asarray(
+                    obs["robot0_ft_right"], dtype=np.float32
+                ),
+            }
+        self._last_prediction_timestamp = timestamp_s
+        self.last_record = record
+        return record
+
+
 __all__ = [
+    "RGBForceValveContextRuntime",
     "ValveStateContextRuntime",
     "ValveStateContextRuntimeV2",
     "sha256_file",

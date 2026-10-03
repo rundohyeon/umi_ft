@@ -120,9 +120,12 @@ resume validation happens before replacing any saved run metadata.
 
 This classifier is separate from the earlier pooled-RGB `ContextEncoder`.
 Use `RGBForceContextEncoder.from_checkpoint(payload)` to reconstruct it without
-downloading visual weights. Integrating its soft probabilities into Stage B
-requires adapting that policy's context model loader; the older loader is not
-compatible with this checkpoint schema.
+downloading visual weights. The full robot evaluator now provides an explicit
+RGB/F-T adapter for a four-state v2 Stage-B policy because both interfaces are
+`[P(approach), P(turning), P(recovery), P(error), context_valid]`. Enable it
+with `VALVE_CLASSIFIER_ALLOW_OVERRIDE=1`; the default path still enforces the
+observer SHA serialized by the action-policy checkpoint. Treat the override as
+a distribution-shift evaluation, not as checkpoint-identical deployment.
 
 For live camera/RG2-FT observation, use `eval_real_context_rgb_force.py` and the
 [real-evaluation / checkpoint handoff guide](context_rgb_force_real_eval.md).

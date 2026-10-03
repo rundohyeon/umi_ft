@@ -25,9 +25,31 @@ def test_native_selection_ignores_future_samples_and_matches_frame_stride():
     np.testing.assert_array_equal(fi, np.arange(10, 51))
     assert timing['ft_age_s'] == pytest.approx(0.005)
     assert timing['ft_history_span_s'] == pytest.approx(0.4)
+    assert timing['rgb_frame_index_gap'] == 3
+    assert timing['rgb_selection'] == 'fixed_stride'
+    assert 'rgb_target_span_s' not in timing
     # Future values/timestamps never change the native past window.
     ft[51:] += 50
     np.testing.assert_array_equal(select_context_window(rt, ft)[1], fi)
+
+
+def test_target_span_selects_causal_pair_at_slower_processed_rgb_cadence():
+    rt = np.asarray([100.0, 100.029, 100.058, 100.087])
+    anchor = float(rt[-1])
+    ft = anchor - 0.005 - np.arange(50, -1, -1) / 100
+
+    with pytest.raises(ObservationUnavailable, match='rgb_cadence_mismatch'):
+        select_context_window(rt, ft)
+
+    ri, fi, timing = select_context_window(
+        rt, ft, rgb_target_span_s=0.05
+    )
+    np.testing.assert_array_equal(ri, [1, 3])
+    np.testing.assert_array_equal(fi, np.arange(10, 51))
+    assert timing['rgb_pair_span_s'] == pytest.approx(0.058)
+    assert timing['rgb_frame_index_gap'] == 2
+    assert timing['rgb_selection'] == 'nearest_target_span'
+    assert timing['rgb_target_span_s'] == pytest.approx(0.05)
 
 
 @pytest.mark.parametrize('problem,expected', [

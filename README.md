@@ -453,6 +453,50 @@ context/actions, and safety logs should the same command be repeated with
 the action checkpoint contract and refuses schema, dimension, phase-order, or
 observer-SHA mismatches.
 
+The newer RGB + native-F/T classifier has the same policy-facing five values
+(four ordered probabilities plus context_valid), but a different internal
+checkpoint/input schema. It can be substituted explicitly without silently
+weakening the default checkpoint identity check. This is an experimental
+distribution shift: the Stage-B policy was trained with the observer recorded
+in its checkpoint, so validate the replacement in plan-only mode first.
+
+Inside the deployment container:
+
+    PYTHON_BIN=python3 \
+    RG2_CHECKPOINT=/ros2_ws/src/indy_umi_rg_ft/data/context-3/latest.ckpt \
+    VALVE_CLASSIFIER_CHECKPOINT=/ros2_ws/src/indy_umi_rg_ft/data/context-3/best_context_dkim.pt \
+    VALVE_CLASSIFIER_ALLOW_OVERRIDE=1 \
+    MATCH_DATASET=/ros2_ws/src/indy_umi_rg_ft/data/context-3/dataset.zarr.zip \
+    MATCH_EPISODE=0 \
+    EVAL_OUTPUT_DIR=/ros2_ws/src/indy_umi_rg_ft/data/eval_context3_dkim \
+    RG2_ENABLE_MOTION=0 \
+    ACTION_SCALE=1.0 \
+    RG2_FT_MAX_AGE_SEC=0.020 \
+    ./deploy_real_indy_rg2.sh \
+      --steps_per_inference 1 \
+      --max_policy_iters 1 \
+      --show_policy_image \
+      --policy_input_audit \
+      --print_policy_output
+
+The override adapter runs once per policy cycle from retained sensor history;
+it does not run a competing camera-rate classifier worker. It requires the
+policy RGB timestamp and pixels to match an exact retained camera frame, then
+selects the older frame closest to the trained approximately 50 ms separation.
+At 60 Hz this is `[t-3,t]`; a slower effective camera cadence is accepted only
+inside the original 30--75 ms timing gate. The adapter also uses the latest 41
+causal native F/T samples and the checkpoint's learned normalization. Future
+RGB/F/T samples are excluded. TCP pose and gripper width are not passed to this
+observer.
+
+Non-startup cadence or staleness failures are not converted into an error
+class. After a transient RGB gap, up to three policy cycles can be marked
+`context_valid=0`; pending waypoints are held and those inference/command
+cycles are skipped. A fourth consecutive cadence failure stops the run. There
+is no asynchronous exact-anchor wait in this override path.
+After validating the logs, enable motion explicitly and select the desired
+steps-per-inference.
+
 </details>
 
 ## Legacy valve-state context classifier

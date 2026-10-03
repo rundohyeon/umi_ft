@@ -4,8 +4,13 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
-from eval_real_indy_rg2 import _PolicyInputCapture, _ValveContextInputCapture
+from eval_real_indy_rg2 import (
+    _PolicyInputCapture,
+    _ValveContextInputCapture,
+    _add_rgb_force_context_to_policy_observation,
+)
 from diffusion_policy.common.valve_context_contract import VALVE_CONTEXT_V2_SCHEMA
+from umi.real_world.valve_state_context import RGBForceValveContextRuntime
 
 
 def _record(timestamp_s=10.02):
@@ -214,3 +219,180 @@ def test_context_capture_supports_four_state_v2_columns(tmp_path):
     assert rows[0]["phase_recovery"] == str(float(record.values[2]))
     assert rows[0]["context_valid"] == "1.0"
     assert "reason_none" not in rows[0]
+
+
+def test_context_capture_preserves_rgb_force_observer_window(tmp_path):
+    root = tmp_path / "rgb_force_context_inputs"
+    capture = _ValveContextInputCapture(
+        root,
+        episode_start_timestamp_s=10.0,
+        context_schema=VALVE_CONTEXT_V2_SCHEMA,
+    )
+    rgb_timestamps = np.asarray([10.0, 10.05], dtype=np.float64)
+    images = np.stack(
+        [
+            np.zeros((224, 224, 3), dtype=np.uint8),
+            np.full((224, 224, 3), 127, dtype=np.uint8),
+        ]
+    )
+    for timestamp_s, image in zip(rgb_timestamps, images):
+        record = SimpleNamespace(
+            timestamp_s=float(timestamp_s),
+            phase_name="turning",
+            error_reason_name="n/a",
+            warmed_up=True,
+            schema=VALVE_CONTEXT_V2_SCHEMA,
+            values=np.asarray([0.1, 0.7, 0.1, 0.1, 1.0], dtype=np.float32),
+        )
+        capture.append_frame(
+            timestamp_s=float(timestamp_s),
+            rgb=image,
+            position_m=np.zeros(3),
+            rotation_axis_angle_rad=np.zeros(3),
+            gripper_width_m=0.05,
+            latest_wrench_timestamp_s=10.049,
+            context_record=record,
+        )
+
+    ft_timestamps = np.linspace(9.65, 10.049, 41, dtype=np.float64)
+    left = np.arange(41 * 6, dtype=np.float32).reshape(41, 6)
+    right = -left
+    capture.append_classifier_window(
+        classifier_timestamp_s=10.05,
+        model_inputs={
+            "observer_input_schema": np.asarray(
+                "context_rgb_force_4state_ft_features_v2"
+            ),
+            "rgb_timestamp_s": rgb_timestamps,
+            "camera0_rgb": images,
+            "ft_timestamp_s": ft_timestamps,
+            "robot0_ft_left": left,
+            "robot0_ft_right": right,
+        },
+    )
+    capture.close()
+
+    with open(root / "classifier_windows" / "index.csv", newline="") as file:
+        rows = list(csv.DictReader(file))
+    assert len(rows) == 1
+    assert rows[0]["temporal_steps"] == "2"
+    assert rows[0]["force_history_samples"] == "41"
+    with np.load(root / rows[0]["npz_file"], allow_pickle=False) as archive:
+        assert str(archive["observer_input_schema"]) == (
+            "context_rgb_force_4state_ft_features_v2"
+        )
+        np.testing.assert_array_equal(
+            archive["rgb_image_file"],
+            np.asarray(
+                ["images/frame_00000000.png", "images/frame_00000001.png"]
+            ),
+        )
+        np.testing.assert_array_equal(archive["ft_timestamp_s"], ft_timestamps)
+        np.testing.assert_array_equal(archive["robot0_ft_left"], left)
+        np.testing.assert_array_equal(archive["robot0_ft_right"], right)
+        assert "lowdim" not in archive
+
+
+def test_policy_rate_rgb_force_helper_runs_once_and_captures_exact_window(
+    tmp_path,
+):
+    anchor = 10.05
+    rgb_timestamps = np.asarray([10.0, anchor], dtype=np.float64)
+    images = np.stack(
+        [
+            np.zeros((224, 224, 3), dtype=np.uint8),
+            np.full((224, 224, 3), 91, dtype=np.uint8),
+        ]
+    )
+    ft_timestamps = np.linspace(9.65, 10.049, 41, dtype=np.float64)
+    ft_left = np.arange(41 * 6, dtype=np.float32).reshape(41, 6)
+    ft_right = -ft_left
+    record = SimpleNamespace(
+        timestamp_s=anchor,
+        phase_name="turning",
+        error_reason_name="n/a",
+        warmed_up=True,
+        schema=VALVE_CONTEXT_V2_SCHEMA,
+        values=np.asarray([0.1, 0.7, 0.1, 0.1, 1.0], dtype=np.float32),
+    )
+
+    class Runtime(RGBForceValveContextRuntime):
+        def __init__(self):
+            self.calls = 0
+
+        def predict_policy_anchor(self, **kwargs):
+            self.calls += 1
+            assert kwargs["timestamp_s"] == anchor
+            np.testing.assert_array_equal(kwargs["rgb"], images[-1])
+            np.testing.assert_array_equal(
+                kwargs["rgb_timestamps"], rgb_timestamps
+            )
+            return record
+
+        def get_last_classifier_model_inputs(self):
+            return {
+                "observer_input_schema": np.asarray(
+                    "context_rgb_force_4state_ft_features_v2"
+                ),
+                "rgb_timestamp_s": rgb_timestamps,
+                "camera0_rgb": images,
+                "ft_timestamp_s": ft_timestamps,
+                "robot0_ft_left": ft_left,
+                "robot0_ft_right": ft_right,
+            }
+
+    runtime = Runtime()
+    obs = {
+        "timestamp": np.asarray([anchor], dtype=np.float64),
+        "camera0_rgb": images[-1][None],
+        "robot0_eef_pos": np.asarray([[0.1, 0.2, 0.3]]),
+        "robot0_eef_rot_axis_angle": np.asarray([[0.01, 0.02, 0.03]]),
+        "robot0_gripper_width": np.asarray([[0.055]]),
+    }
+    stream = {
+        "rgb_timestamp_s": rgb_timestamps,
+        "camera0_rgb": images.astype(np.float32) / 255.0,
+        "ft_timestamp_s": ft_timestamps,
+        "robot0_ft_left": ft_left,
+        "robot0_ft_right": ft_right,
+    }
+    root = tmp_path / "policy_rate_context_inputs"
+    capture = _ValveContextInputCapture(
+        root,
+        episode_start_timestamp_s=9.5,
+        context_schema=VALVE_CONTEXT_V2_SCHEMA,
+    )
+
+    obs_with_context, actual_record = (
+        _add_rgb_force_context_to_policy_observation(
+            obs,
+            runtime=runtime,
+            stream=stream,
+            input_capture=capture,
+        )
+    )
+    capture.close()
+
+    assert runtime.calls == 1
+    assert actual_record is record
+    np.testing.assert_array_equal(
+        obs_with_context["valve_context"], record.values.reshape(1, -1)
+    )
+    with open(root / "context_frames.csv", newline="") as file:
+        frame_rows = list(csv.DictReader(file))
+    assert len(frame_rows) == 1
+    assert float(frame_rows[0]["rgb_timestamp_s"]) == anchor
+    assert frame_rows[0]["image_file"] == "images/frame_00000001.png"
+    with open(root / "classifier_windows" / "index.csv", newline="") as file:
+        window_rows = list(csv.DictReader(file))
+    assert len(window_rows) == 1
+    with np.load(root / window_rows[0]["npz_file"]) as archive:
+        np.testing.assert_array_equal(
+            archive["rgb_image_file"],
+            np.asarray(
+                ["images/frame_00000000.png", "images/frame_00000001.png"]
+            ),
+        )
+        np.testing.assert_array_equal(
+            archive["ft_timestamp_s"], ft_timestamps
+        )

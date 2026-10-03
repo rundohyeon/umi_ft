@@ -45,21 +45,54 @@ def _timestamps(values, name):
 
 def select_context_window(rgb_times, ft_times, *, required_ft_history=41,
                           rgb_stride=3, max_force_age_s=0.012,
-                          episode_start=-np.inf, now=None, limits=None):
+                          episode_start=-np.inf, now=None, limits=None,
+                          rgb_target_span_s=None):
     """Select native samples, never interpolate, resample, or include future F/T.
 
     Live startup waits for a full window instead of repeating startup samples.
     Indices refer to the supplied buffers. Both buffers must use the same clock.
+    A target span selects the closest safe causal pair; None preserves t-stride.
     """
     limits = limits or TimingLimits()
     rt, ft = _timestamps(rgb_times, 'RGB'), _timestamps(ft_times, 'F/T')
     ri = np.flatnonzero(rt >= episode_start)
     if len(ri) < rgb_stride + 1:
         raise ObservationUnavailable('warming_up_rgb')
-    rgb_indices = ri[[-1 - rgb_stride, -1]]
-    anchor = float(rt[rgb_indices[-1]])
+    anchor_index = int(ri[-1])
+    anchor = float(rt[anchor_index])
     if now is not None and (now < anchor or now - anchor > limits.max_rgb_age_s):
         raise ObservationUnavailable('stale_or_future_rgb')
+    if rgb_target_span_s is None:
+        rgb_indices = ri[[-1 - rgb_stride, -1]]
+        rgb_selection = 'fixed_stride'
+    else:
+        rgb_target_span_s = float(rgb_target_span_s)
+        if (
+            not np.isfinite(rgb_target_span_s)
+            or not limits.min_rgb_pair_span_s
+            <= rgb_target_span_s
+            <= limits.max_rgb_pair_span_s
+        ):
+            raise ValueError(
+                'RGB target span must be finite and inside timing limits'
+            )
+        candidates = ri[:-1]
+        candidate_spans = anchor - rt[candidates]
+        eligible = (
+            (candidate_spans >= limits.min_rgb_pair_span_s)
+            & (candidate_spans <= limits.max_rgb_pair_span_s)
+        )
+        if not np.any(eligible):
+            raise ObservationUnavailable(
+                'rgb_cadence_mismatch: no causal RGB pair inside 30-75 ms'
+            )
+        candidates = candidates[eligible]
+        candidate_spans = candidate_spans[eligible]
+        older_index = int(
+            candidates[np.argmin(np.abs(candidate_spans - rgb_target_span_s))]
+        )
+        rgb_indices = np.asarray([older_index, anchor_index], dtype=np.int64)
+        rgb_selection = 'nearest_target_span'
     pair_span = float(np.diff(rt[rgb_indices])[0])
     if not limits.min_rgb_pair_span_s <= pair_span <= limits.max_rgb_pair_span_s:
         raise ObservationUnavailable('rgb_cadence_mismatch: expected about 50 ms between t-3 and t')
@@ -78,9 +111,14 @@ def select_context_window(rgb_times, ft_times, *, required_ft_history=41,
     expected_span = (required_ft_history - 1) / limits.ft_sample_hz
     if abs(span / expected_span - 1) > limits.ft_span_tolerance:
         raise ObservationUnavailable('ft_cadence_mismatch: expected native 100 Hz samples')
-    return rgb_indices, ft_indices, dict(
+    timing = dict(
         anchor_timestamp=anchor, rgb_pair_span_s=pair_span,
+        rgb_frame_index_gap=int(rgb_indices[1] - rgb_indices[0]),
+        rgb_selection=rgb_selection,
         ft_age_s=age, ft_history_span_s=span)
+    if rgb_target_span_s is not None:
+        timing['rgb_target_span_s'] = rgb_target_span_s
+    return rgb_indices, ft_indices, timing
 
 
 class TrainingImageTransform:
@@ -153,7 +191,8 @@ class RGBForceContextRuntime:
             device=str(self.device))
 
     def prepare(self, rgb_times, rgb_frames, ft_times, wrench_12d, *,
-                image_transform=None, episode_start=-np.inf, now=None, limits=None):
+                image_transform=None, episode_start=-np.inf, now=None, limits=None,
+                rgb_target_span_s=None):
         """Buffers contain every captured sample, not just prediction-rate samples.
 
         image_transform=None means frames are ALREADY preprocessed RGB uint8;
@@ -162,7 +201,8 @@ class RGBForceContextRuntime:
         ri, fi, timing = select_context_window(
             rgb_times, ft_times, required_ft_history=self.required_ft_history,
             rgb_stride=self.rgb_stride, max_force_age_s=self.max_force_age_s,
-            episode_start=episode_start, now=now, limits=limits)
+            episode_start=episode_start, now=now, limits=limits,
+            rgb_target_span_s=rgb_target_span_s)
         wrench = np.asarray(wrench_12d)
         if len(rgb_frames) != len(rgb_times) or wrench.shape != (len(ft_times), 12):
             raise ValueError('Sensor buffers have mismatched shapes')

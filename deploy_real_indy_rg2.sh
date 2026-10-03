@@ -28,6 +28,7 @@ RG2_SAVE_POLICY_INPUTS="${RG2_SAVE_POLICY_INPUTS:-1}"
 RG2_FT_MAX_AGE_SEC="${RG2_FT_MAX_AGE_SEC:-0.020}"
 VALVE_CLASSIFIER_CHECKPOINT="${VALVE_CLASSIFIER_CHECKPOINT:-}"
 VALVE_CLASSIFIER_DEVICE="${VALVE_CLASSIFIER_DEVICE:-auto}"
+VALVE_CLASSIFIER_ALLOW_OVERRIDE="${VALVE_CLASSIFIER_ALLOW_OVERRIDE:-0}"
 
 if [[ "$PYTHON_BIN" == */* ]]; then
   if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -121,6 +122,18 @@ if [[ -n "$VALVE_CLASSIFIER_CHECKPOINT" && -f "$VALVE_CLASSIFIER_CHECKPOINT" ]];
     --valve_classifier_checkpoint "$VALVE_CLASSIFIER_CHECKPOINT"
     --valve_classifier_device "$VALVE_CLASSIFIER_DEVICE"
   )
+  case "${VALVE_CLASSIFIER_ALLOW_OVERRIDE,,}" in
+    1|true|yes|on)
+      VALVE_CONTEXT_ARGS+=(--allow_valve_classifier_override)
+      echo "[warn] Explicit RGB/F-T classifier override enabled; policy observer SHA identity will differ."
+      ;;
+    0|false|no|off)
+      ;;
+    *)
+      echo "VALVE_CLASSIFIER_ALLOW_OVERRIDE must be 0/1 or true/false, got: $VALVE_CLASSIFIER_ALLOW_OVERRIDE" >&2
+      exit 2
+      ;;
+  esac
 elif [[ -n "$VALVE_CLASSIFIER_CHECKPOINT" ]]; then
   echo "[warn] valve classifier not found at $VALVE_CLASSIFIER_CHECKPOINT" >&2
   echo "[warn] this is fatal only when RG2_CHECKPOINT is a valve-context policy." >&2

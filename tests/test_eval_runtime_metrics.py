@@ -3,6 +3,7 @@ import numpy as np
 
 from eval_real_indy_rg2 import (
     _exec_actions_with_fresh_ft_guard,
+    _register_context_recovery_skip,
     _runtime_cycle_counts,
 )
 from umi.real_world.dual_ft_policy_safety import FTSafetyConfig, PolicySafetyError
@@ -80,6 +81,7 @@ def test_runtime_cycle_counts_separate_safety_rejection_from_dropped_observation
             "completed_cycles": 9,
             "valid_observations": 10,
             "safety_rejections": 1,
+            "context_recovery_skips": 0,
         }
     )
 
@@ -89,6 +91,7 @@ def test_runtime_cycle_counts_separate_safety_rejection_from_dropped_observation
         "valid_observation_cycles": 10,
         "dropped_cycles": 0,
         "safety_rejected_cycles": 1,
+        "context_recovery_skipped_cycles": 0,
     }
 
 
@@ -103,6 +106,71 @@ def test_runtime_cycle_counts_report_observation_failure_without_negative_drop()
     )
 
     assert counts["dropped_cycles"] == 1
+
+
+def test_runtime_cycle_counts_include_context_recovery_skip():
+    counts = _runtime_cycle_counts(
+        {
+            "attempted_cycles": 10,
+            "completed_cycles": 8,
+            "valid_observations": 10,
+            "safety_rejections": 1,
+            "context_recovery_skips": 1,
+        }
+    )
+
+    assert counts["context_recovery_skipped_cycles"] == 1
+
+
+def test_context_recovery_skip_holds_motion_and_is_bounded():
+    class Env:
+        def __init__(self):
+            self.hold_calls = 0
+
+        def hold_robot(self):
+            self.hold_calls += 1
+
+    env = Env()
+    metrics = {"context_recovery_skips": 0}
+    consecutive = 0
+    for _ in range(3):
+        consecutive = _register_context_recovery_skip(
+            env,
+            metrics,
+            plan_only=False,
+            consecutive_skips=consecutive,
+            reason="test anchor timeout",
+        )
+
+    assert consecutive == 3
+    assert metrics["context_recovery_skips"] == 3
+    assert env.hold_calls == 3
+    with pytest.raises(PolicySafetyError, match="exceeded 3"):
+        _register_context_recovery_skip(
+            env,
+            metrics,
+            plan_only=False,
+            consecutive_skips=consecutive,
+            reason="persistent timeout",
+        )
+    assert metrics["context_recovery_skips"] == 3
+    assert env.hold_calls == 4
+
+
+def test_context_recovery_skip_plan_only_does_not_hold_robot():
+    class Env:
+        def hold_robot(self):
+            raise AssertionError("plan-only recovery must not command the robot")
+
+    metrics = {"context_recovery_skips": 0}
+    assert _register_context_recovery_skip(
+        Env(),
+        metrics,
+        plan_only=True,
+        consecutive_skips=0,
+        reason="test warmup",
+    ) == 1
+    assert metrics["context_recovery_skips"] == 1
 
 
 def test_runtime_cycle_counts_reject_invalid_counter_ordering():

@@ -176,8 +176,27 @@ to `prepare`. For already processed replay-buffer/UmiEnv images, omit that
 argument. Apply bias correction exactly once upstream. Catch
 `ObservationUnavailable` to show an unavailable status; do not convert it into
 class 3, zero-valued F/T, or an old held prediction. Also verify the result's age
-after inference, as the standalone script does. Integrating these probabilities
-into a Stage B action policy requires a separate compatible policy loader.
+after inference, as the standalone script does.
+
+For the repository's four-state v2 Stage-B policy, `eval_real_indy_rg2.py`
+contains an explicit same-output adapter. Use
+`VALVE_CLASSIFIER_ALLOW_OVERRIDE=1` through `deploy_real_indy_rg2.sh`; without
+that opt-in, the policy checkpoint's original observer SHA remains mandatory.
+The override must be commissioned plan-only because its probability calibration
+can differ from the observer used to train Stage B.
+The adapter runs once per Stage-B policy cycle, not once per camera frame. It
+reads retained RGB/F/T history, verifies that the policy RGB timestamp and
+pixels match an exact retained frame, and selects the trained approximately
+50 ms RGB separation: `[t-3,t]` at 60 Hz, or the closest causal older frame
+when the shared stream is slower. The existing 30--75 ms safety gate remains
+enforced, and only the latest 41 native F/T samples at or before the exact
+policy anchor are used.
+
+After a transient RGB gap, at most three policy cycles are emitted with
+`context_valid=0`; each affected cycle holds pending waypoints and skips
+inference/command submission. Persistent cadence failure still stops the run.
+Because this observer is stateless, its full-policy path has no asynchronous
+worker and no exact-anchor wait timeout.
 
 ## 6. Logs and reproducing a prediction
 
