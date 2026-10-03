@@ -123,3 +123,8 @@ Use `RGBForceContextEncoder.from_checkpoint(payload)` to reconstruct it without
 downloading visual weights. Integrating its soft probabilities into Stage B
 requires adapting that policy's context model loader; the older loader is not
 compatible with this checkpoint schema.
+
+For live camera/RG2-FT observation, use `eval_real_context_rgb_force.py` and the
+[real-evaluation / checkpoint handoff guide](context_rgb_force_real_eval.md).
+The standalone observer restores this checkpoint, preserves native causal
+histories, and records predictions without sending robot/gripper commands.

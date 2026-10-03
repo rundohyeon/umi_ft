@@ -1,0 +1,28 @@
+# Passive classifier observer; no robot arm or gripper control connection.
+camera:
+  device: null  # Set --camera /dev/v4l/by-id/<your-camera>-video-index0
+  resolution: [1920, 1080]  # Match the camera/capture-card mode used during collection.
+  fps: 60
+  receive_latency: 0.125  # Seconds: calibrate on the destination computer.
+ft:
+  hostname: 192.168.2.1
+  port: 502
+  slave_id: 65
+  frequency: 100
+  receive_latency: 0.01  # Seconds: calibrate relative to the camera.
+  timeout: 0.5
+startup_bias:
+  sample_count: 200
+  timeout_s: 20.0
+  max_force_std_n: 0.35
+  max_torque_std_nm: 0.03
+  max_force_peak_to_peak_n: 1.5
+  max_torque_peak_to_peak_nm: 0.15
+aruco_config: slam_pipeline_latest/calibration/aruco_config.yaml
+timing:
+  max_rgb_age_s: 0.5
+  min_rgb_pair_span_s: 0.03
+  max_rgb_pair_span_s: 0.075
+  max_ft_gap_s: 0.025
+  ft_sample_hz: 100.0
+  ft_span_tolerance: 0.25

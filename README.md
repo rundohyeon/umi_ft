@@ -628,6 +628,55 @@ use the [RGB + F/T classifier training guide](docs/context_rgb_force_training.md
 It trains a frozen-CLIP / causal-F/T-CNN / small-Transformer classifier without
 TCP inputs, including a `torchrun` command for physical GPUs 2 and 3.
 
+### Real-robot evaluation of `context_encoder_best.pt` / `best.pt`
+
+Use **`eval_real_context_rgb_force.py`** for this trained RGB + native-F/T
+classifier. It observes a live camera and RG2-FT, displays four probabilities,
+and records predictions. It does not command the robot or gripper. This `.pt`
+is not an action-policy checkpoint for `eval_real_indy_rg2_dual_ft.py`.
+
+**Handoff to another computer / Codex:** fetch branch `umi_ft_context-3`, copy
+`outputs/context_rgb_force_4state_ft_features/context_encoder_best.pt` separately
+(renaming it `best.pt` is fine), and read
+[the real-evaluation guide](docs/context_rgb_force_real_eval.md). Checkpoints are
+ignored by Git. The checkpoint includes the full CLIP encoder, learned F/T
+normalization, and model settings; neither Qwen nor a Hugging Face cache nor the
+training dataset is needed for live inference.
+
+```bash
+# In the destination checkout; preserve any local work before switching branches.
+git fetch origin
+git switch umi_ft_context-3
+git pull --ff-only origin umi_ft_context-3
+conda activate umi
+
+# Copy the trained file to checkpoints/context_rgb_force/best.pt first.
+# Hardware-free check; no camera or Modbus connection.
+HF_HUB_OFFLINE=1 python eval_real_context_rgb_force.py \
+  --checkpoint checkpoints/context_rgb_force/best.pt --mode self-test --device cpu
+
+# Replace the camera path with the destination computer's device.
+# Physical GPU 2 is visible as cuda:0; GPU 3 can be selected instead.
+CUDA_VISIBLE_DEVICES=2 HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 \
+python eval_real_context_rgb_force.py \
+  --checkpoint checkpoints/context_rgb_force/best.pt \
+  --config example/eval_context_rgb_force.yaml \
+  --camera /dev/v4l/by-id/YOUR_CAMERA-video-index0 \
+  --gripper-ip 192.168.2.1 --device cuda:0 --save-inputs
+```
+
+Before live startup, keep both fingers unloaded and stationary for software
+bias calibration. Configure camera resolution and measured sensor latencies in
+`example/eval_context_rgb_force.yaml`. Inputs are RGB `[t-3,t]` at approximately
+60 FPS and the latest 41 native 100 Hz F/T samples **at or before the RGB time**,
+in each finger's sensor frame, N/Nm. Mean/delta features are calculated inside
+the model; do not smooth or normalize the inputs again. No TCP input is used.
+Class IDs are **0 approach / 1 turning / 2 recovery / 3 error** (`recovery`, not
+Qwen's `finish`). Missing or stale data yields `valid=false`, not an `error`
+class prediction. Results go to `outputs/context_real_eval/<timestamp>/`.
+
+### Separate Qwen weak-labeling pipeline
+
 The configurable context pipeline adds local offline Qwen-VL weak labeling, human
 playback/review, a small causal Transformer, and soft residual conditioning of
 the existing dual-F/T diffusion policy. It is separate from the four-state valve
