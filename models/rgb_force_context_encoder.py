@@ -11,6 +11,7 @@ from diffusion_policy.context.ft_features import causal_ft_features, ft_feature_
 
 class RGBForceContextEncoder(nn.Module):
     input_keys = ('camera0_rgb', 'robot0_ft_left', 'robot0_ft_right')
+    supported_rgb_horizons = (2, 4)
 
     def __init__(self, model_name='vit_base_patch16_clip_224.openai',
                  hidden_dim=128, num_layers=2, num_heads=4,
@@ -18,8 +19,10 @@ class RGBForceContextEncoder(nn.Module):
                  ft_horizon=32, num_classes=4, pretrained=True,
                  ft_feature_mode='raw', ft_mean_window=5, ft_delta_lag=5):
         super().__init__()
-        if ft_horizon != 32 or rgb_horizon != 2 or num_classes != 4:
-            raise ValueError('This context contract requires RGB=2, F/T=32, classes=4')
+        if ft_horizon != 32 or rgb_horizon not in self.supported_rgb_horizons or num_classes != 4:
+            raise ValueError(f'This context contract requires RGB in {self.supported_rgb_horizons}, F/T=32, classes=4')
+        self.rgb_horizon = int(rgb_horizon)
+        self.num_tokens = self.rgb_horizon + 3  # RGB + left F/T + right F/T + query
         self.config = dict(model_name=model_name, hidden_dim=hidden_dim,
             num_layers=num_layers, num_heads=num_heads, feedforward_dim=feedforward_dim,
             dropout=dropout, rgb_horizon=rgb_horizon, ft_horizon=ft_horizon,
@@ -43,7 +46,7 @@ class RGBForceContextEncoder(nn.Module):
         self.left_force = CausalFTEncoder(input_dim=self.ft_channels, output_dim=hidden_dim)
         self.right_force = CausalFTEncoder(input_dim=self.ft_channels, output_dim=hidden_dim)
         self.modality = nn.Parameter(torch.randn(3, hidden_dim) * 0.02)
-        self.position = nn.Parameter(torch.randn(1, 5, hidden_dim) * 0.02)
+        self.position = nn.Parameter(torch.randn(1, self.num_tokens, hidden_dim) * 0.02)
         self.query = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         layer = nn.TransformerEncoderLayer(hidden_dim, num_heads, feedforward_dim,
             dropout, batch_first=True, norm_first=True)
@@ -72,13 +75,13 @@ class RGBForceContextEncoder(nn.Module):
     def forward(self, obs):
         rgb, left, right = (obs[k] for k in self.input_keys)
         batch = rgb.shape[0]
-        if tuple(rgb.shape[1:]) != (2, 3, 224, 224):
-            raise ValueError('RGB must be [B,2,3,224,224], in [0,1]')
+        if tuple(rgb.shape[1:]) != (self.rgb_horizon, 3, 224, 224):
+            raise ValueError(f'RGB must be [B,{self.rgb_horizon},3,224,224], in [0,1]')
         if tuple(left.shape) != (batch, self.required_ft_history, 6) or right.shape != left.shape:
             raise ValueError(f'Each native F/T history must be [B,{self.required_ft_history},6]')
         with torch.no_grad():
             images = (rgb.flatten(0, 1) - self.rgb_mean) / self.rgb_std
-            visual = self.vision(images).reshape(batch, 2, -1)
+            visual = self.vision(images).reshape(batch, self.rgb_horizon, -1)
         visual = self.visual_projection(visual) + self.modality[0]
         left = (self.force_features(left) - self.ft_mean[:self.ft_channels]) / self.ft_std[:self.ft_channels]
         right = (self.force_features(right) - self.ft_mean[self.ft_channels:]) / self.ft_std[self.ft_channels:]
@@ -88,7 +91,7 @@ class RGBForceContextEncoder(nn.Module):
         # to both RGB observations and both force-history summaries.
         tokens = torch.cat([visual, force_left, force_right,
                             self.query.expand(batch, -1, -1)], dim=1) + self.position
-        mask = torch.ones(5, 5, dtype=torch.bool, device=tokens.device).triu(1)
+        mask = torch.ones(self.num_tokens, self.num_tokens, dtype=torch.bool, device=tokens.device).triu(1)
         return self.classifier(self.transformer(tokens, mask=mask)[:, -1])
 
     @classmethod

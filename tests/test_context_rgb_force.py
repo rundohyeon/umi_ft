@@ -10,8 +10,9 @@ from diffusion_policy.context.ft_features import causal_ft_features
 
 
 @pytest.fixture
-def canonical_files(tmp_path):
-    episodes, per_episode, force_per_episode = 12, 8, 16
+def canonical_files(tmp_path, request):
+    episodes, per_episode = 12, getattr(request, 'param', 8)
+    force_per_episode = max(16, int(np.ceil(per_episode * 100 / 60)) + 2)
     n = episodes * per_episode
     ends = np.arange(1, episodes + 1) * per_episode
     force_ends = np.arange(1, episodes + 1) * force_per_episode
@@ -33,7 +34,7 @@ def canonical_files(tmp_path):
         'data/wrench_12d': np.arange(episodes*force_per_episode*12, dtype=np.float32).reshape(-1,12)}
     for key, values in arrays.items():
         force.create_dataset(key, data=values)
-    targets = np.tile(np.repeat(np.arange(4), 2), episodes)
+    targets = np.tile(np.arange(per_episode) * 4 // per_episode, episodes)
     valid = np.ones(n, dtype=np.uint8); valid[3] = 0
     np.savez(label_path, schema='valve_context_manual_v12_supervision_v2_4state',
         training_eligible=True, phase_names=['approach','turning','recovery','error'],

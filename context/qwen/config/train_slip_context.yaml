@@ -1,0 +1,47 @@
+# Separate slip taxonomy; old 284-episode checkpoints remain unchanged.
+dataset:
+  dataset_path: /home/metafarmers/dkim/data/slip_processed_context/dataset.zarr.zip
+  force_sidecar_path: /home/metafarmers/dkim/data/slip_processed_context/dataset_force_sidecar.zarr
+  label_path: /home/metafarmers/dkim/data/slip_processed_context/state_labels_v2.npz
+  rgb_horizon: 8
+  rgb_span_s: 1.0
+  history_steps: 10
+  history_stride: 6
+  anchor_stride: 6
+  max_force_age_s: 0.012
+model:
+  model_name: vit_base_patch16_clip_224.openai
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 4
+  feedforward_dim: 256
+  dropout: 0.1
+  rgb_horizon: ${dataset.rgb_horizon}
+  rgb_span_s: ${dataset.rgb_span_s}
+  ft_horizon: 32
+  ft_feature_mode: raw_mean_delta
+  ft_mean_window: 5
+  ft_delta_lag: 5
+  num_classes: 4
+  history_steps: ${dataset.history_steps}
+  history_period_s: 0.1001
+  history_hidden: 64
+  history_dropout: 0.2
+  history_noise: 0.1
+seed: 260910
+validation_ratio: 0.15
+test_ratio: 0.15
+epochs: 100
+batch_size: 8  # Per GPU, 11 observation anchors x 8 synchronized RGB/F/T pairs.
+num_workers: 4
+cpu_threads: 2
+learning_rate: 0.0003
+weight_decay: 0.0001
+max_grad_norm: 1.0
+auxiliary_loss_weight: 0.5
+amp: true
+device: cuda
+log_every: 100
+cache_batch_size: 64
+cache_dir: outputs/slip_clip_features
+output_dir: outputs/slip_context_rgb8_1s_history10

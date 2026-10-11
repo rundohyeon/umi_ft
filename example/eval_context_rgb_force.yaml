@@ -21,8 +21,10 @@ startup_bias:
 aruco_config: slam_pipeline_latest/calibration/aruco_config.yaml
 timing:
   max_rgb_age_s: 0.5
+  # Pair limits apply to legacy two-image checkpoints.
   min_rgb_pair_span_s: 0.03
   max_rgb_pair_span_s: 0.075
+  max_rgb_target_error_s: 0.025  # Four-image checkpoints: error from each 0.5 s window target.
   max_ft_gap_s: 0.025
   ft_sample_hz: 100.0
   ft_span_tolerance: 0.25

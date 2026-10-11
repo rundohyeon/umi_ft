@@ -482,9 +482,9 @@ Inside the deployment container:
 The override adapter runs once per policy cycle from retained sensor history;
 it does not run a competing camera-rate classifier worker. It requires the
 policy RGB timestamp and pixels to match an exact retained camera frame, then
-selects the older frame closest to the trained approximately 50 ms separation.
-At 60 Hz this is `[t-3,t]`; a slower effective camera cadence is accepted only
-inside the original 30--75 ms timing gate. The adapter also uses the latest 41
+selects the temporal offsets saved in the classifier checkpoint. Four-image v3
+uses a 0.5 s window (25 ms tolerance per image); legacy two-image checkpoints
+use a 50 ms pair inside the original 30--75 ms timing gate. The adapter also uses the latest 41
 causal native F/T samples and the checkpoint's learned normalization. Future
 RGB/F/T samples are excluded. TCP pose and gripper width are not passed to this
 observer.
@@ -671,6 +671,33 @@ For the labelled 284-episode **approach / turning / recovery / error** dataset,
 use the [RGB + F/T classifier training guide](docs/context_rgb_force_training.md).
 It trains a frozen-CLIP / causal-F/T-CNN / small-Transformer classifier without
 TCP inputs, including a `torchrun` command for physical GPUs 2 and 3.
+The current training config uses **four RGB images over 0.5 s**
+(`[t-30,t-20,t-10,t]` at about 60 FPS), batch size 16 per GPU, and output
+`outputs/context_rgb_force_4frame_500ms/`. F/T remains 41 native samples.
+This produces a new `context_rgb_force_4frame_v3` checkpoint after retraining;
+the existing `best.pt` continues to use its saved two-image configuration.
+
+
+### Slip context with synchronized RGB/F/T and probability history
+
+The separate `train_slip_context.py` trainer uses the 289 reviewed episodes in
+`/home/metafarmers/dkim/data/slip_processed_context` with class order
+**approach / error1 / error2 / turning**. The current configuration pairs each of
+eight RGB frames over ~1 second with that image's own causal 41-sample native F/T
+window, then adds a GRU over 10 past observation-model probability vectors
+(~1 second at 10 Hz). Initial sensor warmup is ~1.4 seconds; history fills gradually.
+Ignore frames are excluded from both targets and all observation windows.
+
+Use `context/qwen/config/train_slip_context.yaml`. Prepare the frozen CLIP cache
+with `train_slip_context.py --prepare-cache-only`, then train with
+`train_slip_context.py`; both support two-rank torchrun on physical GPUs 2 and 3.
+Results go to `outputs/slip_context_rgb8_1s_history10/best.pt`. The existing frame
+feature cache is reusable. Earlier four-image checkpoints under
+`outputs/slip_context_sequence` still load with their saved settings, but are not
+resumable as eight-image training runs. This model has a separate checkpoint
+schema and class order; use `SlipTemporalContextRuntime` for inference, not the
+older A/T/R/E observer adapter. Full commands, data filtering, live API, and
+handoff details are in [the slip context guide](docs/slip_temporal_context.md).
 
 ### Frame-by-frame RGB / F/T debugging and label review
 
@@ -736,8 +763,8 @@ python eval_real_context_rgb_force.py \
 
 Before live startup, keep both fingers unloaded and stationary for software
 bias calibration. Configure camera resolution and measured sensor latencies in
-`example/eval_context_rgb_force.yaml`. Inputs are RGB `[t-3,t]` at approximately
-60 FPS and the latest 41 native 100 Hz F/T samples **at or before the RGB time**,
+`example/eval_context_rgb_force.yaml`. Inputs follow the checkpoint: four RGB frames `[t-30,t-20,t-10,t]` over
+0.5 s for v3, or legacy `[t-3,t]` over 50 ms, at approximately 60 FPS and the latest 41 native 100 Hz F/T samples **at or before the RGB time**,
 in each finger's sensor frame, N/Nm. Mean/delta features are calculated inside
 the model; do not smooth or normalize the inputs again. No TCP input is used.
 Class IDs are **0 approach / 1 turning / 2 recovery / 3 error** (`recovery`, not

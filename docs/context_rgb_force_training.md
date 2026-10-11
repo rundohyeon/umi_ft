@@ -5,10 +5,16 @@ This Stage A classifier uses the existing labelled 284-episode dataset in
 It uses no TCP position/orientation, gripper width, action targets, Qwen labels,
 or model-predicted context sidecar. The action policy is not trained here.
 
+The default configuration now trains four RGB images over 0.5 seconds. Labels
+still describe the latest frame, not a vote over the window. Near episode start,
+RGB indices repeat the first frame instead of crossing into the previous episode.
+F/T remains 41 raw native samples (about 0.4 seconds), with the same 18 features
+per finger. Use `--set epochs=100` if a 100-epoch run is desired.
+
 ## Architecture and observations
 
-- RGB: two 224x224 observations at `[t-3, t]` on the RGB frame grid (about
-  50 ms apart). Frozen pretrained `vit_base_patch16_clip_224.openai` produces
+- RGB: four 224x224 observations at `[t-30,t-20,t-10,t]` on the RGB frame grid
+  (about 0.5 seconds total at 59.94/60 FPS). Frozen pretrained `vit_base_patch16_clip_224.openai` produces
   768-D features, followed by a trainable projection to 128. Normalization
   uses the pretrained model's CLIP mean/std. No task-trained visual checkpoint
   is used to initialize the model.
@@ -32,10 +38,10 @@ or model-predicted context sidecar. The action policy is not trained here.
 - Left and right use independent `CausalFTEncoder` CNNs with 18 input channels. Five
   stride-two layers summarize all 32 feature timesteps into one 128-D token each.
   This is learned from the context labels; the F/T CNNs have no pretrained weights.
-- Two image tokens, two force-history tokens, and a terminal query enter a
+- Four image tokens, two force-history tokens, and a terminal query (7 total) enter a
   two-layer, four-head Transformer with hidden size 128 and FFN size 256.
   The final query produces four logits. Softmax gives four context probabilities.
-- Trainable parameters: 475,492. Frozen visual parameters: 85,799,424.
+- Trainable parameters: 475,748. Frozen visual parameters: 85,799,424.
   Both the CLIP weights and F/T normalization buffers are included in checkpoints.
 
 ## Data and supervision
@@ -83,20 +89,20 @@ CUDA_VISIBLE_DEVICES=2,3 HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 \
 ```
 
 `torchrun` launches one DDP process per GPU. Visible `cuda:0` maps to physical
-GPU 2 and `cuda:1` maps to physical GPU 3. Defaults are 30 epochs, 32 examples
-per GPU (global batch 64), AdamW learning rate 3e-4, and bfloat16 mixed
+GPU 2 and `cuda:1` maps to physical GPU 3. Defaults are 30 epochs, 16 examples
+per GPU (global batch 32), AdamW learning rate 3e-4, and bfloat16 mixed
 precision. CLIP weights are already present in the local Hugging Face cache;
 offline mode fails rather than silently initializing random visual weights.
 
 The script refuses to overwrite an existing nonempty output directory. To
-start a separate run, append `--set output_dir=outputs/context_rgb_force_4state_ft_features_run2`.
+start a separate run, append `--set output_dir=outputs/context_rgb_force_4frame_500ms_run2`.
 To continue the same run, append:
 
 ```bash
---resume outputs/context_rgb_force_4state_ft_features/context_encoder_last.pt
+--resume outputs/context_rgb_force_4frame_500ms/context_encoder_last.pt
 ```
 
-The main artifacts in `outputs/context_rgb_force_4state_ft_features/` are:
+The main artifacts in `outputs/context_rgb_force_4frame_500ms/` are:
 
 - `context_encoder_best.pt`, `context_encoder_last.pt`: complete model,
   optimizer, architecture, normalization, epoch, labels/splits, and config.
@@ -112,10 +118,11 @@ cannot resume a full training run. A CPU-only data check is available with
 `--dry-run --set device=cpu --set output_dir=/tmp/context_rgb_force_data_check`.
 
 The feature mode, mean window, lag, input shapes, and normalization are saved
-with the new `context_rgb_force_4state_ft_features_v2` checkpoint. It requires
-a new training run; the old six-channel F/T checkpoint cannot resume this
-18-channel model. Old raw-only checkpoints still reconstruct their original
-32-by-6 observation contract. Dataset/model feature settings must agree, and
+with the new `context_rgb_force_4frame_v3` checkpoint, including RGB horizon 4,
+stride 10, and 0.5-second coverage. This requires a new training run: a two-image
+checkpoint cannot resume four-image training. Existing v1/v2 checkpoints still
+restore their original two-image models; the old epoch-123 best.pt is unchanged.
+Old raw-only checkpoints also retain their 32-by-6 F/T observation contract. Dataset/model feature settings must agree, and
 resume validation happens before replacing any saved run metadata.
 
 This classifier is separate from the earlier pooled-RGB `ContextEncoder`.

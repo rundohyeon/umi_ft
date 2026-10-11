@@ -16,43 +16,61 @@ from diffusion_policy.context.ft_features import causal_ft_features, ft_feature_
 
 
 PHASE_NAMES = ('approach', 'turning', 'recovery', 'error')
+SLIP_PHASE_NAMES = ('approach', 'error1', 'error2', 'turning')
 
 
 class CanonicalRGBForceDataset(Dataset):
     def __init__(self, dataset_path, force_sidecar_path, label_path,
                  rgb_stride=3, ft_history=32, max_force_age_s=0.012,
                  rule_label_weight=0.3, manual_label_weight=1.0,
-                 ft_feature_mode='raw', ft_mean_window=5, ft_delta_lag=5):
+                 ft_feature_mode='raw', ft_mean_window=5, ft_delta_lag=5, rgb_horizon=2,
+                 label_contract='canonical'):
         register_codecs()
         self.dataset_path = str(Path(dataset_path).resolve())
         self.force_sidecar_path = str(Path(force_sidecar_path).resolve())
         self.label_path = str(Path(label_path).resolve())
         self.rgb_stride, self.ft_history = int(rgb_stride), int(ft_history)
+        self.rgb_horizon = int(rgb_horizon)
+        supported_rgb = (2, 4, 8) if label_contract == 'slip' else (2, 4)
+        if self.rgb_horizon not in supported_rgb:
+            raise ValueError(f'RGB horizon must be in {supported_rgb}')
         self.ft_contract = ft_feature_contract(ft_feature_mode, ft_mean_window, ft_delta_lag)
         self.required_ft_history = self.ft_history + self.ft_contract['prefix_samples']
         if self.rgb_stride < 1 or self.ft_history != 32:
             raise ValueError('Require positive RGB stride and 32 native F/T samples')
         if max_force_age_s <= 0 or rule_label_weight <= 0 or manual_label_weight <= 0:
             raise ValueError('Force age and source weights must be positive')
+        if label_contract not in ('canonical', 'slip'):
+            raise ValueError('Unknown label contract')
+        self.phase_names = SLIP_PHASE_NAMES if label_contract == 'slip' else PHASE_NAMES
+        schema = ('umi_manual_314_approach_error1_error2_turning_v2' if label_contract == 'slip'
+                  else 'valve_context_manual_v12_supervision_v2_4state')
         with np.load(self.label_path, allow_pickle=False) as labels:
-            if str(labels['schema']) != 'valve_context_manual_v12_supervision_v2_4state':
+            if str(labels['schema']) != schema:
                 raise ValueError('Unexpected canonical label schema')
             if not bool(labels['training_eligible']):
                 raise ValueError('Labels are not eligible for training')
-            if tuple(labels['phase_names'].tolist()) != PHASE_NAMES:
-                raise ValueError('Expected approach/turning/recovery/error in that order')
+            if tuple(labels['phase_names'].tolist()) != self.phase_names:
+                raise ValueError(f'Expected classes in this order: {self.phase_names}')
             self.targets = labels['state_phase'].astype(np.int64)
             raw_valid = labels['state_phase_valid']
             if not np.isin(raw_valid, [0, 1]).all():
                 raise ValueError('Label validity must be binary')
             self.valid = raw_valid.astype(bool)
-            self.label_source = labels['state_label_source'].astype(np.int64)
-            self.source_names = labels['label_source_names'].tolist()
+            if label_contract == 'slip':
+                if not np.array_equal(self.valid, self.targets >= 0):
+                    raise ValueError('Slip label mask must exclude every ignore frame')
+                self.label_source = np.ones(len(self.targets), dtype=np.int64)
+                self.source_names = ['unused', 'approved_slip_review']
+                self.original_episode_numbers = labels['original_episode_numbers'].copy()
+            else:
+                self.label_source = labels['state_label_source'].astype(np.int64)
+                self.source_names = labels['label_source_names'].tolist()
             self.rgb_times = labels['rgb_timestamp_s'].astype(np.float64)
             self.rgb_ends = labels['rgb_episode_ends'].astype(np.int64)
             source_episode = labels['source_episode'].copy()
             approved = labels['episode_is_approved'].astype(bool)
-        if self.source_names != ['v12_001_193', 'manual_194_214', 'manual_215_284']:
+        if label_contract == 'canonical' and self.source_names != ['v12_001_193', 'manual_194_214', 'manual_215_284']:
             raise ValueError('Unknown label provenance; source weighting must be explicit')
         n = len(self.rgb_times)
         if any(a.shape != (n,) for a in (self.targets, self.valid, self.label_source)):
@@ -129,6 +147,8 @@ class CanonicalRGBForceDataset(Dataset):
                 raise ValueError('Stored force ages disagree with timestamps')
         self.usable = (self.valid & force_valid & (self.force_index >= 0)
                        & np.isfinite(force_age) & (force_age >= 0) & (force_age <= max_force_age_s))
+        self.force_available = (force_valid & (self.force_index >= 0) & np.isfinite(force_age)
+                                & (force_age >= 0) & (force_age <= max_force_age_s))
         self.sample_weights = np.where(self.label_source == 0, rule_label_weight,
                                        manual_label_weight).astype(np.float32)
         self.indices = np.flatnonzero(self.usable)
@@ -177,7 +197,8 @@ class CanonicalRGBForceDataset(Dataset):
 
     def history_indices(self, frame):
         ep = self.frame_episode[frame]
-        rgb = np.maximum([frame - self.rgb_stride, frame], self.rgb_starts[ep])
+        rgb = np.maximum(frame - np.arange(self.rgb_horizon - 1, -1, -1) * self.rgb_stride,
+                         self.rgb_starts[ep])
         latest = self.force_index[frame]
         if latest < self.force_starts[ep]:
             raise ValueError('Anchor has no causal force measurement')

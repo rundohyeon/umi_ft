@@ -12,7 +12,8 @@ from models.rgb_force_context_encoder import RGBForceContextEncoder
 
 
 PHASE_NAMES = ('approach', 'turning', 'recovery', 'error')
-SCHEMAS = ('context_rgb_force_4state_v1', 'context_rgb_force_4state_ft_features_v2')
+SCHEMAS = ('context_rgb_force_4state_v1', 'context_rgb_force_4state_ft_features_v2',
+           'context_rgb_force_4frame_v3')
 
 
 class ObservationUnavailable(ValueError):
@@ -25,6 +26,7 @@ class TimingLimits:
     max_rgb_age_s: float = 0.5
     min_rgb_pair_span_s: float = 0.03
     max_rgb_pair_span_s: float = 0.075
+    max_rgb_target_error_s: float = 0.025  # Per-image tolerance for the 0.5 s four-frame window.
     max_ft_gap_s: float = 0.025
     ft_sample_hz: float = 100.0
     ft_span_tolerance: float = 0.25
@@ -46,56 +48,81 @@ def _timestamps(values, name):
 def select_context_window(rgb_times, ft_times, *, required_ft_history=41,
                           rgb_stride=3, max_force_age_s=0.012,
                           episode_start=-np.inf, now=None, limits=None,
-                          rgb_target_span_s=None):
+                          rgb_target_span_s=None, rgb_horizon=2):
     """Select native samples, never interpolate, resample, or include future F/T.
 
     Live startup waits for a full window instead of repeating startup samples.
     Indices refer to the supplied buffers. Both buffers must use the same clock.
-    A target span selects the closest safe causal pair; None preserves t-stride.
+    A target span selects frames near causal time offsets; None uses fixed strides.
     """
     limits = limits or TimingLimits()
     rt, ft = _timestamps(rgb_times, 'RGB'), _timestamps(ft_times, 'F/T')
     ri = np.flatnonzero(rt >= episode_start)
-    if len(ri) < rgb_stride + 1:
+    if rgb_horizon not in (2, 4) or rgb_stride < 1:
+        raise ValueError('Unsupported RGB history')
+    needed = ((rgb_horizon - 1) * rgb_stride + 1 if rgb_target_span_s is None
+              else (rgb_stride + 1 if rgb_horizon == 2 else rgb_horizon))
+    if len(ri) < needed:
         raise ObservationUnavailable('warming_up_rgb')
     anchor_index = int(ri[-1])
     anchor = float(rt[anchor_index])
     if now is not None and (now < anchor or now - anchor > limits.max_rgb_age_s):
         raise ObservationUnavailable('stale_or_future_rgb')
-    if rgb_target_span_s is None:
-        rgb_indices = ri[[-1 - rgb_stride, -1]]
-        rgb_selection = 'fixed_stride'
+    if rgb_horizon == 4:
+        span_target = 0.5
+        if rgb_stride != 10 or (rgb_target_span_s is not None and
+                               not np.isclose(rgb_target_span_s, span_target, atol=1e-9, rtol=0)):
+            raise ValueError('Four RGB frames require stride=10 and total span=0.5 s')
+        targets = anchor - np.linspace(span_target, 0.0, rgb_horizon)
+        if rgb_target_span_s is None:
+            rgb_indices = ri[-1 - np.arange(rgb_horizon - 1, -1, -1) * rgb_stride]
+            rgb_selection = 'fixed_stride'
+        else:
+            if anchor - rt[ri[0]] < span_target - 1e-6:
+                raise ObservationUnavailable('warming_up_rgb')
+            # The policy path may retain a lower effective frame rate. Select
+            # four distinct observations near the same training-time offsets.
+            rgb_indices = np.asarray([ri[np.argmin(np.abs(rt[ri] - t))] for t in targets])
+            rgb_selection = 'nearest_target_span'
+        if (np.any(np.diff(rgb_indices) <= 0) or
+                np.max(np.abs(rt[rgb_indices] - targets)) > limits.max_rgb_target_error_s + 1e-9):
+            raise ObservationUnavailable('rgb_cadence_mismatch: four frames must cover 0.5 s at uniform offsets')
+        pair_span = float(anchor - rt[rgb_indices[0]])
     else:
-        rgb_target_span_s = float(rgb_target_span_s)
-        if (
-            not np.isfinite(rgb_target_span_s)
-            or not limits.min_rgb_pair_span_s
-            <= rgb_target_span_s
-            <= limits.max_rgb_pair_span_s
-        ):
-            raise ValueError(
-                'RGB target span must be finite and inside timing limits'
+        if rgb_target_span_s is None:
+            rgb_indices = ri[[-1 - rgb_stride, -1]]
+            rgb_selection = 'fixed_stride'
+        else:
+            rgb_target_span_s = float(rgb_target_span_s)
+            if (
+                not np.isfinite(rgb_target_span_s)
+                or not limits.min_rgb_pair_span_s
+                <= rgb_target_span_s
+                <= limits.max_rgb_pair_span_s
+            ):
+                raise ValueError(
+                    'RGB target span must be finite and inside timing limits'
+                )
+            candidates = ri[:-1]
+            candidate_spans = anchor - rt[candidates]
+            eligible = (
+                (candidate_spans >= limits.min_rgb_pair_span_s)
+                & (candidate_spans <= limits.max_rgb_pair_span_s)
             )
-        candidates = ri[:-1]
-        candidate_spans = anchor - rt[candidates]
-        eligible = (
-            (candidate_spans >= limits.min_rgb_pair_span_s)
-            & (candidate_spans <= limits.max_rgb_pair_span_s)
-        )
-        if not np.any(eligible):
-            raise ObservationUnavailable(
-                'rgb_cadence_mismatch: no causal RGB pair inside 30-75 ms'
+            if not np.any(eligible):
+                raise ObservationUnavailable(
+                    'rgb_cadence_mismatch: no causal RGB pair inside 30-75 ms'
+                )
+            candidates = candidates[eligible]
+            candidate_spans = candidate_spans[eligible]
+            older_index = int(
+                candidates[np.argmin(np.abs(candidate_spans - rgb_target_span_s))]
             )
-        candidates = candidates[eligible]
-        candidate_spans = candidate_spans[eligible]
-        older_index = int(
-            candidates[np.argmin(np.abs(candidate_spans - rgb_target_span_s))]
-        )
-        rgb_indices = np.asarray([older_index, anchor_index], dtype=np.int64)
-        rgb_selection = 'nearest_target_span'
-    pair_span = float(np.diff(rt[rgb_indices])[0])
-    if not limits.min_rgb_pair_span_s <= pair_span <= limits.max_rgb_pair_span_s:
-        raise ObservationUnavailable('rgb_cadence_mismatch: expected about 50 ms between t-3 and t')
+            rgb_indices = np.asarray([older_index, anchor_index], dtype=np.int64)
+            rgb_selection = 'nearest_target_span'
+        pair_span = float(np.diff(rt[rgb_indices])[0])
+        if not limits.min_rgb_pair_span_s <= pair_span <= limits.max_rgb_pair_span_s:
+            raise ObservationUnavailable('rgb_cadence_mismatch: expected about 50 ms between t-3 and t')
     start = int(np.searchsorted(ft, episode_start, side='left'))
     end = int(np.searchsorted(ft, anchor, side='right'))
     if end - start < required_ft_history:
@@ -113,7 +140,8 @@ def select_context_window(rgb_times, ft_times, *, required_ft_history=41,
         raise ObservationUnavailable('ft_cadence_mismatch: expected native 100 Hz samples')
     timing = dict(
         anchor_timestamp=anchor, rgb_pair_span_s=pair_span,
-        rgb_frame_index_gap=int(rgb_indices[1] - rgb_indices[0]),
+        rgb_frame_index_gap=int(rgb_indices[-1] - rgb_indices[0]),
+        rgb_horizon=rgb_horizon, rgb_span_s=pair_span,
         rgb_selection=rgb_selection,
         ft_age_s=age, ft_history_span_s=span)
     if rgb_target_span_s is not None:
@@ -170,8 +198,15 @@ class RGBForceContextRuntime:
             raise ValueError('Checkpoint classes must be approach/turning/recovery/error in that order')
         dataset_cfg = payload['training_config']['dataset']
         self.rgb_stride = int(dataset_cfg['rgb_stride'])
+        self.rgb_horizon = int(payload['model_config'].get('rgb_horizon', 2))
+        if (self.rgb_horizon not in (2, 4) or
+                dataset_cfg.get('rgb_horizon', 2) != self.rgb_horizon or
+                (payload['schema'] == 'context_rgb_force_4frame_v3') != (self.rgb_horizon == 4)):
+            raise ValueError('Checkpoint RGB schema/model/dataset contracts differ')
+        self.required_rgb_history = (self.rgb_horizon - 1) * self.rgb_stride + 1
+        self.rgb_history_span_s = (self.required_rgb_history - 1) / 60.0
         self.max_force_age_s = float(dataset_cfg['max_force_age_s'])
-        if self.rgb_stride != 3 or not 0 < self.max_force_age_s <= 0.012:
+        if self.rgb_stride != (10 if self.rgb_horizon == 4 else 3) or not 0 < self.max_force_age_s <= 0.012:
             raise ValueError('Unsupported training time alignment contract')
         self.device = torch.device(device)
         self.model = RGBForceContextEncoder.from_checkpoint(payload).eval().requires_grad_(False)
@@ -187,6 +222,8 @@ class RGBForceContextRuntime:
             best_validation_macro_f1=payload.get('best_validation_macro_f1'),
             model_config=self.model.config, required_ft_history=self.required_ft_history,
             rgb_stride=self.rgb_stride, max_force_age_s=self.max_force_age_s,
+            rgb_horizon=self.rgb_horizon, rgb_history_span_s=self.rgb_history_span_s,
+            required_rgb_history=self.required_rgb_history,
             ft_channel_order=['Fx', 'Fy', 'Fz', 'Tx', 'Ty', 'Tz'],
             device=str(self.device))
 
@@ -202,7 +239,7 @@ class RGBForceContextRuntime:
             rgb_times, ft_times, required_ft_history=self.required_ft_history,
             rgb_stride=self.rgb_stride, max_force_age_s=self.max_force_age_s,
             episode_start=episode_start, now=now, limits=limits,
-            rgb_target_span_s=rgb_target_span_s)
+            rgb_target_span_s=rgb_target_span_s, rgb_horizon=self.rgb_horizon)
         wrench = np.asarray(wrench_12d)
         if len(rgb_frames) != len(rgb_times) or wrench.shape != (len(ft_times), 12):
             raise ValueError('Sensor buffers have mismatched shapes')
@@ -218,14 +255,14 @@ class RGBForceContextRuntime:
 
     @torch.inference_mode()
     def predict(self, obs):
-        """Two uint8 HWC RGB images + two float [41,6] histories -> class softmax.
+        """Checkpoint-sized uint8 RGB history + two float [41,6] histories -> softmax.
 
         Raw-only v1 checkpoints use 32 F/T samples. No threshold, phase smoothing,
         or automatic unknown/finish relabeling is applied to these four classes.
         """
         rgb = np.asarray(obs['camera0_rgb'])
-        if rgb.shape != (2, 224, 224, 3) or rgb.dtype != np.uint8:
-            raise ValueError('camera0_rgb must be preprocessed uint8 [2,224,224,3] RGB')
+        if rgb.shape != (self.rgb_horizon, 224, 224, 3) or rgb.dtype != np.uint8:
+            raise ValueError(f'camera0_rgb must be preprocessed uint8 [{self.rgb_horizon},224,224,3] RGB')
         tensors = dict(camera0_rgb=torch.from_numpy(np.ascontiguousarray(rgb.transpose(0, 3, 1, 2)))
                        .unsqueeze(0).to(self.device, dtype=torch.float32) / 255.0)
         for key in ('robot0_ft_left', 'robot0_ft_right'):
