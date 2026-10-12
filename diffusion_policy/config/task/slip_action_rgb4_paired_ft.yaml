@@ -1,0 +1,68 @@
+name: slip_action_rgb4_paired_ft
+dataset_path: /home/metafarmers/dkim/data/slip_processed_context/dataset.zarr.zip
+force_sidecar_path: /home/metafarmers/dkim/data/slip_processed_context/dataset_force_sidecar.zarr
+label_path: /home/metafarmers/dkim/data/slip_processed_context/state_labels_v2.npz
+context_checkpoint_path: outputs/slip_context_sequence/best.pt
+context_cache_path: outputs/slip_action/context_rgb4.npz
+action_frequency: 19.98001998001998
+action_horizon: 16
+
+model_contract:
+  version: slip_rgb4_paired_ft_no_tcp_768_action11_v1
+  condition_dim: 768
+  policy_input_keys: [camera0_rgb, robot0_ft_left, robot0_ft_right, valve_context]
+  rgb_offsets: [30, 20, 10, 0]
+  rgb_span_s: 0.5
+  ft_temporal_contract: per_rgb_causal_raw41_mean5_delta5_to_32x18_v1
+  ft_input_key: wrench_12d
+  ft_coordinate_transform: none
+  ft_bias_removal: precomputed_in_sidecar
+  deployment_bias_requirement: startup_static_calibration
+  ft_history_padding: none
+  valve_context_phase_names: [approach, error1, error2, turning]
+  valve_context_dim: 5
+  valve_context_classifier_frozen: true
+  action_schema_version: pose9_width1_grasp_force1_v1
+  action_pose_semantics: anchor_relative_xyz_rotation6d
+  action_channels: [x, y, z, r6d_0, r6d_1, r6d_2, r6d_3, r6d_4, r6d_5, gripper_width_m, grasp_force_N]
+  grasp_force_formula: "0.5*(right_Fz-left_Fz), bias already removed"
+  grasp_force_role: gripper_width_feedback_reference_not_direct_command_v1
+
+shape_meta:
+  obs:
+    camera0_rgb:
+      shape: [3, 224, 224]
+      horizon: 4
+      down_sample_steps: 10
+      latency_steps: 0
+      type: rgb
+    robot0_ft_left:
+      shape: [41, 6]
+      horizon: 4
+      type: low_dim
+    robot0_ft_right:
+      shape: [41, 6]
+      horizon: 4
+      type: low_dim
+    valve_context:
+      shape: [5]
+      horizon: 1
+      type: low_dim
+      ignore_by_policy: true
+  action:
+    shape: [11]
+    horizon: 16
+    down_sample_steps: 3
+    latency_steps: 0
+    rotation_rep: rotation_6d
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+dataset:
+  _target_: diffusion_policy.dataset.slip_action_dataset.SlipActionDataset
+  shape_meta: ${task.shape_meta}
+  dataset_path: ${task.dataset_path}
+  force_sidecar_path: ${task.force_sidecar_path}
+  label_path: ${task.label_path}
+  context_checkpoint_path: ${task.context_checkpoint_path}
+  context_cache_path: ${task.context_cache_path}

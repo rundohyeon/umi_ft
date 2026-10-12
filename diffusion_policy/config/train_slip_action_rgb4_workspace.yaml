@@ -1,0 +1,40 @@
+defaults:
+  - train_diffusion_unet_timm_umi_dual_ft_workspace
+  - override task: slip_action_rgb4_paired_ft
+  - _self_
+
+name: train_slip_action_rgb4
+policy:
+  obs_encoder:
+    frozen: true
+    ft_window_mode: per_rgb
+    ft_feature_mode: raw_mean_delta
+    valve_context_key: valve_context
+    valve_context_dim: 5
+    valve_context_num_phase_experts: 4
+    valve_context_hidden_dim: 128
+    valve_expert_bottleneck_dim: 128
+training:
+  num_epochs: 100
+  resume: false
+  init_from_checkpoint: null
+  save_optimizer: true
+  full_validation: true
+  checkpoint_every: 1
+dataloader:
+  batch_size: 8
+  num_workers: 4
+val_dataloader:
+  batch_size: 8
+  num_workers: 2
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 3
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.5f}.ckpt'
+logging:
+  mode: offline
+hydra:
+  run:
+    dir: outputs/slip_action/rgb4_paired_ft_no_tcp

@@ -1,5 +1,23 @@
 # Universal Manipulation Interface
 
+## 현재 Slip action 모델을 다른 컴퓨터에서 실행하기
+
+**현재 모델의 이전 절차는 [Slip action 인수인계 가이드](docs/slip_action_handoff.md)를 먼저 읽으세요.**
+이 가이드는 아래의 과거 Indy/A/T/R/E 배포 예제와 구분됩니다.
+
+- Action: `epoch=0008-val_loss=0.02815.ckpt` — 9번째 epoch, 기본 EMA 가중치.
+- Context: `outputs/slip_context_sequence/best.pt` — RGB 4장/0.5초,
+  확률 history 20개/약 2초, 순서 `approach / error1 / error2 / turning`.
+- 실행: `eval_slip_action.py`로 **저장 데이터에 대한 오프라인 평가**까지 검증했습니다.
+  이 모델의 실물 로봇용 관측 연결 코드는 아직 구현되지 않았습니다.
+- Git은 코드와 문서를 옮깁니다. 모델·context 확률 캐시·평가 데이터는 별도로 복사해야 합니다.
+  데이터의 원래 절대 경로와 ZIP의 수정 시각 보존도 필요합니다.
+- 새 컴퓨터의 `git fetch`는 원격에 올라간 commit만 받습니다. 작업 폴더의 수정 파일과
+  untracked 파일은 전달되지 않습니다. 필요한 변경이 포함된 branch/commit을 확인하세요.
+
+가이드에 필요한 파일, 복사 방법, 환경, GPU 설정, 빠른 검사와 전체 평가 명령,
+현재 지원 범위를 정리했습니다.
+
 [[Project page]](https://umi-gripper.github.io/)
 [[Paper]](https://umi-gripper.github.io/#paper)
 [[Hardware Guide]](https://docs.google.com/document/d/1TPYwV9sNVPAi0ZlAupDMkXZ4CA1hsZx7YDMSmcEy6EU/edit?usp=sharing)
@@ -698,6 +716,21 @@ resumable as eight-image training runs. This model has a separate checkpoint
 schema and class order; use `SlipTemporalContextRuntime` for inference, not the
 older A/T/R/E observer adapter. Full commands, data filtering, live API, and
 handoff details are in [the slip context guide](docs/slip_temporal_context.md).
+
+The new **slip action policy** uses four RGB frames over 0.5 seconds, each paired
+with its own causal left/right F/T window, plus the frozen slip context probabilities.
+TCP is absent from policy inputs; demonstrated TCP is used only for action targets.
+The 12 RGB/F/T tokens produce a 768-D diffusion condition. Use
+`train_slip_action_rgb4_workspace`; cache preparation, GPU 2/3 training commands,
+ignore filtering, checkpoint contracts, and deployment limitations are documented
+in [the slip action training guide](docs/slip_action_training.md).
+
+For offline evaluation, `eval_slip_action.py` defaults to the best epoch-9 action
+checkpoint (`epoch=0008-val_loss=0.02815.ckpt`) and EMA weights. It evaluates the
+held-out test split with the saved normalizer, writes per-context/per-episode
+position, rotation, width and force errors, and saves predicted trajectories.
+Run it on GPU 2 with `CUDA_VISIBLE_DEVICES=2` and `--device cuda:0`; see the
+[evaluation command and result format](docs/slip_action_training.md#offline-evaluation-of-the-best-epoch-9-model).
 
 ### Frame-by-frame RGB / F/T debugging and label review
 
