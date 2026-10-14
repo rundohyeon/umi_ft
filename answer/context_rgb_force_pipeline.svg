@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3200" height="1720" viewBox="0 0 3200 1720">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12Z" fill="#486581"/></marker>
+    <style>
+      text { font-family: Arial, 'Noto Sans CJK KR', sans-serif; fill: #102a43; }
+      .title { font-size: 42px; font-weight: 700; }
+      .sub { font-size: 21px; fill: #486581; }
+      .section { font-size: 27px; font-weight: 700; }
+      .head { font-size: 22px; font-weight: 700; }
+      .body { font-size: 18px; }
+      .small { font-size: 15px; fill: #486581; }
+      .box { stroke: #829ab1; stroke-width: 2; rx: 15; ry: 15; }
+      .data { fill: #e6fcf5; }
+      .process { fill: #e7f5ff; }
+      .model { fill: #f3f0ff; }
+      .output { fill: #fff0f6; }
+      .train { fill: #fff3bf; }
+      .line { fill: none; stroke: #486581; stroke-width: 3; marker-end: url(#arrow); }
+      .dash { fill: none; stroke: #7b61a8; stroke-width: 3; stroke-dasharray: 10 8; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="3200" height="1720" fill="#f8fbff"/>
+  <text x="70" y="68" class="title">RGB + Force Context Classifier — 입력에서 출력까지</text>
+  <text x="70" y="105" class="sub">모든 실선 화살표는 실제 forward 입력 흐름이다. 점선은 학습 때만 쓰는 loss / backpropagation 흐름이다.</text>
+  <text x="70" y="165" class="section">Forward path: 한 프레임 t를 분류하는 과정</text>
+
+  <!-- INPUT -->
+  <text x="70" y="220" class="section">① 입력 데이터</text>
+  <rect x="70" y="250" width="300" height="135" class="box data"/>
+  <text x="95" y="287" class="head">라벨 NPZ</text>
+  <text x="95" y="320" class="body">state_phase: 0~3</text>
+  <text x="95" y="348" class="body">valid, label source</text>
+  <text x="95" y="374" class="small">학습에서만 정답으로 사용</text>
+  <rect x="70" y="455" width="300" height="125" class="box data"/>
+  <text x="95" y="492" class="head">RGB 저장소</text>
+  <text x="95" y="525" class="body">uint8 [N, 224, 224, 3]</text>
+  <text x="95" y="553" class="body">t-3, t 프레임</text>
+  <rect x="70" y="650" width="300" height="125" class="box data"/>
+  <text x="95" y="687" class="head">F/T 저장소</text>
+  <text x="95" y="720" class="body">wrench_12d = 좌 6 + 우 6</text>
+  <text x="95" y="748" class="body">t까지의 과거 측정값</text>
+
+  <!-- SAMPLE -->
+  <text x="465" y="220" class="section">② 샘플 구성</text>
+  <rect x="465" y="355" width="345" height="300" class="box process"/>
+  <text x="492" y="394" class="head">유효한 프레임 t 선택</text>
+  <text x="492" y="435" class="body">valid label + 시간 정렬된 F/T만 사용</text>
+  <text x="492" y="482" class="body">RGB  → [2, 3, 224, 224], /255</text>
+  <text x="492" y="520" class="body">왼 F/T → [41, 6]</text>
+  <text x="492" y="555" class="body">오른 F/T → [41, 6]</text>
+  <text x="492" y="604" class="small">label은 forward 입력이 아니라 학습 정답(target)</text>
+  <path d="M370 517 H465" class="line"/>
+  <path d="M370 712 H420 V565 H465" class="line"/>
+
+  <!-- ENCODERS -->
+  <text x="905" y="220" class="section">③ 입력별 encoder</text>
+  <rect x="905" y="290" width="360" height="170" class="box model"/>
+  <text x="932" y="330" class="head">RGB encoder</text>
+  <text x="932" y="367" class="body">CLIP vision backbone (frozen)</text>
+  <text x="932" y="400" class="body">→ RGB projection (학습 가능)</text>
+  <text x="932" y="432" class="body">→ RGB 토큰 2개: [B, 2, 128]</text>
+  <rect x="905" y="535" width="360" height="185" class="box model"/>
+  <text x="932" y="575" class="head">왼쪽 / 오른쪽 Force encoder</text>
+  <text x="932" y="612" class="body">[B, 41, 6] → causal feature</text>
+  <text x="932" y="644" class="body">→ [B, 32, 18] → normalize</text>
+  <text x="932" y="676" class="body">→ 각자 Causal Force CNN → 128</text>
+  <text x="932" y="704" class="small">좌/우는 서로 다른 CNN 가중치 사용</text>
+  <path d="M810 450 H850 V375 H905" class="line"/>
+  <path d="M810 560 H850 V627 H905" class="line"/>
+
+  <!-- TOKENS -->
+  <text x="1360" y="220" class="section">④ 토큰 결합</text>
+  <rect x="1360" y="365" width="410" height="260" class="box model"/>
+  <text x="1390" y="405" class="head">5개 토큰</text>
+  <text x="1390" y="445" class="body">[과거 RGB] [현재 RGB]</text>
+  <text x="1390" y="478" class="body">[왼 Force] [오른 Force]</text>
+  <text x="1390" y="511" class="body">[QUERY]</text>
+  <text x="1390" y="557" class="body">+ modality / position embedding</text>
+  <text x="1390" y="592" class="body">결과: [B, 5, 128]</text>
+  <rect x="1360" y="710" width="410" height="118" class="box model"/>
+  <text x="1390" y="749" class="head">학습 가능한 QUERY parameter</text>
+  <text x="1390" y="782" class="body">초기값 [0, ..., 0], 길이 128</text>
+  <text x="1390" y="810" class="small">forward마다 expand되어 배치에 붙음</text>
+  <path d="M1265 375 H1310 V445 H1360" class="line"/>
+  <path d="M1265 627 H1310 V545 H1360" class="line"/>
+  <path d="M1565 710 V625" class="line"/>
+
+  <!-- TRANSFORMERS -->
+  <text x="1860" y="220" class="section">⑤ Transformer — 2개 layer를 순서대로 통과</text>
+  <rect x="1860" y="365" width="300" height="260" class="box model"/>
+  <text x="1890" y="410" class="head">Transformer layer 1</text>
+  <text x="1890" y="453" class="body">multi-head attention</text>
+  <text x="1890" y="486" class="body">+ feed-forward network</text>
+  <text x="1890" y="533" class="small">[B, 5, 128] → [B, 5, 128]</text>
+  <rect x="2250" y="365" width="300" height="260" class="box model"/>
+  <text x="2280" y="410" class="head">Transformer layer 2</text>
+  <text x="2280" y="453" class="body">multi-head attention</text>
+  <text x="2280" y="486" class="body">+ feed-forward network</text>
+  <text x="2280" y="533" class="small">[B, 5, 128] → [B, 5, 128]</text>
+  <text x="1890" y="585" class="small">causal mask: 마지막 QUERY는 앞 4개 토큰을 볼 수 있음</text>
+  <path d="M1770 495 H1860" class="line"/>
+  <path d="M2160 495 H2250" class="line"/>
+
+  <!-- OUTPUT -->
+  <text x="2645" y="220" class="section">⑥ 출력</text>
+  <rect x="2645" y="365" width="230" height="260" class="box process"/>
+  <text x="2670" y="410" class="head">마지막 QUERY 선택</text>
+  <text x="2670" y="449" class="body">output[:, -1]</text>
+  <text x="2670" y="482" class="body">[B, 128]</text>
+  <text x="2670" y="535" class="head">Classifier</text>
+  <text x="2670" y="568" class="body">Linear(128 → 4)</text>
+  <path d="M2550 495 H2645" class="line"/>
+  <rect x="2950" y="365" width="200" height="260" class="box output"/>
+  <text x="2975" y="410" class="head">logits [B, 4]</text>
+  <text x="2975" y="456" class="body">approach</text>
+  <text x="2975" y="489" class="body">turning</text>
+  <text x="2975" y="522" class="body">recovery</text>
+  <text x="2975" y="555" class="body">error</text>
+  <text x="2975" y="600" class="small">평가 때 softmax</text>
+  <path d="M2875 495 H2950" class="line"/>
+
+  <!-- TRAIN -->
+  <line x1="70" y1="910" x2="3150" y2="910" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="70" y="970" class="section">Training only: 정답 라벨을 이용해 학습 가능한 가중치를 수정</text>
+  <rect x="465" y="1060" width="360" height="155" class="box train"/>
+  <text x="492" y="1100" class="head">Weighted cross-entropy loss</text>
+  <text x="492" y="1138" class="body">모델 logits + context_label</text>
+  <text x="492" y="1171" class="body">source weight × class weight</text>
+  <rect x="975" y="1060" width="360" height="155" class="box train"/>
+  <text x="1002" y="1100" class="head">backpropagation + AdamW</text>
+  <text x="1002" y="1138" class="body">loss를 줄이는 방향을 계산</text>
+  <text x="1002" y="1171" class="body">각 parameter를 조금씩 수정</text>
+  <rect x="1485" y="1030" width="1000" height="215" class="box train"/>
+  <text x="1515" y="1070" class="head">수정되는 parameter</text>
+  <text x="1515" y="1110" class="body">RGB projection · 왼쪽/오른쪽 Force CNN · 기본 QUERY</text>
+  <text x="1515" y="1145" class="body">modality / position embedding · Transformer layer 1 · Transformer layer 2 · classifier</text>
+  <text x="1515" y="1190" class="body">CLIP vision backbone은 frozen이므로 수정되지 않음</text>
+  <path d="M825 1137 H975" class="line"/>
+  <path d="M1335 1137 H1485" class="line"/>
+  <path d="M370 317 H420 V1020 H645 V1060" class="dash"/>
+  <path d="M3150 495 H3180 V1020 H705 V1060" class="dash"/>
+  <text x="435" y="1005" class="small">label target</text>
+  <text x="2700" y="1005" class="small">model logits</text>
+
+  <!-- EVALUATION -->
+  <text x="70" y="1395" class="section">Evaluation only: 가중치는 수정하지 않고 성능만 측정</text>
+  <rect x="465" y="1445" width="410" height="125" class="box output"/>
+  <text x="492" y="1485" class="head">softmax 확률 + macro-F1</text>
+  <text x="492" y="1522" class="body">validation 성능을 측정</text>
+  <rect x="1045" y="1445" width="500" height="125" class="box output"/>
+  <text x="1072" y="1485" class="head">best checkpoint 선택</text>
+  <text x="1072" y="1522" class="body">validation macro-F1 최고 모델 저장</text>
+  <rect x="1715" y="1445" width="430" height="125" class="box output"/>
+  <text x="1742" y="1485" class="head">fixed test 평가</text>
+  <text x="1742" y="1522" class="body">평가 결과 파일 기록</text>
+  <path d="M875 1507 H1045" class="line"/>
+  <path d="M1545 1507 H1715" class="line"/>
+  <path d="M3150 550 H3180 V1350 H670 V1445" class="dash"/>
+  <text x="2600" y="1330" class="small">logits → softmax / metrics</text>
+</svg>
