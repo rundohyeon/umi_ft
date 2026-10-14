@@ -8,6 +8,8 @@ from umi.real_world.dual_ft_policy_safety import (
     read_and_validate_latest_ft,
     validate_ft_load,
     validate_policy_waypoints,
+    validate_teleop_target,
+    validate_workspace_waypoints,
 )
 
 
@@ -45,6 +47,35 @@ def test_default_motion_guard_allows_a_fifteen_mm_gripper_step():
     target[0, 6] = 0.01501
     with pytest.raises(PolicySafetyError, match="gripper delta"):
         validate_policy_waypoints(target, current, 0.0, PolicyMotionSafetyConfig())
+
+
+def test_teleop_guard_does_not_apply_policy_delta_limits():
+    cfg = _motion_cfg()
+    current = np.zeros(6)
+    target = np.asarray([0.05, 0.0, 0.0, 0.0, 0.0, 0.5, 0.08])
+
+    np.testing.assert_array_equal(validate_teleop_target(target, current, cfg), target)
+
+    below_workspace = target.copy()
+    below_workspace[2] = -1.01
+    with pytest.raises(PolicySafetyError, match="below"):
+        validate_teleop_target(below_workspace, current, cfg)
+
+
+def test_workspace_guard_allows_large_policy_deltas_but_keeps_physical_bounds():
+    cfg = _motion_cfg()
+    current = np.zeros(6)
+    targets = np.asarray(
+        [[0.05, 0.0, 0.0, 0.0, 0.0, 0.5, 0.08],
+         [0.10, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01]]
+    )
+    np.testing.assert_array_equal(
+        validate_workspace_waypoints(targets, current, cfg), targets
+    )
+    invalid_width = targets.copy()
+    invalid_width[-1, 6] = 0.11
+    with pytest.raises(PolicySafetyError, match="gripper width"):
+        validate_workspace_waypoints(invalid_width, current, cfg)
 
 
 def test_ft_guard_is_fail_closed_for_force_torque_and_grasp_load():

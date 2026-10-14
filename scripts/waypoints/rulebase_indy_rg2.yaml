@@ -30,9 +30,9 @@ gripper:
 
 waypoints:
   # ##### temp ################################# 
-  - name: gripper_open
-    type: gripper
-    target: open
+  # - name: gripper_open
+  #   type: gripper
+  #   target: open
 
   # - name: point7_retract
   #   type: movel

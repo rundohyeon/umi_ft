@@ -174,6 +174,24 @@ def test_live_sequence_training_parity_and_resets(recording, tiny_model, tmp_pat
         runtime.predict_observation(current, ds.rgb_times[frame])
     result = runtime.predict_observation(current, ds.rgb_times[frame] + .3)
     assert result['history_samples'] == 0
+
+    # Physical camera frames can alternate around the fixed 10 Hz target grid.
+    # The latest live run contained a 130.9 ms interval followed by 76.5 ms;
+    # both anchors were within 25 ms of their respective cadence targets and
+    # must not reset or thin the probability history.
+    base = ds.rgb_times[frame] + 1.0
+    offsets = np.array([0.0, .0868, .2046, .2934, .3881, .4868, .6091, .6962])
+    runtime.reset(base)
+    counts = [
+        runtime.predict_observation(current, base + offset)['history_samples']
+        for offset in offsets
+    ]
+    assert counts == list(range(len(offsets)))
+    np.testing.assert_allclose(
+        [row[0] for row in runtime.history],
+        base + np.arange(len(offsets)) * model.history_period_s,
+    )
+
     runtime.reset(ds.rgb_times[181])
     assert len(runtime.history) == 0
     rt = ds.rgb_times[:400]

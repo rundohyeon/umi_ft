@@ -1,0 +1,11 @@
+{
+  "run_dir": "/home/idim/dkim/umi_ft/data/eval_contextFT4/20261014_060510_176097",
+  "video": "/home/idim/dkim/umi_ft/exports/slip_action_validation/20261014_060510_176097_validation.mp4",
+  "completed_cycles": 42,
+  "rejected_candidate_saved": false,
+  "recorded_duration_s": 10.210886716842651,
+  "exit_status": "failed: PolicySafetyError: waypoint[0] position delta 0.01637 m > 0.01500 m",
+  "valid_max_position_step_m": 0.012134093766146228,
+  "position_step_limit_m": 0.015,
+  "note": "The rejected candidate was not saved; the final card uses run.json exit_status."
+}

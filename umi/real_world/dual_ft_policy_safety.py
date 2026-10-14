@@ -212,3 +212,65 @@ def validate_policy_waypoints(targets, current_tcp6, current_width_m, config):
             raise PolicySafetyError(f"waypoint[{idx}] gripper width is outside [0,0.1] m")
         previous = target
     return poses
+
+
+def validate_teleop_target(target, current_tcp6, config):
+    """Keep only workspace/finite guards for one operator-issued target.
+
+    Teleop step size is controlled by the keyboard mapping itself. Policy
+    horizon delta limits do not apply because the physical arm may still be
+    catching up with earlier operator commands.
+    """
+
+    return validate_workspace_waypoints(
+        np.asarray(target, dtype=np.float64).reshape(1, 7), current_tcp6, config
+    )[0]
+
+
+def validate_workspace_waypoints(targets, current_tcp6, config):
+    """Validate finite physical/workspace bounds without arbitrary delta caps."""
+
+    cfg = (
+        config
+        if isinstance(config, PolicyMotionSafetyConfig)
+        else PolicyMotionSafetyConfig.from_mapping(config)
+    )
+    poses = np.asarray(targets, dtype=np.float64)
+    if poses.ndim != 2 or poses.shape[1] != 7 or len(poses) == 0:
+        raise PolicySafetyError("waypoints must have non-empty shape [N,7]")
+    current = np.asarray(current_tcp6, dtype=np.float64).reshape(6)
+    if np.any(~np.isfinite(poses)) or np.any(~np.isfinite(current)):
+        raise PolicySafetyError("waypoint contains NaN or Inf")
+    center = np.asarray(cfg.exclusion_sphere_center_m, dtype=np.float64)
+    previous = current
+    for index, target in enumerate(poses):
+        if float(target[2]) < cfg.min_tcp_z_m:
+            raise PolicySafetyError(
+                f"waypoint[{index}] TCP z {float(target[2]):.5f} m is below "
+                f"{cfg.min_tcp_z_m:.5f} m"
+            )
+        if not 0.0 <= float(target[6]) <= 0.1:
+            raise PolicySafetyError(
+                f"waypoint[{index}] gripper width is outside [0,0.1] m"
+            )
+        segment = target[:3] - previous[:3]
+        length_sq = float(np.dot(segment, segment))
+        if length_sq > 0:
+            alpha = float(
+                np.clip(
+                    np.dot(center - previous[:3], segment) / length_sq,
+                    0.0,
+                    1.0,
+                )
+            )
+            closest = previous[:3] + alpha * segment
+        else:
+            closest = target[:3]
+        distance = float(np.linalg.norm(closest - center))
+        if distance < cfg.exclusion_sphere_radius_m:
+            raise PolicySafetyError(
+                f"segment to waypoint[{index}] enters exclusion sphere: "
+                f"distance={distance:.5f} m"
+            )
+        previous = target
+    return poses

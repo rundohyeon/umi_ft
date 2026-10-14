@@ -64,8 +64,17 @@ class SlipTemporalContextRuntime:
 
     def reset(self, task_start_timestamp=-np.inf):
         self.task_start = float(task_start_timestamp)
+        self.reset_history()
+
+    def reset_history(self):
+        """Discard temporal state while preserving the current task boundary."""
         self.history = deque(maxlen=self.model.history_steps + 2)
         self.last_timestamp = None
+        self.last_history_timestamp = None
+        # Fixed sensor-time grid used by live deployment. Keeping the target
+        # phase separate from selected camera timestamps prevents small frame
+        # cadence errors from accumulating until history_at() loses its slots.
+        self.next_update_target_timestamp = None
 
     def history_at(self, timestamp):
         n, dt = self.model.history_steps, self.model.history_period_s
@@ -110,7 +119,9 @@ class SlipTemporalContextRuntime:
                           ft_end_timestamp_s=np.asarray(ft_times)[fi[:, -1]].tolist())
             return result
         except ObservationUnavailable:
-            self.history.clear()
+            # The failed anchor must not leave the cadence cursor pointing at a
+            # slot that can never be observed on a later loop iteration.
+            self.reset_history()
             raise
 
     @torch.inference_mode()
@@ -119,13 +130,25 @@ class SlipTemporalContextRuntime:
         timestamp = float(timestamp)
         if not np.isfinite(timestamp) or timestamp < self.task_start:
             raise ValueError('Invalid observation timestamp')
+        history_timestamp = timestamp
         if self.last_timestamp is not None:
             delta = timestamp - self.last_timestamp
             if delta <= 0:
                 raise ValueError('Context timestamps must increase; reset between episodes')
-            if abs(delta - self.model.history_period_s) > .025:
+            # Live RGB anchors are selected against a fixed 10 Hz target grid,
+            # but each physical camera timestamp may be up to 25 ms either side
+            # of its target.  Comparing two physical timestamps therefore needs
+            # twice that allowance.  Keep the probability sequence itself on
+            # the exact training cadence so alternating early/late frames do
+            # not erase history or distort all subsequent history ages.
+            if abs(delta - self.model.history_period_s) > .050001:
                 self.history.clear()
-        p, valid, ages = self.history_at(timestamp)
+                self.last_history_timestamp = None
+            elif self.last_history_timestamp is not None:
+                history_timestamp = (
+                    self.last_history_timestamp + self.model.history_period_s
+                )
+        p, valid, ages = self.history_at(history_timestamp)
         feature, base_logits = self.model.observe({k: v[None].to(self.device) for k, v in obs.items()})
         logits = self.model.fuse(feature, base_logits, torch.from_numpy(p)[None].to(self.device),
                                 torch.from_numpy(valid)[None].to(self.device), torch.from_numpy(ages)[None].to(self.device))
@@ -134,8 +157,9 @@ class SlipTemporalContextRuntime:
             raise ObservationUnavailable('nonfinite_context_prediction')
         probabilities = logits.float().softmax(-1)[0].cpu().numpy()
         raw = base_logits.float().softmax(-1)[0].cpu().numpy()
-        self.history.append((timestamp, raw.copy()))
+        self.history.append((history_timestamp, raw.copy()))
         self.last_timestamp = timestamp
+        self.last_history_timestamp = history_timestamp
         cid = int(probabilities.argmax())
         return dict(class_id=cid, class_name=PHASE_NAMES[cid], probabilities=probabilities.tolist(),
                     observation_probabilities=raw.tolist(), history_samples=int(valid.sum()), timestamp=timestamp)

@@ -1,0 +1,12 @@
+{
+  "run_dir": "/home/idim/dkim/umi_ft/data/eval_contextFT4/20261014_062440_411612",
+  "video": "/home/idim/dkim/umi_ft/exports/slip_action_validation/20261014_062440_411612_validation.mp4",
+  "completed_cycles": 15,
+  "stale_results_discarded": 4,
+  "rejected_candidate_saved": false,
+  "recorded_duration_s": 5.43796443939209,
+  "exit_status": "interrupted",
+  "valid_max_position_step_m": 0.012996739210885564,
+  "position_step_limit_m": 0.015,
+  "note": "Video uses completed policy cycles; stale-result records have no saved RGB input."
+}
