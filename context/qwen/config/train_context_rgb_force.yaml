@@ -4,7 +4,8 @@ dataset:
   dataset_path: three_dataset/dataset.zarr.zip
   force_sidecar_path: three_dataset/dataset_force_sidecar.zarr
   label_path: three_dataset/canonical_context_supervision_v2_4state_284.npz
-  rgb_stride: 3
+  rgb_horizon: ${model.rgb_horizon}
+  rgb_stride: 10  # [t-30,t-20,t-10,t]: about 0.5 s at 59.94/60 FPS
   ft_history: 32
   ft_feature_mode: ${model.ft_feature_mode}
   ft_mean_window: ${model.ft_mean_window}
@@ -19,7 +20,7 @@ model:
   num_heads: 4
   feedforward_dim: 256
   dropout: 0.1
-  rgb_horizon: 2
+  rgb_horizon: 4
   ft_horizon: 32
   # Per finger: raw(6) + trailing mean(6) + lagged-mean difference(6).
   # Nine extra preceding samples yield 32 feature steps from 41 raw samples.
@@ -31,7 +32,7 @@ seed: 260904
 val_ratio: 0.15
 test_episode_numbers: [37, 45, 47, 87, 104, 202, 211, 246, 273, 281]
 epochs: 30
-batch_size: 32  # Per GPU: global batch 64 with two processes.
+batch_size: 16  # Per GPU: 4 images/sample; global batch 32 on two GPUs.
 num_workers: 4  # Per process.
 cpu_threads: 2
 learning_rate: 0.0003
@@ -40,4 +41,4 @@ max_grad_norm: 1.0
 amp: true
 device: cuda
 log_every: 100
-output_dir: outputs/context_rgb_force_4state_ft_features
+output_dir: outputs/context_rgb_force_4frame_500ms

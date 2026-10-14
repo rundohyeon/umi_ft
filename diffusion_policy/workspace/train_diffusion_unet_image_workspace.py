@@ -345,7 +345,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
         # Preserve legacy checkpoint behavior; new context runs must save Adam
         # state from their first epoch so later resume is actually resumable.
-        if not cfg.training.resume and not hasattr(self.model, 'context_encoder'):
+        if (not cfg.training.resume and not hasattr(self.model, 'context_encoder')
+                and not OmegaConf.select(cfg, 'training.save_optimizer', default=False)):
             self.exclude_keys = ['optimizer']
 
     def run(self):
@@ -437,6 +438,12 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset) or isinstance(dataset, BaseDataset)
+        if hasattr(dataset, 'action_training_metadata'):
+            # Bind cached predictions and episode splits to every action checkpoint.
+            # This is separate from the legacy trainable ContextAwarePolicy loader.
+            from omegaconf import open_dict
+            with open_dict(self.cfg):
+                self.cfg.task.model_contract.context_training_metadata = dataset.action_training_metadata
         context_metadata = OmegaConf.select(self.cfg, 'context_training.metadata', default=None)
         if context_metadata is not None and hasattr(dataset, 'context_splits'):
             from diffusion_policy.context.data import source_fingerprint
@@ -466,6 +473,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+        # Retain the unsharded loader for full-set EMA validation on rank zero.
+        # Using a scalar batch loss on padded DDP shards would count duplicates.
+        full_val_dataloader = val_dataloader
         accelerator.print(
             'train dataset:', len(dataset), 'train dataloader:', len(train_dataloader)
         )
@@ -668,6 +678,26 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     policy = self.ema_model
                 policy.eval()
 
+                if (OmegaConf.select(cfg, 'training.full_validation', default=False)
+                        and self.epoch % cfg.training.val_every == 0):
+                    totals = torch.zeros(2, device=device, dtype=torch.float64)
+                    if accelerator.is_main_process:
+                        cuda_devices = [device.index] if device.type == 'cuda' else []
+                        with torch.no_grad(), torch.random.fork_rng(devices=cuda_devices):
+                            torch.manual_seed(int(cfg.training.seed) + 100003)
+                            for val_idx, val_batch in enumerate(full_val_dataloader):
+                                val_batch = dict_apply(val_batch, lambda x: x.to(device, non_blocking=True))
+                                size = len(val_batch['action'])
+                                totals[0] += policy(val_batch).detach().double() * size
+                                totals[1] += size
+                                if (cfg.training.max_val_steps is not None
+                                        and val_idx + 1 >= cfg.training.max_val_steps):
+                                    break
+                    totals = accelerator.reduce(totals, reduction='sum')
+                    if totals[1] <= 0:
+                        raise ValueError('Full validation requires a nonempty validation set')
+                    step_log['val_loss'] = (totals[0] / totals[1]).item()
+
                 # run rollout
                 if (
                     (self.epoch % cfg.training.rollout_every) == 0
@@ -677,7 +707,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     # log all
                     step_log.update(runner_log)
 
-                # run validation
+                # Legacy validation (disabled; new runs opt into full_validation above).
                 # if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0 and accelerator.is_main_process:
                 #     with torch.no_grad():
                 #         val_losses = list()

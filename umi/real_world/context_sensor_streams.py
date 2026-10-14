@@ -98,7 +98,7 @@ class NativeFTStream(SensorStream):
 class CameraStream(SensorStream):
     def __init__(self, device, *, resolution=(1920, 1080), fps=60,
                  receive_latency=0.125, capture_factory=None):
-        super().__init__(capacity=16)
+        super().__init__(capacity=64)  # Retain >0.5 s at 60 Hz for four-image context.
         if not 59 <= fps <= 61 or not np.isfinite(receive_latency) or receive_latency < 0:
             raise ValueError('Camera must capture at about 60 FPS; latency must be nonnegative')
         self.device, self.resolution, self.fps = device, tuple(resolution), fps

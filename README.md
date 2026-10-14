@@ -1,5 +1,23 @@
 # Universal Manipulation Interface
 
+## 현재 Slip action 모델을 다른 컴퓨터에서 실행하기
+
+**현재 모델의 이전 절차는 [Slip action 인수인계 가이드](docs/slip_action_handoff.md)를 먼저 읽으세요.**
+이 가이드는 아래의 과거 Indy/A/T/R/E 배포 예제와 구분됩니다.
+
+- Action: `epoch=0008-val_loss=0.02815.ckpt` — 9번째 epoch, 기본 EMA 가중치.
+- Context: `outputs/slip_context_sequence/best.pt` — RGB 4장/0.5초,
+  확률 history 20개/약 2초, 순서 `approach / error1 / error2 / turning`.
+- 실행: `eval_slip_action.py`로 **저장 데이터에 대한 오프라인 평가**까지 검증했습니다.
+  이 모델의 실물 로봇용 관측 연결 코드는 아직 구현되지 않았습니다.
+- Git은 코드와 문서를 옮깁니다. 모델·context 확률 캐시·평가 데이터는 별도로 복사해야 합니다.
+  데이터의 원래 절대 경로와 ZIP의 수정 시각 보존도 필요합니다.
+- 새 컴퓨터의 `git fetch`는 원격에 올라간 commit만 받습니다. 작업 폴더의 수정 파일과
+  untracked 파일은 전달되지 않습니다. 필요한 변경이 포함된 branch/commit을 확인하세요.
+
+가이드에 필요한 파일, 복사 방법, 환경, GPU 설정, 빠른 검사와 전체 평가 명령,
+현재 지원 범위를 정리했습니다.
+
 [[Project page]](https://umi-gripper.github.io/)
 [[Paper]](https://umi-gripper.github.io/#paper)
 [[Hardware Guide]](https://docs.google.com/document/d/1TPYwV9sNVPAi0ZlAupDMkXZ4CA1hsZx7YDMSmcEy6EU/edit?usp=sharing)
@@ -482,9 +500,9 @@ Inside the deployment container:
 The override adapter runs once per policy cycle from retained sensor history;
 it does not run a competing camera-rate classifier worker. It requires the
 policy RGB timestamp and pixels to match an exact retained camera frame, then
-selects the older frame closest to the trained approximately 50 ms separation.
-At 60 Hz this is `[t-3,t]`; a slower effective camera cadence is accepted only
-inside the original 30--75 ms timing gate. The adapter also uses the latest 41
+selects the temporal offsets saved in the classifier checkpoint. Four-image v3
+uses a 0.5 s window (25 ms tolerance per image); legacy two-image checkpoints
+use a 50 ms pair inside the original 30--75 ms timing gate. The adapter also uses the latest 41
 causal native F/T samples and the checkpoint's learned normalization. Future
 RGB/F/T samples are excluded. TCP pose and gripper width are not passed to this
 observer.
@@ -671,6 +689,73 @@ For the labelled 284-episode **approach / turning / recovery / error** dataset,
 use the [RGB + F/T classifier training guide](docs/context_rgb_force_training.md).
 It trains a frozen-CLIP / causal-F/T-CNN / small-Transformer classifier without
 TCP inputs, including a `torchrun` command for physical GPUs 2 and 3.
+The current training config uses **four RGB images over 0.5 s**
+(`[t-30,t-20,t-10,t]` at about 60 FPS), batch size 16 per GPU, and output
+`outputs/context_rgb_force_4frame_500ms/`. F/T remains 41 native samples.
+This produces a new `context_rgb_force_4frame_v3` checkpoint after retraining;
+the existing `best.pt` continues to use its saved two-image configuration.
+
+
+### Slip context with synchronized RGB/F/T and probability history
+
+The separate `train_slip_context.py` trainer uses the 289 reviewed episodes in
+`/home/metafarmers/dkim/data/slip_processed_context` with class order
+**approach / error1 / error2 / turning**. The current configuration pairs each of
+eight RGB frames over ~1 second with that image's own causal 41-sample native F/T
+window, then adds a GRU over 10 past observation-model probability vectors
+(~1 second at 10 Hz). Initial sensor warmup is ~1.4 seconds; history fills gradually.
+Ignore frames are excluded from both targets and all observation windows.
+
+Use `context/qwen/config/train_slip_context.yaml`. Prepare the frozen CLIP cache
+with `train_slip_context.py --prepare-cache-only`, then train with
+`train_slip_context.py`; both support two-rank torchrun on physical GPUs 2 and 3.
+Results go to `outputs/slip_context_rgb8_1s_history10/best.pt`. The existing frame
+feature cache is reusable. Earlier four-image checkpoints under
+`outputs/slip_context_sequence` still load with their saved settings, but are not
+resumable as eight-image training runs. This model has a separate checkpoint
+schema and class order; use `SlipTemporalContextRuntime` for inference, not the
+older A/T/R/E observer adapter. Full commands, data filtering, live API, and
+handoff details are in [the slip context guide](docs/slip_temporal_context.md).
+
+The new **slip action policy** uses four RGB frames over 0.5 seconds, each paired
+with its own causal left/right F/T window, plus the frozen slip context probabilities.
+TCP is absent from policy inputs; demonstrated TCP is used only for action targets.
+The 12 RGB/F/T tokens produce a 768-D diffusion condition. Use
+`train_slip_action_rgb4_workspace`; cache preparation, GPU 2/3 training commands,
+ignore filtering, checkpoint contracts, and deployment limitations are documented
+in [the slip action training guide](docs/slip_action_training.md).
+
+For offline evaluation, `eval_slip_action.py` defaults to the best epoch-9 action
+checkpoint (`epoch=0008-val_loss=0.02815.ckpt`) and EMA weights. It evaluates the
+held-out test split with the saved normalizer, writes per-context/per-episode
+position, rotation, width and force errors, and saves predicted trajectories.
+Run it on GPU 2 with `CUDA_VISIBLE_DEVICES=2` and `--device cuda:0`; see the
+[evaluation command and result format](docs/slip_action_training.md#offline-evaluation-of-the-best-epoch-9-model).
+
+### Frame-by-frame RGB / F/T debugging and label review
+
+Use the small browser UI in `tools/debug_context_labels.py` to inspect the
+canonical dataset's video frames, synchronized force/torque, and A/T/R/E labels:
+
+```bash
+conda activate umi
+python -m streamlit run tools/debug_context_labels.py \
+  --server.address 127.0.0.1 --server.port 8502
+```
+
+Open **http://localhost:8502**. It starts at EP194 (the first manually labelled
+episode). Select any episode, step with **← / →**, play/pause with **Space**, or
+enter an exact frame number. F/T plots offer raw axes, the trailing five-sample
+mean, and the lagged-mean difference. Force (N) and torque (Nm) use separate
+plots. **1–4** assign approach/turning/recovery/error to a frame or inclusive
+selected range; **U** clears a label, **Z** undoes an edit, **S** saves.
+
+Edits are stored in `outputs/context_label_debug/review.json` and restored on
+restart. The UI keeps the original dataset/labels read-only and does not feed
+these review patches into training automatically. It requires the three files
+in `three_dataset`, but no model checkpoint or GPU. See the
+[debug UI guide](docs/context_label_debug_ui.md) for data paths, SSH forwarding,
+and command-line options.
 
 ### Real-robot evaluation of `context_encoder_best.pt` / `best.pt`
 
@@ -711,8 +796,8 @@ python eval_real_context_rgb_force.py \
 
 Before live startup, keep both fingers unloaded and stationary for software
 bias calibration. Configure camera resolution and measured sensor latencies in
-`example/eval_context_rgb_force.yaml`. Inputs are RGB `[t-3,t]` at approximately
-60 FPS and the latest 41 native 100 Hz F/T samples **at or before the RGB time**,
+`example/eval_context_rgb_force.yaml`. Inputs follow the checkpoint: four RGB frames `[t-30,t-20,t-10,t]` over
+0.5 s for v3, or legacy `[t-3,t]` over 50 ms, at approximately 60 FPS and the latest 41 native 100 Hz F/T samples **at or before the RGB time**,
 in each finger's sensor frame, N/Nm. Mean/delta features are calculated inside
 the model; do not smooth or normalize the inputs again. No TCP input is used.
 Class IDs are **0 approach / 1 turning / 2 recovery / 3 error** (`recovery`, not

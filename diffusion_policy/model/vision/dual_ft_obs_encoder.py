@@ -9,6 +9,7 @@ import torch.nn as nn
 from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 from diffusion_policy.model.vision.timm_obs_encoder import TimmObsEncoder
 from diffusion_policy.model.vision.valve_stage_conditioner import ValveStageConditioner
+from diffusion_policy.context.ft_features import causal_ft_features, ft_feature_contract
 
 
 logger = logging.getLogger(__name__)
@@ -128,8 +129,15 @@ class DualFTObsEncoder(ModuleAttrMixin):
         valve_expert_bottleneck_dim: int = 128,
         valve_context_num_phase_experts: int = 5,
         allow_frozen_without_pretrained: bool = False,
+        ft_window_mode: str = "latest",
+        ft_feature_mode: str = "raw",
     ):
         super().__init__()
+        if ft_window_mode not in ("latest", "per_rgb"):
+            raise ValueError("ft_window_mode must be latest or per_rgb")
+        self.ft_window_mode = ft_window_mode
+        self.ft_feature_mode = ft_feature_mode
+        self.ft_feature_contract = ft_feature_contract(ft_feature_mode)
         if valve_context_key is None:
             architecture_contract_version = 2
         elif (int(valve_context_dim), int(valve_context_num_phase_experts)) == (10, 5):
@@ -141,6 +149,9 @@ class DualFTObsEncoder(ModuleAttrMixin):
                 "unsupported valve context encoder contract: "
                 f"dim={valve_context_dim}, experts={valve_context_num_phase_experts}"
             )
+        if ft_window_mode == "per_rgb":
+            # New input/token layout must not masquerade as the old 786-D policy.
+            architecture_contract_version = 5
         self.register_buffer(
             "architecture_contract_version",
             torch.tensor(architecture_contract_version, dtype=torch.int64),
@@ -157,8 +168,9 @@ class DualFTObsEncoder(ModuleAttrMixin):
         for key in (left_ft_key, right_ft_key):
             if key not in obs_meta:
                 raise ValueError(f"shape_meta is missing required F/T key {key!r}")
-            if tuple(obs_meta[key]["shape"]) != (6,):
-                raise ValueError(f"{key} must have six independent channels")
+            required = (32 + self.ft_feature_contract['prefix_samples'], 6) if ft_window_mode == "per_rgb" else (6,)
+            if tuple(obs_meta[key]["shape"]) != required:
+                raise ValueError(f"{key} must have shape {required}")
         if valve_context_key is not None:
             context_meta = obs_meta.get(valve_context_key)
             if context_meta is None:
@@ -221,6 +233,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
             )
 
         self.left_ft_encoder = CausalFTEncoder(
+            input_dim=self.ft_feature_contract['channels_per_finger'],
             channel_dims=ft_channel_dims,
             output_dim=self.fusion_dim,
         )
@@ -228,6 +241,7 @@ class DualFTObsEncoder(ModuleAttrMixin):
             self.right_ft_encoder = self.left_ft_encoder
         else:
             self.right_ft_encoder = CausalFTEncoder(
+                input_dim=self.ft_feature_contract['channels_per_finger'],
                 channel_dims=ft_channel_dims,
                 output_dim=self.fusion_dim,
             )
@@ -237,7 +251,11 @@ class DualFTObsEncoder(ModuleAttrMixin):
             int(legacy_shape_meta["obs"][key]["horizon"])
             for key in self.vision_pose_encoder.rgb_keys
         )
-        self.num_fusion_tokens = rgb_horizon + 2
+        self.rgb_horizon = rgb_horizon
+        if ft_window_mode == "per_rgb":
+            if any(int(obs_meta[key]['horizon']) != rgb_horizon for key in (left_ft_key, right_ft_key)):
+                raise ValueError("Per-RGB F/T must have one window for each RGB")
+        self.num_fusion_tokens = 3 * rgb_horizon if ft_window_mode == "per_rgb" else rgb_horizon + 2
         if int(fusion_layers) != 1:
             raise ValueError(
                 "official UMI-FT fusion contract requires fusion_layers=1"
@@ -346,6 +364,9 @@ class DualFTObsEncoder(ModuleAttrMixin):
 
     def fusion_token_names(self) -> list[str]:
         """Stable labels for the query/key axes of ``last_fusion_attention``."""
+        if self.ft_window_mode == "per_rgb":
+            return [f"{key}[t={idx}]" for idx in range(self.rgb_horizon)
+                    for key in (*self.vision_pose_encoder.rgb_keys, self.left_ft_key, self.right_ft_key)]
         names = []
         for key in self.vision_pose_encoder.rgb_keys:
             horizon = int(self.shape_meta["obs"][key]["horizon"])
@@ -399,10 +420,22 @@ class DualFTObsEncoder(ModuleAttrMixin):
 
     def forward(self, obs_dict):
         visual = self._visual_tokens(obs_dict)
-        left = self.left_ft_encoder(obs_dict[self.left_ft_key]).unsqueeze(1)
-        right = self.right_ft_encoder(obs_dict[self.right_ft_key]).unsqueeze(1)
         batch_size = visual.shape[0]
-        tokens = torch.cat([visual, left, right], dim=1)
+        forces = []
+        for key, encoder in ((self.left_ft_key, self.left_ft_encoder),
+                             (self.right_ft_key, self.right_ft_encoder)):
+            raw = obs_dict[key]
+            if self.ft_window_mode == "per_rgb":
+                expected = (batch_size, self.rgb_horizon, *self.shape_meta['obs'][key]['shape'])
+                if tuple(raw.shape) != expected:
+                    raise ValueError(f"{key} must be {expected}, got {tuple(raw.shape)}")
+                raw = raw.flatten(0, 1)
+            feature = causal_ft_features(raw, mode=self.ft_feature_mode)
+            forces.append(encoder(feature).reshape(batch_size, -1, self.fusion_dim))
+        if self.ft_window_mode == "per_rgb":
+            tokens = torch.stack([visual, *forces], dim=2).flatten(1, 2)
+        else:
+            tokens = torch.cat([visual, *forces], dim=1)
         if tokens.shape[1] != self.num_fusion_tokens:
             raise ValueError(
                 f"unexpected fusion token count {tokens.shape[1]} != "

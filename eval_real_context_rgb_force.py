@@ -53,8 +53,9 @@ def self_test(runtime):
     # Extra future samples verify that history selection stops at the RGB anchor.
     ft_times = np.arange(n + 20, dtype=np.float64) / 100
     anchor = ft_times[n - 1] + 0.005
-    rgb_times = anchor - np.arange(3, -1, -1) / 60
-    frames = np.full((4, 224, 224, 3), 128, dtype=np.uint8)
+    rgb_count = runtime.required_rgb_history
+    rgb_times = anchor - np.arange(rgb_count - 1, -1, -1) / 60
+    frames = np.full((rgb_count, 224, 224, 3), 128, dtype=np.uint8)
     wrench = np.zeros((len(ft_times), 12), dtype=np.float32)
     wrench[:n, 8] = np.linspace(0, 2, n)
     wrench[n:] = 999

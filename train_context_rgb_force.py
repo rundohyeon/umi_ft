@@ -98,7 +98,14 @@ def train(cfg, device, rank, world, resume, smoke_batches, dry_run):
     if (data_force_contract != model_force_contract
             or cfg['dataset']['ft_history'] != cfg['model']['ft_horizon']):
         raise ValueError('Dataset and model F/T feature/history contracts differ')
+    rgb_horizon = cfg['model'].get('rgb_horizon', 2)
+    if cfg['dataset'].get('rgb_horizon', 2) != rgb_horizon:
+        raise ValueError('Dataset and model RGB horizons differ')
+    if rgb_horizon not in (2, 4) or cfg['dataset']['rgb_stride'] != (10 if rgb_horizon == 4 else 3):
+        raise ValueError('Require RGB=4/stride=10 or legacy RGB=2/stride=3')
     base = CanonicalRGBForceDataset(**cfg['dataset'])
+    if base.phase_names != PHASE_NAMES:
+        raise ValueError('Use train_slip_context.py for the slip label contract')
     splits = canonical_episode_splits(len(base.rgb_ends), cfg['seed'], cfg['val_ratio'], cfg['test_episode_numbers'])
     datasets = {k: base.subset(v) for k, v in splits.items()}
     counts = {k: np.bincount(base.targets[ds.indices], minlength=4) for k, ds in datasets.items()}
@@ -111,6 +118,9 @@ def train(cfg, device, rank, world, resume, smoke_batches, dry_run):
     if model_force_contract['mode'] != 'raw':
         manifest.update(schema='context_rgb_force_4state_ft_features_v2',
                         force_features=model_force_contract)
+    if rgb_horizon == 4:
+        manifest.update(schema='context_rgb_force_4frame_v3',
+                        rgb_history=dict(horizon=4, stride=10, span_s=0.5))
     report = dict(**manifest, physical_cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
         world_size=world, batch_size_per_gpu=cfg['batch_size'], global_batch_size=cfg['batch_size'] * world,
         input_keys=list(RGBForceContextEncoder.input_keys), labelled_frames=int(base.valid.sum()),
@@ -118,6 +128,8 @@ def train(cfg, device, rank, world, resume, smoke_batches, dry_run):
         class_counts={k: v.tolist() for k, v in counts.items()},
         label_source_names=base.source_names, rule_label_weight=cfg['dataset']['rule_label_weight'],
         manual_label_weight=cfg['dataset']['manual_label_weight'],
+        rgb_horizon=base.rgb_horizon, rgb_stride=base.rgb_stride,
+        rgb_offsets_frames=(np.arange(base.rgb_horizon - 1, -1, -1) * base.rgb_stride).tolist(),
         force_raw_history=base.required_ft_history, force_cnn_steps=base.ft_history,
         force_channels_per_finger=model_force_contract['channels_per_finger'])
     payload = torch.load(resume, map_location='cpu', weights_only=False) if resume else None
@@ -262,7 +274,8 @@ def main():
     args = parser.parse_args()
     cfg = OmegaConf.to_container(OmegaConf.merge(OmegaConf.load(args.config), OmegaConf.from_dotlist(args.set)), resolve=True)
     if args.smoke_batches and cfg['output_dir'] in (
-            'outputs/context_rgb_force_4state', 'outputs/context_rgb_force_4state_ft_features'):
+            'outputs/context_rgb_force_4state', 'outputs/context_rgb_force_4state_ft_features',
+            'outputs/context_rgb_force_4frame_500ms'):
         raise ValueError('Set a separate output_dir for the smoke test')
     run(cfg, args.resume, args.smoke_batches, args.dry_run)
 

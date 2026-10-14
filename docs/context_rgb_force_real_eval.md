@@ -8,6 +8,16 @@ unavailable-input status. This is an observer, with no robot motion or gripper
 commands. Run an existing teleoperation/controller program separately if motion
 is needed. The classifier checkpoint alone cannot produce actions.
 
+Four-image models use schema `context_rgb_force_4frame_v3`, trained with the
+current config into `outputs/context_rgb_force_4frame_500ms/`. They consume
+`[t-30,t-20,t-10,t]` (about 0.5 s). The runtime reads this contract from the
+checkpoint; replacing code alone does not convert an old two-image best.pt.
+The standalone camera now retains 64 frames. The policy adapter uses its retained
+history and selects four distinct images near the same four temporal offsets;
+each selected timestamp must be within 25 ms of its target. It waits for the
+full 0.5 s of RGB history after reset. The policy's four probabilities plus
+context_valid and the native 41-sample F/T input remain the same.
+
 ## 1. Move the code and checkpoint
 
 On the destination computer, from the existing repository checkout:
@@ -28,7 +38,7 @@ Copy this file from the training computer using your preferred transfer method:
 Place it at `checkpoints/context_rgb_force/best.pt` in the destination checkout.
 The original filename also works; pass its path with `--checkpoint`. Git does
 not transfer `.pt` files. Compare `sha256sum` on both computers after copying.
-The current best file is from epoch 123 with validation macro F1 approximately
+The existing two-image best file is from epoch 123 with validation macro F1 approximately
 0.84484, schema `context_rgb_force_4state_ft_features_v2`. It includes the whole
 visual encoder, trained heads, architecture settings, class order, and F/T
 normalization. The training YAML's default epoch count does not describe the
@@ -97,7 +107,7 @@ new computer**. They are receive-time corrections, not hardware synchronization.
 The observer checks the resulting clocks, sample intervals, and RGB-to-F/T age;
 those checks cannot detect a consistently wrong latency offset. Camera geometry,
 sensor mounting/axis signs, and exposure should match collection. A 30 FPS camera
-mode changes the trained `[t-3,t]` interval and is rejected by the cadence check.
+mode changes the trained fixed-stride interval and is rejected by the cadence check.
 
 Keep both fingers unloaded and still before starting. The program collects a
 fresh software bias, checks sample stability, and subtracts it once from native
@@ -131,7 +141,7 @@ input-age limits. The configured rate is a maximum, not a guaranteed rate.
 
 Press **q/Esc** to quit, **r** for a new episode. Reset discards pre-reset sensor
 history from inference and keeps the startup bias. It waits for a full new
-window (about 0.4 s of F/T plus camera latency), rather than carrying old history
+window (about 0.5 s of RGB for a four-image checkpoint, plus camera latency), rather than carrying old history
 into a new episode. For SSH without a display, append
 `--headless --max-seconds 60`; Ctrl-C also stops the process.
 
@@ -139,7 +149,7 @@ into a new episode. For SSH without a display, append
 
 | Input | Contract |
 |---|---|
-| RGB | Two native frames `[t-3,t]`, about 50 ms apart at 60 Hz |
+| RGB | v3: four frames `[t-30,t-20,t-10,t]`, 0.5 s total; v1/v2: two frames `[t-3,t]`, 50 ms |
 | Image preprocessing | Inpaint ArUco `DICT_4X4_50`, mask gripper on raw frame, resize/center crop to 224 × 224, BGR→RGB |
 | Image options | Mirror retained, no mirror swap, no lens warp, no augmentation; `finger=False`, `use_aa=False` |
 | F/T | Last 41 consecutive native samples **at or before** the latest selected RGB time |
@@ -186,11 +196,13 @@ The override must be commissioned plan-only because its probability calibration
 can differ from the observer used to train Stage B.
 The adapter runs once per Stage-B policy cycle, not once per camera frame. It
 reads retained RGB/F/T history, verifies that the policy RGB timestamp and
-pixels match an exact retained frame, and selects the trained approximately
-50 ms RGB separation: `[t-3,t]` at 60 Hz, or the closest causal older frame
-when the shared stream is slower. The existing 30--75 ms safety gate remains
-enforced, and only the latest 41 native F/T samples at or before the exact
-policy anchor are used.
+pixels match an exact retained frame, and selects the RGB window stored in
+the checkpoint. New v3 checkpoints use four images at offsets
+`[-0.5, -1/3, -1/6, 0]` seconds, each within 25 ms of its target. The adapter
+waits for a full 0.5 seconds of history after reset and can select frames from
+a slower shared camera stream. Legacy v1/v2 checkpoints retain their 50 ms
+pair and 30--75 ms timing gate. Both paths use only the latest 41 native F/T
+samples at or before the exact policy anchor (32 for raw-only v1).
 
 After a transient RGB gap, at most three policy cycles are emitted with
 `context_valid=0`; each affected cycle holds pending waypoints and skips
@@ -207,7 +219,7 @@ Each run creates a new `outputs/context_real_eval/<timestamp>/` directory:
 - `predictions.jsonl`: timestamps, probabilities, class/confidence, inference
   latency, F/T age and history span, or `valid=false` with the reason.
 - `summary.json`: valid/total records, elapsed time, and exit/failure status.
-- `inputs/*.npz` with `--save-inputs`: exact two processed RGB images and both
+- `inputs/*.npz` with `--save-inputs`: exact checkpoint-sized processed RGB history and both
   41×6 F/T arrays, plus selected timestamps, before internal normalization.
 
 ```bash

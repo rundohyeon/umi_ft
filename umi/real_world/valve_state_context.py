@@ -479,7 +479,8 @@ class RGBForceValveContextRuntime:
     """Adapt the RGB/native-F/T Stage-A classifier to policy context v2.
 
     Both observers expose four ordered probabilities plus a validity flag, but
-    this observer consumes two RGB frames about 50 ms apart and one 41-sample
+    this observer consumes the checkpoint RGB window (4 frames/0.5 s, or
+    legacy 2 frames/50 ms) and one 41-sample
     native F/T history at t. It does not consume TCP pose or gripper width.
     """
 
@@ -513,10 +514,13 @@ class RGBForceValveContextRuntime:
                 "RGB/F-T observer phase order must be "
                 f"{tuple(OBSERVER_PHASE_NAMES)}, got {phase_names}"
             )
-        self.rgb_target_span_s = (
-            float(self._runtime.metadata.get("rgb_stride", OBSERVER_RGB_STRIDE))
-            / 60.0
-        )
+        rgb_horizon = int(self._runtime.metadata.get("rgb_horizon", 2))
+        rgb_stride = int(self._runtime.metadata.get("rgb_stride", OBSERVER_RGB_STRIDE))
+        required_rgb = 1 + (rgb_horizon - 1) * rgb_stride
+        if int(max_rgb_buffer) < required_rgb:
+            raise ValueError(f"RGB/F-T context buffer must retain at least {required_rgb} frames")
+        self.rgb_target_span_s = float(self._runtime.metadata.get(
+            "rgb_history_span_s", (required_rgb - 1) / 60.0))
         self.checkpoint_metadata = dict(self._runtime.metadata)
         self.checkpoint_metadata["integration_rgb_target_span_s"] = (
             self.rgb_target_span_s
